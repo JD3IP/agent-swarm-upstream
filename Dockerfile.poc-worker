@@ -1,0 +1,9 @@
+# Narrow local overlay for the POC. All tools and runtime layers remain from
+# the published upstream worker image; only the patched entrypoint is replaced.
+FROM ghcr.io/desplega-ai/agent-swarm-worker:latest
+
+USER root
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod 755 /docker-entrypoint.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]

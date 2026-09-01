@@ -155,7 +155,7 @@ export function generateCompose(state: OnboardState): string {
     lines.push("");
     lines.push("    volumes:");
     lines.push("      - swarm_logs:/app/logs");
-    lines.push("      - swarm_shared:/app/shared");
+    lines.push("      - swarm_shared:/workspace/shared");
     lines.push(`      - swarm_${svc.sanitizedName}:/app/agent`);
     lines.push("");
     lines.push("    restart: unless-stopped");

@@ -755,6 +755,16 @@ if [ -n "$AGENT_ID" ]; then
                 echo "# === End agent-managed setup ===" >> /workspace/start-up.sh
                 chmod +x /workspace/start-up.sh
             fi
+
+            # The entrypoint runs as root, while the prepared script is later
+            # read and executed after dropping to the unprivileged worker.
+            # `mktemp` + `mv` above otherwise replaces a worker-owned script
+            # with a root-owned mode-600 file on every restart.
+            PREPARED_STARTUP=$(find_startup_script) || true
+            if [ -n "$PREPARED_STARTUP" ]; then
+                chown worker:worker "$PREPARED_STARTUP"
+                chmod 700 "$PREPARED_STARTUP"
+            fi
             echo "Setup scripts prepared (global root hook: $([ -n "$GLOBAL_SCRIPT" ] && echo "yes" || echo "no"), agent worker hook: $([ -n "$AGENT_SCRIPT" ] && echo "yes" || echo "no"))"
         else
             echo "No setup scripts configured"

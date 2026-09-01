@@ -81,3 +81,6 @@ docker-compose.desplega.yaml
 
 # Opencode artifacts
 .opencode/
+
+# Added by agent-swarm onboard
+.agent-swarm/
