@@ -188,6 +188,28 @@ async function readClaudeMd(clonePath: string, role: string): Promise<string | n
 
 export type SwarmAutostash = { ref: string; message: string };
 
+/** Exported for unit testing. */
+export function formatAutoStashNotice(autoStashes: SwarmAutostash[] | undefined): string {
+  if (!autoStashes || autoStashes.length === 0) return "";
+  const stashes = autoStashes.map((stash) => `- ${stash.ref}: ${stash.message}`).join("\n");
+  return `\nPending auto-stashed work exists in this repo:\n${stashes}\nRestore if relevant with \`git stash apply <ref>\` or \`git stash pop <ref>\`.\n`;
+}
+
+/**
+ * Exported for unit testing. Returns null (never throws) if the path isn't a
+ * git repo or the command fails for any reason.
+ */
+export async function getCurrentGitBranch(clonePath: string): Promise<string | null> {
+  try {
+    const branch = (
+      await Bun.$`git -C ${clonePath} rev-parse --abbrev-ref HEAD`.quiet().text()
+    ).trim();
+    return branch || null;
+  } catch {
+    return null;
+  }
+}
+
 async function listSwarmAutostashes(clonePath: string, role: string): Promise<SwarmAutostash[]> {
   try {
     const result =
@@ -5359,6 +5381,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
         // Resolve cwd for resumed task (mirrors normal task path: task.dir > vcsRepo clonePath)
         let resumeCwd: string | undefined;
+        let resumeStashNotice = "";
         if (task.dir) {
           try {
             if (existsSync(task.dir) && statSync(task.dir).isDirectory()) {
@@ -5389,6 +5412,9 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           if (repoContext?.clonePath) {
             resumeCwd = repoContext.clonePath;
           }
+          if (repoContext?.autoStashes && repoContext.autoStashes.length > 0) {
+            resumeStashNotice = formatAutoStashNotice(repoContext.autoStashes);
+          }
         }
 
         // Per-task runner session ID so session logs are scoped to this task
@@ -5401,7 +5427,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             {
               prompt: resumePrompt,
               logFile,
-              systemPrompt: resolvedSystemPrompt,
+              systemPrompt: resolvedSystemPrompt + resumeStashNotice,
               additionalArgs: opts.additionalArgs,
               // Native resume deprecated: always undefined. Follow-up continuity flows through
               // the context preamble injected above (see context-preamble.ts).
@@ -5882,6 +5908,16 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           }
           triggerPrompt +=
             " You can still access any path on the filesystem — this is just your starting directory.";
+        }
+
+        if (taskObj?.taskType === "resume" && currentRepoContext?.clonePath) {
+          const branch = await getCurrentGitBranch(currentRepoContext.clonePath);
+          const stashNotice = formatAutoStashNotice(currentRepoContext.autoStashes);
+          if (branch || stashNotice) {
+            triggerPrompt += `\n\n---\n### Worktree State\n`;
+            if (branch) triggerPrompt += `- Current branch: \`${branch}\`\n`;
+            triggerPrompt += stashNotice;
+          }
         }
 
         // Warn in system prompt when task dir was specified but doesn't exist
