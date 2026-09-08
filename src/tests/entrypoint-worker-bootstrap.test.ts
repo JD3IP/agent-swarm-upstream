@@ -42,7 +42,9 @@ function extractWorkerBootstrapWrite(): string {
   const endMarker = "# END worker_bootstrap_write";
   const endIndex = script.indexOf(endMarker, beginIndex);
   if (endIndex === -1) {
-    throw new Error("Could not locate `# END worker_bootstrap_write` marker in docker-entrypoint.sh.");
+    throw new Error(
+      "Could not locate `# END worker_bootstrap_write` marker in docker-entrypoint.sh.",
+    );
   }
   return script.slice(beginIndex + beginMarker.length, endIndex);
 }
