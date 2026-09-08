@@ -544,7 +544,7 @@ export function buildClaudeCodeRuntimeEnv(
  */
 export function getSystemPromptFilePath(taskId: string): string {
   // The taskId is a UUID; safe to embed in a /tmp filename. Mirrors the
-  // existing /tmp/agent-swarm-task-${pid}.json + /tmp/mcp-${taskId}.json
+  // existing /tmp/agent-swarm-task-${pid}-${taskId}.json + /tmp/mcp-${taskId}.json
   // convention so a janitor sweeping /tmp can find all session-scoped state
   // under the same prefix.
   return `/tmp/agent-swarm-system-prompt-${taskId}.txt`;

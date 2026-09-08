@@ -792,7 +792,7 @@ The adapter is responsible for polling swarm-side signals during a run. Pattern 
 
 - Codex: [`src/providers/codex-swarm-events.ts`](https://github.com/desplega-ai/agent-swarm/blob/main/src/providers/codex-swarm-events.ts) — throttled `fireAndForget` fetches for cancel/heartbeat/activity/context-usage, attached via `this.listeners.push(...)` inside the session.
 - Pi: [`src/providers/pi-mono-extension.ts`](https://github.com/desplega-ai/agent-swarm/blob/main/src/providers/pi-mono-extension.ts) — `createSwarmHooksExtension` passed into `DefaultResourceLoader({ extensionFactories: [swarmExtension] })`.
-- Claude: external hook process reads a task file (`/tmp/agent-swarm-task-<pid>.json`) written by `claude-adapter.ts` L31–43; hook logic lives under `src/hooks/` (e.g. [`tool-loop-detection.ts`](https://github.com/desplega-ai/agent-swarm/blob/main/src/hooks/tool-loop-detection.ts)).
+- Claude: external hook process reads a task file (`/tmp/agent-swarm-task-<pid>-<taskId>.json`) written by `claude-adapter.ts` L31–43; hook logic lives under `src/hooks/` (e.g. [`tool-loop-detection.ts`](https://github.com/desplega-ai/agent-swarm/blob/main/src/hooks/tool-loop-detection.ts)).
 
 Tool-loop detection (`src/hooks/tool-loop-detection.ts::checkToolLoop`) is reusable — call it from your event translator when you see `tool_start`.
 
