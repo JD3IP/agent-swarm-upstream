@@ -59,19 +59,26 @@ interface TaskFileData {
   startedAt: string;
 }
 
-function getTaskFilePath(pid: number): string {
-  return `/tmp/agent-swarm-task-${pid}.json`;
+/** Exported for unit testing. */
+export function getTaskFilePath(pid: number, taskId: string): string {
+  return `/tmp/agent-swarm-task-${pid}-${taskId}.json`;
 }
 
-async function writeTaskFile(pid: number, data: TaskFileData): Promise<string> {
-  const filePath = getTaskFilePath(pid);
+/** Exported for unit testing. */
+export async function writeTaskFile(
+  pid: number,
+  taskId: string,
+  data: TaskFileData,
+): Promise<string> {
+  const filePath = getTaskFilePath(pid, taskId);
   await writeFile(filePath, JSON.stringify(data, null, 2));
   return filePath;
 }
 
-async function cleanupTaskFile(pid: number): Promise<void> {
+/** Exported for unit testing. */
+export async function cleanupTaskFile(pid: number, taskId: string): Promise<void> {
   try {
-    await unlink(getTaskFilePath(pid));
+    await unlink(getTaskFilePath(pid, taskId));
   } catch {
     // File might already be deleted or never created
   }
@@ -878,7 +885,7 @@ class ClaudeSession implements ProviderSession {
     }
 
     // Cleanup task file, per-session MCP config, and per-task system prompt
-    await cleanupTaskFile(this.taskFilePid);
+    await cleanupTaskFile(this.taskFilePid, this.config.taskId);
     if (this.sessionMcpConfig) {
       try {
         await unlink(this.sessionMcpConfig);
@@ -1294,7 +1301,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
 
     const taskFilePid = process.pid;
-    const taskFilePath = await writeTaskFile(taskFilePid, {
+    const taskFilePath = await writeTaskFile(taskFilePid, config.taskId, {
       taskId: config.taskId,
       agentId: config.agentId,
       startedAt: new Date().toISOString(),
