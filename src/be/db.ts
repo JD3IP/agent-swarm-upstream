@@ -739,9 +739,20 @@ export const agentQueries = {
   insert: () =>
     getDb().prepare<
       AgentRow,
-      [string, string, number, AgentStatus, number, string | null, string | null]
+      [
+        string,
+        string,
+        number,
+        AgentStatus,
+        number,
+        string | null,
+        string | null,
+        string | null,
+        string,
+        string | null,
+      ]
     >(
-      "INSERT INTO agents (id, name, isLead, status, maxTasks, provider, harness_provider, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *",
+      "INSERT INTO agents (id, name, isLead, status, maxTasks, provider, harness_provider, role, capabilities, description, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *",
     ),
 
   getById: () => getDb().prepare<AgentRow, [string]>("SELECT * FROM agents WHERE id = ?"),
@@ -804,6 +815,9 @@ export function createAgent(
       maxTasks,
       agent.provider ?? null,
       agent.harnessProvider ?? null,
+      agent.role ?? null,
+      JSON.stringify(agent.capabilities ?? []),
+      agent.description ?? null,
     );
   if (!row) throw new Error("Failed to create agent");
   try {
