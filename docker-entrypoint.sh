@@ -913,6 +913,10 @@ if [ "${SWARM_DEP_REDIS_ENABLED:-false}" = "true" ]; then
 fi
 
 WORKER_BOOTSTRAP="/tmp/agent-swarm-worker-entrypoint.sh"
+# BEGIN worker_bootstrap_write
+# Remove any prior-boot copy first: after boot 1 it's worker-owned, and root
+# recreating a non-root-owned file in sticky /tmp is blocked by protected_regular.
+rm -f "$WORKER_BOOTSTRAP" 2>/dev/null || true
 cat > "$WORKER_BOOTSTRAP" <<'EOF'
 #!/bin/bash
 set -e
@@ -1031,6 +1035,7 @@ exec /usr/local/bin/agent-swarm "$role" "$@"
 EOF
 chmod 755 "$WORKER_BOOTSTRAP"
 chown worker:worker "$WORKER_BOOTSTRAP" 2>/dev/null || true
+# END worker_bootstrap_write
 
 # Run the agent using compiled binary.
 #
