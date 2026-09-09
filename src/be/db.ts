@@ -872,6 +872,21 @@ export function updateAgentStatus(id: string, status: AgentStatus): Agent | null
   return row ? rowToAgent(row) : null;
 }
 
+// D6a — tombstone (never a hard-delete): sets role="retired",
+// capabilities="[]", status="offline" atomically, unconditionally. Never
+// deletes any row (agent_skills FK would throw on a real delete; agent_tasks
+// has no FK to agents at all and is the audit trail — never touched here).
+export function retireAgent(id: string): Agent | null {
+  const row = getDb()
+    .prepare<AgentRow, [string]>(
+      `UPDATE agents SET role = 'retired', capabilities = '[]', status = 'offline',
+       lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       WHERE id = ? RETURNING *`,
+    )
+    .get(id);
+  return row ? rowToAgent(row) : null;
+}
+
 export function updateAgentMaxTasks(id: string, maxTasks: number): Agent | null {
   const row = getDb()
     .prepare<AgentRow, [number, string]>(

@@ -12,6 +12,7 @@ import {
   getDb,
   getSwarmConfigs,
   resetEmptyPollCount,
+  retireAgent,
   setAgentHarnessProvider,
   updateAgentActivity,
   updateAgentCredentialState,
@@ -266,6 +267,21 @@ const updateAgentProfileRoute = route({
         profileSyncRejection: ProfileSyncRejectionSchema.optional(),
       }),
     },
+    404: { description: "Agent not found" },
+  },
+});
+
+const retireAgentRoute = route({
+  method: "post",
+  path: "/api/agents/{id}/retire",
+  pattern: ["api", "agents", null, "retire"],
+  summary: "Tombstone (retire) an agent: role=retired, capabilities=[], status=offline. Never deletes any row.",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  rbac: { permission: "agent.retire.any" },
+  responses: {
+    200: { description: "Agent retired", schema: AgentWithCapacitySchema },
+    400: { description: "Cannot retire the Lead agent" },
     404: { description: "Agent not found" },
   },
 });
@@ -665,6 +681,23 @@ export async function handleAgentsRest(
     updateAgentActivity(parsed.params.id);
     res.writeHead(204);
     res.end();
+    return true;
+  }
+
+  if (retireAgentRoute.match(req.method, pathSegments)) {
+    const parsed = await retireAgentRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const agent = getAgentById(parsed.params.id);
+    if (!agent) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    if (agent.isLead) {
+      jsonError(res, "Cannot retire the Lead agent", 400);
+      return true;
+    }
+    const updated = retireAgent(parsed.params.id);
+    retireAgentRoute.respond(res, 200, agentWithCapacity(updated as Agent));
     return true;
   }
 

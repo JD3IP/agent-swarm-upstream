@@ -9307,6 +9307,92 @@
         }
       }
     },
+    "/api/agents/{id}/retire": {
+      "post": {
+        "summary": "Tombstone (retire) an agent: role=retired, capabilities=[], status=offline. Never deletes any row.",
+        "tags": [
+          "Agents"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Agent retired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Agent"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "capacity": {
+                          "type": "object",
+                          "properties": {
+                            "current": {
+                              "type": "integer"
+                            },
+                            "max": {
+                              "type": "integer"
+                            },
+                            "available": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "current",
+                            "max",
+                            "available"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "capacity"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Cannot retire the Lead agent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Agent not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/agents/{id}/activity": {
       "put": {
         "summary": "Update agent last activity timestamp",
