@@ -263,6 +263,7 @@ export const LEGACY_RULES = {
 export const LEGACY_POLICY = {
   "user.manage": leadOnly,
   "agent.profile.update.any": leadOnly,
+  "agent.retire.any": leadOnly,
   "agent.context.read.any": leadOnly,
   "task.cancel.any": leadOrTaskCreator,
   "approval.cancel.any": humanOrLeadOrResourceOwner,

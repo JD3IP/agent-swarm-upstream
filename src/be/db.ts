@@ -231,6 +231,7 @@ export {
   ReservedAgentRoleError,
   reservedRoleViolation,
   resetEmptyPollCount,
+  retireAgent,
   setAgentHarnessProvider,
   shouldBlockPolling,
   updateAgentActivity,

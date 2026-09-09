@@ -25,6 +25,10 @@ export const PERMISSIONS = {
     description: "Update another agent's profile.",
     namespace: "agent",
   },
+  "agent.retire.any": {
+    description: "Tombstone (retire) another agent.",
+    namespace: "agent",
+  },
   "agent.context.read.any": {
     description: "View or diff another agent's context history.",
     namespace: "agent",

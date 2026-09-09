@@ -334,6 +334,20 @@ export async function updateAgentStatus(id: string, status: AgentStatus): Promis
   return row ? rowToAgent(row) : null;
 }
 
+// D6a — tombstone (never a hard-delete): sets role="retired",
+// capabilities="[]", status="offline" atomically, unconditionally. Never
+// deletes any row (agent_skills FK would throw on a real delete; agent_tasks
+// has no FK to agents at all and is the audit trail — never touched here).
+export async function retireAgent(id: string): Promise<Agent | null> {
+  const row = await getDbClient().get<AgentRow>(
+    `UPDATE agents SET role = 'retired', capabilities = '[]', status = 'offline',
+       lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       WHERE id = ? RETURNING *`,
+    [id],
+  );
+  return row ? rowToAgent(row) : null;
+}
+
 export async function updateAgentMaxTasks(id: string, maxTasks: number): Promise<Agent | null> {
   const row = await getDbClient().get<AgentRow>(
     `UPDATE agents SET maxTasks = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')

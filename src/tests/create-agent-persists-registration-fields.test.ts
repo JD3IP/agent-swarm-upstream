@@ -45,8 +45,8 @@ beforeEach(() => {
 });
 
 describe("createAgent: role, capabilities, description persist on first registration", () => {
-  test("role and capabilities survive the insert and are readable back via getAgentById", () => {
-    const created = createAgent({
+  test("role and capabilities survive the insert and are readable back via getAgentById", async () => {
+    const created = await createAgent({
       name: "Coder 3",
       isLead: false,
       status: "idle",
@@ -60,13 +60,13 @@ describe("createAgent: role, capabilities, description persist on first registra
     // Read back through a fresh SELECT, not the RETURNING clause of the
     // insert itself — a bug that only fixed the returned object but not the
     // stored row would pass on `created` alone.
-    const reread = getAgentById(created.id);
+    const reread = await getAgentById(created.id);
     expect(reread?.role).toBe("coder");
     expect(reread?.capabilities).toEqual(["implementation", "coding", "testing", "review"]);
   });
 
-  test("description survives the insert", () => {
-    const created = createAgent({
+  test("description survives the insert", async () => {
+    const created = await createAgent({
       name: "Researcher 2",
       isLead: false,
       status: "idle",
@@ -75,17 +75,17 @@ describe("createAgent: role, capabilities, description persist on first registra
     });
 
     expect(created.description).toBe("a description supplied at registration time");
-    expect(getAgentById(created.id)?.description).toBe(
+    expect((await getAgentById(created.id))?.description).toBe(
       "a description supplied at registration time",
     );
   });
 
-  test("omitting role/capabilities/description still succeeds with the documented defaults", () => {
+  test("omitting role/capabilities/description still succeeds with the documented defaults", async () => {
     // Backward compatibility: a caller that sends none of these three must
     // keep getting role=undefined, capabilities=[], description=undefined —
     // exactly rowToAgent's existing NULL-coalescing behavior — not a thrown
     // error and not a NOT NULL constraint violation.
-    const created = createAgent({
+    const created = await createAgent({
       name: "Minimal Agent",
       isLead: false,
       status: "idle",
