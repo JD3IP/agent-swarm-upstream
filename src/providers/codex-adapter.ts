@@ -489,7 +489,14 @@ export async function buildCodexConfig(
     sandbox_mode: "danger-full-access",
     skip_git_repo_check: true,
     show_raw_agent_reasoning: false,
-    features: { hooks: true, plugin_hooks: true },
+    // `multi_agent: false` disables Codex's built-in `spawn_agent` tool. A
+    // sub-agent spawned that way (`fork_turns: "all"`) inherits the parent
+    // session's MCP identity — the `agent-swarm` MCP server entry carries the
+    // parent's `X-Agent-ID` / `X-Source-Task-Id` headers — so it can complete
+    // the PARENT task early via `store_progress(status: "completed")` (task
+    // 2551bf57 on 15 Sep 2026, 9e8b616f on 1 Sep 2026). Must stay aligned with
+    // the Dockerfile baseline at `~/.codex/config.toml` (Phase 6).
+    features: { hooks: true, plugin_hooks: true, multi_agent: false },
     mcp_servers: mcpServers as CodexConfig,
     ...reasoningConfig,
   };
