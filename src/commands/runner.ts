@@ -36,6 +36,7 @@ import {
 import type { SteerDeliveryResult } from "../providers/types.ts";
 import { initTelemetry, telemetry } from "../telemetry.ts";
 import {
+  isTerminalTaskStatus,
   type ProviderName,
   type ReasoningEffort,
   type RepoGuidelines,
@@ -2070,6 +2071,11 @@ interface RunningTask {
   triggerType?: string;
   /** Set when the promise resolves, enabling non-blocking completion checks */
   result: ProviderResult | null;
+  /**
+   * When the runner first saw the API report this task terminal while the
+   * session was still running (see `abortSessionsForEndedTasks`).
+   */
+  endedSeenAt?: number;
   /** Deferred cursor updates for channel_activity triggers — committed after success */
   cursorUpdates?: Array<{ channelId: string; ts: string }>;
   /** Resolved working directory for VCS detection */
@@ -4047,6 +4053,90 @@ async function spawnProviderProcess(
   return runningTask;
 }
 
+/**
+ * How long a session may keep running after the API reports its task
+ * completed / failed / superseded before the runner aborts it.
+ *
+ * The agent's own `store-progress(status=completed)` is normally its last
+ * tool call, and the session then still has a final message, the session
+ * summary and memory indexing to finish. Measured on the live swarm
+ * (1–15 Sep 2026, 680 completed tasks): session end lands p99 22.5s and at
+ * most 58.4s after the task went terminal. The two outliers, 583s and 701s,
+ * were both sessions whose task had been completed out from under them by a
+ * Codex sub-agent — exactly what this bound exists to stop.
+ */
+export const ENDED_TASK_SESSION_GRACE_MS = 120_000;
+
+/**
+ * Abort live provider sessions whose task the API says has ended.
+ *
+ * - `cancelled` aborts immediately (unchanged behaviour).
+ * - Any other terminal status (`completed`, `failed`, `superseded`) aborts
+ *   once the session has outlived it by `graceMs`. Without this, a task
+ *   completed mid-session — e.g. by a sub-agent calling store-progress on
+ *   the parent's task — left the whole provider process tree running with no
+ *   task to report to (task 2551bf57, 15 Sep 2026: 11.5 minutes).
+ *
+ * Best-effort: an unreachable API or unknown task never aborts anything.
+ * `signaled` records tasks already aborted so the SIGTERM is sent once;
+ * `checkCompletedProcesses` clears the entry when the session exits.
+ */
+export async function abortSessionsForEndedTasks(
+  activeTasks: Map<string, { session: Pick<ProviderSession, "abort">; endedSeenAt?: number }>,
+  config: ApiConfig,
+  role: string,
+  signaled: Set<string>,
+  opts: { fetchImpl?: typeof fetch; now?: () => number; graceMs?: number } = {},
+): Promise<void> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const now = opts.now ?? Date.now;
+  const graceMs = opts.graceMs ?? ENDED_TASK_SESSION_GRACE_MS;
+  for (const [taskId, task] of activeTasks) {
+    if (signaled.has(taskId)) continue; // Already sent SIGTERM
+    let status: string | undefined;
+    try {
+      const resp = await fetchImpl(
+        `${config.apiUrl}/api/tasks/${encodeURIComponent(taskId)}?logsLimit=1`,
+        {
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+            "X-Agent-ID": config.agentId,
+          },
+        },
+      );
+      if (!resp.ok) continue;
+      status = ((await resp.json()) as { status?: string }).status;
+    } catch {
+      continue; // Non-blocking — the ended-task check is best-effort
+    }
+    if (!status) continue;
+
+    if (status === "cancelled") {
+      console.log(
+        `[${role}] Task ${taskId.slice(0, 8)} was cancelled — sending SIGTERM to subprocess`,
+      );
+      task.session.abort("cancelled").catch(() => {});
+      signaled.add(taskId);
+      continue;
+    }
+
+    if (!isTerminalTaskStatus(status)) {
+      task.endedSeenAt = undefined;
+      continue;
+    }
+
+    task.endedSeenAt ??= now();
+    const outlivedMs = now() - task.endedSeenAt;
+    if (outlivedMs < graceMs) continue;
+    console.log(
+      `[${role}] Task ${taskId.slice(0, 8)} is ${status} but its session is still running ` +
+        `${Math.round(outlivedMs / 1000)}s later — sending SIGTERM to subprocess`,
+    );
+    task.session.abort(`task_${status}`).catch(() => {});
+    signaled.add(taskId);
+  }
+}
+
 /** Check for completed processes and remove them from active tasks */
 async function checkCompletedProcesses(
   state: RunnerState,
@@ -5613,39 +5703,10 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       );
     }
 
-    // Check for cancelled tasks and signal their subprocesses. Deliberately
+    // Check for ended tasks and signal their subprocesses. Deliberately
     // NOT gated on steeringDispatchState — cancellation abort must keep
     // working when steering dispatch is off (STEERING_ENABLED unset).
-    if (state.activeTasks.size > 0) {
-      for (const [taskId, task] of state.activeTasks) {
-        if (cancelledSignaled.has(taskId)) continue; // Already sent SIGTERM
-        try {
-          const cancelResp = await fetch(
-            `${apiUrl}/cancelled-tasks?taskId=${encodeURIComponent(taskId)}`,
-            {
-              headers: {
-                Authorization: `Bearer ${apiKey}`,
-                "X-Agent-ID": agentId,
-              },
-            },
-          );
-          if (cancelResp.ok) {
-            const cancelData = (await cancelResp.json()) as {
-              cancelled: Array<{ id: string }>;
-            };
-            if (cancelData.cancelled?.some((t) => t.id === taskId)) {
-              console.log(
-                `[${role}] Task ${taskId.slice(0, 8)} was cancelled — sending SIGTERM to subprocess`,
-              );
-              task.session.abort("cancelled").catch(() => {});
-              cancelledSignaled.add(taskId);
-            }
-          }
-        } catch {
-          // Non-blocking — cancellation check is best-effort
-        }
-      }
-    }
+    await abortSessionsForEndedTasks(state.activeTasks, apiConfig, role, cancelledSignaled);
 
     // Deliver pending steering to live provider sessions and report the actual outcome.
     if (steeringDispatchState && state.activeTasks.size > 0) {
