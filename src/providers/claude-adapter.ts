@@ -617,6 +617,8 @@ class ClaudeSession implements ProviderSession {
     const reasoningEnv = reasoningApplication.kind === "claude-env" ? reasoningApplication.env : {};
     this.appliedReasoningEffort =
       reasoningApplication.kind === "claude-env" ? (config.reasoningEffort ?? null) : null;
+    // Summaries run in the adapter process. Do not bypass Claude's OAuth filtering for hooks.
+    delete sourceEnv.AGENT_SWARM_CLAUDE_OAUTH_TOKEN;
     this.proc = Bun.spawn(cmd, {
       cwd: this.config.cwd,
       env: {
@@ -634,13 +636,6 @@ class ClaudeSession implements ProviderSession {
         // The parent adapter owns a reliable in-memory stream-json transcript.
         // Prevent the child Stop hook from attempting the missing CLI artifact.
         AGENT_SWARM_ADAPTER_SESSION_SUMMARY: "1",
-        // claude CLI strips CLAUDE_CODE_OAUTH_TOKEN from hook subprocess env
-        // (security: prevents OAuth-token leakage to user-written hooks).
-        // Mirror it under a name claude doesn't recognize so the Stop hook
-        // can resolve the claude-cli fallback in internal-ai/credentials.ts.
-        ...(sourceEnv.CLAUDE_CODE_OAUTH_TOKEN
-          ? { AGENT_SWARM_CLAUDE_OAUTH_TOKEN: sourceEnv.CLAUDE_CODE_OAUTH_TOKEN }
-          : {}),
         CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY: CTX_MODE_NUDGE_EVERY,
       } as Record<string, string>,
       // Only pipe stdin on the stream-json path; on the `-p` path the child
