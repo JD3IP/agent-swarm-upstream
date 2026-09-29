@@ -171,7 +171,7 @@ export async function createAgent(
   const id = agent.id ?? crypto.randomUUID();
   const maxTasks = agent.maxTasks ?? 1;
   const row = await getDbClient().get<AgentRow>(
-    "INSERT INTO agents (id, name, isLead, status, maxTasks, provider, harness_provider, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *",
+    "INSERT INTO agents (id, name, isLead, status, maxTasks, provider, harness_provider, role, capabilities, description, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *",
     [
       id,
       agent.name,
@@ -180,6 +180,9 @@ export async function createAgent(
       maxTasks,
       agent.provider ?? null,
       agent.harnessProvider ?? null,
+      agent.role ?? null,
+      JSON.stringify(agent.capabilities ?? []),
+      agent.description ?? null,
     ],
   );
   if (!row) throw new Error("Failed to create agent");

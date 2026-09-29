@@ -812,10 +812,10 @@ if [ -n "$AGENT_ID" ]; then
                     | sed '/^# === Agent-managed setup (from DB) ===$/,/^# === End agent-managed setup ===$/d' \
                     >> "$TEMP_FILE"
                 mv "$TEMP_FILE" "$EXISTING_STARTUP"
-                # mktemp creates the temp file 0600; mv keeps that mode, and `chmod +x`
-                # would leave it 0711 (root-owned, unreadable by the worker uid that
-                # has to `head` and run it). Set the full mode explicitly.
-                chmod 755 "$EXISTING_STARTUP"
+                # mktemp creates a root-owned 0600 file and mv preserves its owner.
+                # The worker must be able to execute AND later edit this profile file.
+                chown worker:worker "$EXISTING_STARTUP" 2>/dev/null || true
+                chmod 700 "$EXISTING_STARTUP"
             elif [ -n "$AGENT_SCRIPT" ]; then
                 # Create new start-up.sh
                 echo "Creating /workspace/start-up.sh from agent setup script..."
@@ -823,7 +823,8 @@ if [ -n "$AGENT_ID" ]; then
                 echo "# === Agent-managed setup (from DB) ===" >> /workspace/start-up.sh
                 echo "$AGENT_SCRIPT" >> /workspace/start-up.sh
                 echo "# === End agent-managed setup ===" >> /workspace/start-up.sh
-                chmod 755 /workspace/start-up.sh
+                chown worker:worker /workspace/start-up.sh 2>/dev/null || true
+                chmod 700 /workspace/start-up.sh
             fi
             echo "Setup scripts prepared (global root hook: $([ -n "$GLOBAL_SCRIPT" ] && echo "yes" || echo "no"), agent worker hook: $([ -n "$AGENT_SCRIPT" ] && echo "yes" || echo "no"))"
         else

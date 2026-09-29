@@ -149,6 +149,13 @@ describe("generateCompose", () => {
     expect(yaml).toContain("  worker-coder-2:");
   });
 
+  test("CLI onboarding mounts the shared volume where agent prompts read it", () => {
+    const yaml = generateCompose(devState);
+
+    expect(yaml.match(/swarm_shared:\/workspace\/shared/g)).toHaveLength(3);
+    expect(yaml).not.toContain("swarm_shared:/app/shared");
+  });
+
   test.each([
     {
       provider: "claude" as const,

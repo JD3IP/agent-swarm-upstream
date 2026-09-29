@@ -89,3 +89,25 @@ test("unmoved profile and idle-worker callers share agent mapping defaults", asy
     .run("UPDATE agents SET avatar = ? WHERE id = ?", ["invalid json", agent.id]);
   expect((await db.getAgentById(agent.id))?.avatar).toBeNull();
 });
+
+test("fresh registration persists routing fields used by pool eligibility", async () => {
+  const agent = await db.createAgent({
+    name: "Registered Coder",
+    isLead: false,
+    status: "idle",
+    role: "coder",
+    capabilities: ["implementation", "testing"],
+    description: "Created from the worker registration payload",
+  });
+
+  expect(agent).toMatchObject({
+    role: "coder",
+    capabilities: ["implementation", "testing"],
+    description: "Created from the worker registration payload",
+  });
+  expect(await db.getAgentById(agent.id)).toMatchObject({
+    role: "coder",
+    capabilities: ["implementation", "testing"],
+    description: "Created from the worker registration payload",
+  });
+});
