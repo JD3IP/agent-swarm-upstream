@@ -22,6 +22,14 @@ describe("REASONING_EFFORT_LEVELS", () => {
 });
 
 describe("reasoningCapability — cache-sourced levels", () => {
+  test("Claude Opus 5.5 exposes supported CLI effort levels", () => {
+    expect(reasoningCapability("claude", "claude-opus-5-5").levels).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+  });
   test("claude claude-opus-4-8: levels come from reasoning_options.effort, not the fallback", () => {
     const cap = reasoningCapability("claude", "claude-opus-4-8");
     expect(cap.supported).toBe(true);
@@ -33,6 +41,12 @@ describe("reasoningCapability — cache-sourced levels", () => {
     const cap = reasoningCapability("codex", "gpt-5.6-sol");
     expect(cap.supported).toBe(true);
     expect(cap.levels).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("codex gpt-6-astra supports models.dev reasoning efforts", () => {
+    const cap = reasoningCapability("codex", "gpt-6-astra");
+    expect(cap.supported).toBe(true);
+    expect(cap.levels).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   test("codex gpt-5.1-codex-max: cache already includes xhigh", () => {
@@ -165,6 +179,13 @@ describe("applyReasoningEffort — codex-config shape", () => {
 
   test("max on gpt-5.6-sol is applied", () => {
     expect(applyReasoningEffort("codex", "gpt-5.6-sol", "max")).toEqual({
+      kind: "codex-config",
+      config: { model_reasoning_effort: "max" },
+    });
+  });
+
+  test("max on gpt-6-astra is applied", () => {
+    expect(applyReasoningEffort("codex", "gpt-6-astra", "max")).toEqual({
       kind: "codex-config",
       config: { model_reasoning_effort: "max" },
     });

@@ -15,6 +15,7 @@ import { getDbRetentionStats } from "../be/db-retention";
 import { isSteeringEnabled } from "../be/steering";
 import type { AgentLog } from "../types";
 import { AgentLogSchema, ScheduledTaskSchema, ServiceSchema } from "../types";
+import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
 import { resolveHttpFavoriteOwner } from "./favorite-owner";
 import { route } from "./route-def";
 
@@ -48,6 +49,25 @@ const DashboardStatsSchema = z.object({
   agents: AgentCountsSchema,
   tasks: TaskCountsSchema,
   steeringEnabled: z.boolean(),
+  multiRuntimeEnabled: z.boolean(),
+});
+
+/** Mirrors `DbRetentionTableStats` (src/be/db-retention.ts). */
+const RetentionTableStatsSchema = z.object({
+  at: z.string(),
+  rowsDeleted: z.number(),
+  batches: z.number(),
+  durationMs: z.number(),
+  dryRun: z.boolean(),
+  cumulativeRowsDeleted: z.number(),
+  outcome: z.enum(["converged", "budget_exhausted", "error"]),
+  drained: z.boolean(),
+  backlogRemaining: z.number(),
+  batchSize: z.number(),
+  slowestStatementMs: z.number(),
+  lastError: z.string().optional(),
+  lastErrorAt: z.string().optional(),
+  lastSuccessAt: z.string().optional(),
 });
 
 /** Mirrors `SwarmMetrics` (src/be/db.ts). */
@@ -59,36 +79,9 @@ const SwarmMetricsSchema = z.object({
   sessions: z.object({ active: z.number() }),
   skills: z.object({ total: z.number() }),
   retention: z.object({
-    sessionLogs: z
-      .object({
-        at: z.string(),
-        rowsDeleted: z.number(),
-        batches: z.number(),
-        durationMs: z.number(),
-        dryRun: z.boolean(),
-        cumulativeRowsDeleted: z.number(),
-      })
-      .optional(),
-    agentLog: z
-      .object({
-        at: z.string(),
-        rowsDeleted: z.number(),
-        batches: z.number(),
-        durationMs: z.number(),
-        dryRun: z.boolean(),
-        cumulativeRowsDeleted: z.number(),
-      })
-      .optional(),
-    events: z
-      .object({
-        at: z.string(),
-        rowsDeleted: z.number(),
-        batches: z.number(),
-        durationMs: z.number(),
-        dryRun: z.boolean(),
-        cumulativeRowsDeleted: z.number(),
-      })
-      .optional(),
+    sessionLogs: RetentionTableStatsSchema.optional(),
+    agentLog: RetentionTableStatsSchema.optional(),
+    events: RetentionTableStatsSchema.optional(),
   }),
 });
 
@@ -268,6 +261,17 @@ export async function handleStats(
       // Authenticated home for the steering feature flag — deliberately NOT on
       // the unauthenticated /health endpoint (config must not leak).
       steeringEnabled: isSteeringEnabled(),
+      // Same authenticated home, for the same reason. Read through the helper
+      // the server itself branches on, and read PER REQUEST rather than
+      // captured at module load, so the reported value tracks a `swarm_config`
+      // reload the way every other consumer of the flag does.
+      //
+      // Worth stating because the difference is not visible from the outside:
+      // when the mode is off, runtime-instance rows are never written, so an
+      // empty runtime-instance list means either "no runtimes registered" or
+      // "this server does not track them at all". Those need different
+      // responses from a client, and nothing else on the API separates them.
+      multiRuntimeEnabled: isMultiRuntimeEnabled(),
     };
 
     getStats.respond(res, 200, stats);

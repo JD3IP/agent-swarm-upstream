@@ -12,6 +12,7 @@ export const SDK_TOOL_NAME_MAP = {
   task_list: "get-tasks",
   task_get: "get-task-details",
   task_storeProgress: "store-progress",
+  task_defer: "defer-task",
   task_poll: "poll-task",
   task_send: "send-task",
   task_cancel: "cancel-task", // destructive
@@ -26,6 +27,12 @@ export const SDK_TOOL_NAME_MAP = {
   kv_del: "kv-delete",
   kv_incr: "kv-incr",
   kv_list: "kv-list",
+
+  // ── realtime rooms ──
+  room_get: "room-get",
+  room_change: "room-change",
+  room_reset: "room-reset",
+  room_decode: "room-decode",
 
   // ── repos ──
   repo_list: "get-repos",
@@ -48,6 +55,15 @@ export const SDK_TOOL_NAME_MAP = {
   script_launchRun: "launch-script-run",
   script_getRun: "get-script-run",
   script_listRuns: "list-script-runs",
+
+  // ── extensions ──
+  extension_delete: "extension-delete",
+  extension_enable: "extension-enable",
+  extension_disable: "extension-disable",
+  extension_activate_version: "extension-activate-version",
+  extension_catalog: "extension-catalog",
+  extension_install: "extension-install",
+  extension_list: "extension-list",
 
   // ── swarm / agent ──
   swarm_get: "get-swarm",

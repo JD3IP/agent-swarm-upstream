@@ -99,3 +99,44 @@ No harness or boot-path changes are needed.
 The `catalog/` directory is excluded from Biome (`biome.json`) — the authoritative
 gate for script source is the script-runtime typecheck, not the host repo's lint
 rules. The files are still covered by `tsc` and the seed-scripts test.
+
+## Live star-history SVG pages
+
+The `star-history-refresh` seed uses the original chart renderer extracted into
+`src/be/seed-scripts/catalog/star-history-renderer.ts`. The CLI generator imports
+that same module (Node 22.18+ supports its erasable TypeScript); the seed manifest
+inlines it into the script source because the sandbox permits no local imports.
+
+Arguments: `{dryRun: true}` fetches and renders without publishing pages.
+`{authenticated: false}` uses unauthenticated GitHub requests; the default uses
+the `GITHUB_TOKEN` credential binding at `api.github.com`, in a request header only.
+Both paths use per-page ETags. A failed/incomplete fetch retains the entire prior
+series in KV namespace `star-history:desplega-ai/agent-swarm`, key `series`.
+Without a cached series, failure publishes nothing. The result exposes `stale`
+and `fetchedAt`; cached data does not acquire a false fresh timestamp.
+
+After SVG support deploys, run `{dryRun: false}` twice under the intended schedule
+creator and verify identical page IDs and `apiUrl` values. The fixed slugs are
+`star-history-light` and `star-history-dark`. Public images use
+`<PUBLIC_MCP_BASE_URL (or MCP_BASE_URL)>/p/<page-id>`, not the SPA `/pages/<id>` URL.
+The MCP tool upserts by `(agentId, slug)`. Script schedules execute as
+`createdByAgentId` (fallback `schedule`), so a Lead-created schedule publishes
+Lead-owned pages, which differ from worker-owned test pages. Keep that creator
+identity stable and avoid overlapping refresh runs.
+
+The page content type is exactly `image/svg+xml`. Public responses retain raw SVG
+bytes, cache for 1800 seconds, and include nosniff and a sandboxed CSP with
+`default-src 'none'; style-src 'unsafe-inline'`. Protected SVGs retain the
+normal page access gate and use `private, no-store`.
+
+The live pages are published and Lead-owned:
+
+- Light: https://api.desplega.agent-swarm.dev/p/4b5cdc17c45e4a63845fb0a71ed9609c
+- Dark: https://api.desplega.agent-swarm.dev/p/e3473addceb348c0bed6cb93bd5aa532
+
+The hourly schedule `star-history-refresh-hourly` (id
+`3ef2c51c-5d21-4c1b-a19b-fd10d0c57022`) runs at `23 * * * *` UTC with
+`targetType: "script"`. The schedule must stay created by Lead
+`d454d1a5-4df9-49bd-8a89-e58d6a657dc3`: script schedules execute as
+`createdByAgentId`, and pages upsert by `(agentId, slug)`. A different creator
+mints new page ids and silently breaks the README embed.

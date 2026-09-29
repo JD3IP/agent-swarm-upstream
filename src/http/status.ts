@@ -18,16 +18,25 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import {
+  type AutomationSetupStates,
+  automationIntegrationFixUrl,
+  getAutomationSetupStates,
+  listEnabledAutomationPreflightInputs,
+  preflightAutomation,
+} from "../be/automation-preflight";
+import {
   getAgentHarnessProviders,
   getDbClient,
   getInstanceActivity,
   getLiveAgentCounts,
   hasFirstCompletedTask,
   listAgentsWithCredStatusByProvider,
+  NOT_EXTENSION_AGENT_SQL,
 } from "../be/db";
-import { getOAuthApp, getOAuthTokens } from "../be/db-queries/oauth";
+import { getEmbeddingProvider } from "../be/memory";
 import { getFileStorageProvider } from "../fs/registry";
-import { type AgentCredStatus, ProviderNameSchema } from "../types";
+import { getSlackConfiguration } from "../slack/config";
+import { type AgentCredStatus, AutomationIntegrationIdSchema, ProviderNameSchema } from "../types";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
@@ -38,10 +47,14 @@ export type SetupMilestoneState = z.infer<typeof SetupMilestoneStateSchema>;
 
 export const SetupMilestoneIdSchema = z.enum([
   "harness",
+  "embeddings",
   "slack",
   "github",
   "linear",
   "jira",
+  "gsc",
+  "agentmail",
+  "agentfs",
   "workers",
   "first_task",
 ]);
@@ -113,6 +126,29 @@ export const StatusAgentFsSchema = z.object({
 });
 export type StatusAgentFs = z.infer<typeof StatusAgentFsSchema>;
 
+export const AutomationStatusSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  kind: z.enum(["schedule", "workflow"]),
+  state: z.enum(["running", "needs_setup"]),
+  missing: z.object({
+    params: z.array(z.string()),
+    integrations: z.array(AutomationIntegrationIdSchema),
+  }),
+  fixes: z.array(
+    z.discriminatedUnion("type", [
+      z.object({ type: z.literal("param"), key: z.string(), url: z.string() }),
+      z.object({
+        type: z.literal("integration"),
+        key: AutomationIntegrationIdSchema,
+        url: z.string(),
+      }),
+    ]),
+  ),
+  fixUrl: z.string(),
+});
+export type AutomationStatus = z.infer<typeof AutomationStatusSchema>;
+
 /**
  * Phase 2: Aggregate health derived from setup milestones.
  *
@@ -131,6 +167,7 @@ export const StatusResponseSchema = z.object({
   setup: z.array(SetupMilestoneSchema),
   activity: StatusActivitySchema,
   agent_fs: StatusAgentFsSchema,
+  automations: z.array(AutomationStatusSchema),
   /** Phase 2: rolled-up health for the always-on header badge. */
   health: StatusHealthSchema,
 });
@@ -162,9 +199,10 @@ export const TestConnectionResponseSchema = z.object({
  */
 type CredRollupState = "verified" | "configured" | "unverified";
 
-interface CredRollup {
+export interface CredRollup {
   state: CredRollupState;
   workers: number;
+  verifiedWorkers: number;
   reports: number;
   latestLiveTest: AgentCredStatus["liveTest"];
   latestMissing: string[];
@@ -188,7 +226,7 @@ export function _resetTestConnectionCache(): void {
   // intentionally empty
 }
 
-async function rollupCredStatusForProvider(provider: string): Promise<CredRollup> {
+export async function rollupCredStatusForProvider(provider: string): Promise<CredRollup> {
   const agents = await listAgentsWithCredStatusByProvider(provider);
   const reports = agents.map((a) => a.credStatus).filter((s): s is AgentCredStatus => s != null);
 
@@ -196,6 +234,7 @@ async function rollupCredStatusForProvider(provider: string): Promise<CredRollup
     return {
       state: "unverified",
       workers: agents.length,
+      verifiedWorkers: 0,
       reports: 0,
       latestLiveTest: null,
       latestMissing: [],
@@ -207,8 +246,10 @@ async function rollupCredStatusForProvider(provider: string): Promise<CredRollup
   // most-recent live test of any kind.
   const ttl = getCredVerifyTtlMs();
   const now = Date.now();
+  const isFreshPassingReport = (report: AgentCredStatus): boolean =>
+    report.liveTest?.ok === true && now - (report.liveTest?.testedAt ?? 0) < ttl;
   const passing = reports
-    .filter((r) => r.liveTest?.ok === true && now - (r.liveTest?.testedAt ?? 0) < ttl)
+    .filter(isFreshPassingReport)
     .sort((a, b) => (b.liveTest?.testedAt ?? 0) - (a.liveTest?.testedAt ?? 0));
   const anyLive = reports
     .filter((r) => r.liveTest != null)
@@ -231,6 +272,8 @@ async function rollupCredStatusForProvider(provider: string): Promise<CredRollup
   return {
     state,
     workers: agents.length,
+    // Every agent on the harness counts (leads too), same as `workers` and `state`.
+    verifiedWorkers: passing.length,
     reports: reports.length,
     latestLiveTest,
     latestMissing,
@@ -350,63 +393,89 @@ async function harnessMilestone(): Promise<SetupMilestone> {
   };
 }
 
-function slackMilestone(): SetupMilestone {
-  const bot = process.env.SLACK_BOT_TOKEN;
-  const app = process.env.SLACK_APP_TOKEN;
-  const disable = process.env.SLACK_DISABLE;
-  const disabled = disable === "true" || disable === "1";
-
-  if (disabled || !bot || !app) {
+function embeddingsMilestone(): SetupMilestone {
+  // Ask the live provider rather than re-deriving key precedence here — it
+  // reflects whatever the last config reload (or boot) resolved, including
+  // an explicitly empty EMBEDDING_API_KEY disabling the OPENAI_API_KEY
+  // fallback. See OpenAIEmbeddingProvider.isConfigured().
+  if (getEmbeddingProvider().isConfigured()) {
     return {
-      id: "slack",
-      label: "Slack connected",
-      state: "unverified",
-      hint: disabled
-        ? "Slack is explicitly disabled (SLACK_DISABLE=true)."
-        : "Set SLACK_BOT_TOKEN + SLACK_APP_TOKEN to connect Slack.",
-      action_url: "/integrations/slack",
+      id: "embeddings",
+      label: "Memory search",
+      state: "configured",
     };
   }
-  // Socket Mode connection state isn't surfaced today — Phase 2+ enhancement.
-  // For now treat env-present as `verified` so the UX matches the brainstorm.
+
   return {
-    id: "slack",
-    label: "Slack connected",
-    state: "verified",
-    action_url: "/integrations/slack",
+    id: "embeddings",
+    label: "Memory search",
+    state: "unverified",
+    hint: "Memory search is off. Set OPENAI_API_KEY (or EMBEDDING_API_KEY) on the API server to enable it; it is cheap.",
   };
 }
 
-function githubMilestone(): SetupMilestone {
-  const webhook = process.env.GITHUB_WEBHOOK_SECRET;
-  const appId = process.env.GITHUB_APP_ID;
-  const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
-  if (!webhook || !appId || !privateKey) {
+function slackMilestone(state: AutomationSetupStates["slack"]): SetupMilestone {
+  const config = getSlackConfiguration();
+
+  if (state === "unverified") {
+    let hint: string;
+    if (config.disabled) {
+      hint = "Slack is explicitly disabled (SLACK_DISABLE=true).";
+    } else if (!config.mode) {
+      hint = "Invalid SLACK_MODE. Use socket or http.";
+    } else if (config.mode === "http" && config.missingCredentials.length === 0) {
+      hint =
+        "HTTP credentials are configured, but HTTP ingress is unavailable until the receiver is installed.";
+    } else {
+      hint = `Set ${config.missingCredentials.join(" + ")} for Slack ${config.mode} mode.`;
+    }
+    return {
+      id: "slack",
+      label: "Slack configured",
+      state: "unverified",
+      hint,
+      action_url: automationIntegrationFixUrl("slack"),
+    };
+  }
+
+  return {
+    id: "slack",
+    label: "Slack configured",
+    state: "configured",
+    hint:
+      config.mode === "http"
+        ? "HTTP credentials are configured, but HTTP ingress is unavailable until the receiver is installed."
+        : "Socket Mode credentials are configured; a live connection has not been verified.",
+    action_url: automationIntegrationFixUrl("slack"),
+  };
+}
+
+function githubMilestone(state: AutomationSetupStates["github"]): SetupMilestone {
+  if (state === "unverified") {
     return {
       id: "github",
       label: "GitHub App connected",
       state: "unverified",
       hint: "Set GITHUB_WEBHOOK_SECRET, GITHUB_APP_ID, and GITHUB_APP_PRIVATE_KEY.",
-      action_url: "/integrations/github",
+      action_url: automationIntegrationFixUrl("github"),
     };
   }
   return {
     id: "github",
     label: "GitHub App connected",
     state: "verified",
-    action_url: "/integrations/github",
+    action_url: automationIntegrationFixUrl("github"),
   };
 }
 
-async function linearMilestone(): Promise<SetupMilestone> {
-  const tokens = await getOAuthTokens("linear");
-  if (!tokens) {
+function linearMilestone(state: AutomationSetupStates["linear"]): SetupMilestone {
+  if (state === "unverified") {
     return {
       id: "linear",
       label: "Linear connected",
       state: "unverified",
       hint: "Connect Linear via the integrations page.",
-      action_url: "/integrations/linear",
+      action_url: automationIntegrationFixUrl("linear"),
     };
   }
   return {
@@ -414,37 +483,18 @@ async function linearMilestone(): Promise<SetupMilestone> {
     label: "Linear connected",
     state: "verified",
     hint: "Token row present; refresh-failure tracking will land in a future migration — check #swarm-alerts for keepalive errors.",
-    action_url: "/integrations/linear",
+    action_url: automationIntegrationFixUrl("linear"),
   };
 }
 
-async function jiraMilestone(): Promise<SetupMilestone> {
-  const tokens = await getOAuthTokens("jira");
-  if (!tokens) {
+function jiraMilestone(state: AutomationSetupStates["jira"]): SetupMilestone {
+  if (state === "unverified") {
     return {
       id: "jira",
       label: "Jira connected",
       state: "unverified",
-      hint: "Connect Jira via the integrations page.",
-      action_url: "/integrations/jira",
-    };
-  }
-  // Verify cloudId is in oauth_apps.metadata.
-  const app = await getOAuthApp("jira");
-  let hasCloudId = false;
-  try {
-    const meta = app?.metadata ? JSON.parse(app.metadata) : null;
-    hasCloudId = !!(meta && typeof meta === "object" && meta.cloudId);
-  } catch {
-    hasCloudId = false;
-  }
-  if (!hasCloudId) {
-    return {
-      id: "jira",
-      label: "Jira connected",
-      state: "unverified",
-      hint: "Token row present, but cloudId is not yet stored — finish the Jira OAuth callback.",
-      action_url: "/integrations/jira",
+      hint: "Connect Jira and finish the OAuth callback via the integrations page.",
+      action_url: automationIntegrationFixUrl("jira"),
     };
   }
   return {
@@ -452,7 +502,43 @@ async function jiraMilestone(): Promise<SetupMilestone> {
     label: "Jira connected",
     state: "verified",
     hint: "Token row present; refresh-failure tracking will land in a future migration — check #swarm-alerts for keepalive errors.",
-    action_url: "/integrations/jira",
+    action_url: automationIntegrationFixUrl("jira"),
+  };
+}
+
+function gscMilestone(state: AutomationSetupStates["gsc"]): SetupMilestone {
+  return {
+    id: "gsc",
+    label: "Google Search Console connected",
+    state,
+    ...(state === "unverified"
+      ? { hint: "Set GSC_SERVICE_ACCOUNT_BASE64 to connect Google Search Console." }
+      : {}),
+    action_url: automationIntegrationFixUrl("gsc"),
+  };
+}
+
+function agentmailMilestone(state: AutomationSetupStates["agentmail"]): SetupMilestone {
+  return {
+    id: "agentmail",
+    label: "AgentMail connected",
+    state,
+    ...(state === "unverified"
+      ? { hint: "Set AGENTMAIL_API_KEY to let automations send email." }
+      : {}),
+    action_url: automationIntegrationFixUrl("agentmail"),
+  };
+}
+
+function agentfsMilestone(state: AutomationSetupStates["agentfs"]): SetupMilestone {
+  return {
+    id: "agentfs",
+    label: "Agent File System connected",
+    state,
+    ...(state === "unverified"
+      ? { hint: "Configure the agent-fs URL, API key, default org, and default drive." }
+      : {}),
+    action_url: automationIntegrationFixUrl("agentfs"),
   };
 }
 
@@ -460,7 +546,7 @@ async function workersMilestone(): Promise<SetupMilestone> {
   // `configured` if ≥1 row in agents; `verified` if both lead+worker alive
   // within the last 5 minutes.
   const totalRow = await getDbClient().get<{ count: number }>(
-    `SELECT COUNT(*) AS count FROM agents`,
+    `SELECT COUNT(*) AS count FROM agents WHERE ${NOT_EXTENSION_AGENT_SQL}`,
   );
   const totalAgents = totalRow?.count ?? 0;
 
@@ -514,13 +600,20 @@ async function firstTaskMilestone(): Promise<SetupMilestone> {
   };
 }
 
-async function buildSetup(): Promise<SetupMilestone[]> {
+export async function buildSetup(
+  automationSetup?: AutomationSetupStates,
+): Promise<SetupMilestone[]> {
+  automationSetup ??= await getAutomationSetupStates();
   return [
     await harnessMilestone(),
-    slackMilestone(),
-    githubMilestone(),
-    await linearMilestone(),
-    await jiraMilestone(),
+    embeddingsMilestone(),
+    slackMilestone(automationSetup.slack),
+    githubMilestone(automationSetup.github),
+    linearMilestone(automationSetup.linear),
+    jiraMilestone(automationSetup.jira),
+    gscMilestone(automationSetup.gsc),
+    agentmailMilestone(automationSetup.agentmail),
+    agentfsMilestone(automationSetup.agentfs),
     await workersMilestone(),
     await firstTaskMilestone(),
   ];
@@ -570,7 +663,14 @@ export function computeHealth(setup: SetupMilestone[]): StatusHealth {
 // ─── Public payload builder (also exported for tests) ────────────────────────
 
 export async function buildStatusPayload(): Promise<StatusResponse> {
-  const setup = await buildSetup();
+  const automationSetup = await getAutomationSetupStates();
+  const setup = await buildSetup(automationSetup);
+  const automationInputs = await listEnabledAutomationPreflightInputs();
+  const toStatus = ({ failureReason: _, ...status }: ReturnType<typeof preflightAutomation>) =>
+    status;
+  const automations: AutomationStatus[] = automationInputs
+    .map((automation) => toStatus(preflightAutomation(automation, automationSetup)))
+    .sort((a, b) => a.name.localeCompare(b.name) || a.kind.localeCompare(b.kind));
   return {
     identity: buildIdentity(),
     setup,
@@ -580,6 +680,7 @@ export async function buildStatusPayload(): Promise<StatusResponse> {
       base_url: process.env.AGENT_FS_API_URL ?? null,
       ...getAgentFsStatusProvider(),
     },
+    automations,
     health: computeHealth(setup),
   };
 }
@@ -610,7 +711,7 @@ const getStatus = route({
   pattern: ["status"],
   summary: "Identity + setup readiness + live activity for the swarm dashboard",
   description:
-    "Single source of truth consumed by the UI home page. Identity comes from SWARM_* envs; the 7 setup milestones each emit `unverified | configured | verified`; activity counts agents alive in the last 5 min and tasks created in the last 24h; agent_fs reports whether AGENT_FS_API_URL is set.",
+    "Single source of truth consumed by the UI home page. Identity comes from SWARM_* envs; setup milestones each emit `unverified | configured | verified`; automations report `running | needs_setup` from the same runtime preflight used at dispatch; activity counts agents alive in the last 5 min and tasks created in the last 24h; agent_fs reports whether AGENT_FS_API_URL is set.",
   tags: ["Status"],
   responses: {
     200: { description: "Status payload", schema: StatusResponseSchema },
@@ -623,9 +724,9 @@ const postTestConnection = route({
   method: "post",
   path: "/status/test-connection",
   pattern: ["status", "test-connection"],
-  summary: "Live-test the harness provider's credentials",
+  summary: "Read worker-reported harness credential status",
   description:
-    "Issues a real upstream call (Anthropic /v1/models, OpenAI /v1/models, etc.) for the given provider. Updates an in-memory cache so the next GET /status reports `harness.state = 'verified'` for SWARM_VERIFY_TTL_MS (default 1h).",
+    "Reads worker-reported credential checks from agent rows. This route makes no upstream request and returns a reported live-test result when one exists.",
   tags: ["Status"],
   body: TestConnectionRequestSchema,
   responses: {

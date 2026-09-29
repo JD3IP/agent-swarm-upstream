@@ -1,3 +1,4 @@
+import type { TaskCitation } from "../../../../src/utils/task-citations";
 // Backend types (mirrored from agent-swarm backend)
 export type AgentStatus = "idle" | "busy" | "offline" | "waiting_for_credentials";
 export type AgentTaskStatus =
@@ -26,11 +27,72 @@ export type AgentTaskSource =
   | "workflow"
   | "linear"
   | "jira";
+export type RoutingReason = "skill" | "continuity" | "overflow" | "human_pinned" | "reroute_fault";
 export type ChannelType = "public" | "dm";
 export type ModelTier = "smol" | "regular" | "smart" | "ultra";
 /** Mirrors `REASONING_EFFORT_LEVELS` in `src/providers/reasoning-effort.ts` (backend). */
 export const REASONING_EFFORT_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"] as const;
 export type ReasoningEffortLevel = (typeof REASONING_EFFORT_LEVELS)[number];
+
+export type AcpTarget = "opencode" | "custom";
+
+export type ClaudeTransport = "cli" | "sdk";
+
+export interface ClaudeRuntimeConfig {
+  /** `null` clears the agent override. Omission leaves it unchanged. */
+  transport?: ClaudeTransport | null;
+}
+
+export interface AgentRuntimeResponse {
+  claude: {
+    /** The agent-scoped override. `null` means inherit. */
+    transport: ClaudeTransport | null;
+    effectiveTransport: ClaudeTransport;
+    inheritedTransport: ClaudeTransport;
+    bridgeEffective: boolean;
+  };
+}
+
+export interface AcpRuntimeConfig {
+  target: AcpTarget;
+  command?: string | null;
+  args?: string[];
+  envKeys?: string[];
+  modelEnvKey?: string | null;
+  options?: Record<string, string | boolean>;
+}
+
+export type AcpSessionConfigOption =
+  | {
+      type: "select";
+      id: string;
+      name: string;
+      description?: string | null;
+      category?: string | null;
+      currentValue: string;
+      options: Array<
+        | { value: string; name: string; description?: string | null }
+        | {
+            group: string;
+            name: string;
+            options: Array<{ value: string; name: string; description?: string | null }>;
+          }
+      >;
+    }
+  | {
+      type: "boolean";
+      id: string;
+      name: string;
+      description?: string | null;
+      category?: string | null;
+      currentValue: boolean;
+    };
+
+export interface AgentAcpStatus {
+  target: AcpTarget;
+  configOptions: AcpSessionConfigOption[];
+  reportedAt: number;
+}
 
 /** Mirrors `AgentAvatarSchema` (backend `src/types.ts`). Discriminated union so
  * future avatar types (emoji, image, ...) can be added with no migration —
@@ -79,6 +141,14 @@ export interface Agent {
    * worker hasn't booted yet, or `CRED_CHECK_DISABLE=1` opted it out.
    */
   credStatus?: AgentCredStatus | null;
+  /**
+   * Effective `CLAUDE_TRANSPORT` (global → agent precedence) for Claude
+   * agents. Absent for other harnesses. Reflects the next session, not
+   * necessarily the last one that ran.
+   */
+  claudeTransport?: ClaudeTransport;
+  /** Last heartbeat or activity (ISO). "Alive" in `/status` = within 5 min and not offline. */
+  lastActivityAt?: string;
   createdAt: string;
   lastUpdatedAt: string;
 }
@@ -133,6 +203,8 @@ export interface AgentCredStatus {
   reportKind?: "boot" | "post_task";
   /** Pi-mono Bedrock enumeration block. Null when not in Bedrock mode. */
   bedrock?: AgentBedrockStatus | null;
+  /** ACP session options most recently advertised by the target. */
+  acp?: AgentAcpStatus | null;
 }
 
 export interface AgentLatestModel {
@@ -154,6 +226,9 @@ export interface AgentTask {
   title?: string;
   status: AgentTaskStatus;
   source: AgentTaskSource;
+  routingReason?: RoutingReason;
+  routingSource?: "declared" | "engine_default";
+  routingNote?: string;
   taskType?: string;
   tags: string[];
   priority: number;
@@ -190,7 +265,7 @@ export interface AgentTask {
   credentialKeyType?: string;
   swarmVersion?: string;
   provider?: ProviderName;
-  providerMeta?: DevinProviderMeta | Record<string, never>;
+  providerMeta?: DevinProviderMeta | ClaudeProviderMeta | Record<string, never>;
   harnessVariant?: string;
   harnessVariantMeta?: { version?: string; failureArtifact?: string };
   peakContextPercent?: number;
@@ -204,6 +279,7 @@ export interface AgentTask {
   contextKey?: string;
   /** Pointer-based artifacts attached to the task, when included by the API response. */
   attachments?: TaskAttachment[];
+  citations?: TaskCitation[];
   /**
    * Steering (≥1.122.1), derived server-side: true when the assigned agent is
    * the Lead. Only present on task *read* responses (`GET /api/tasks/:id`,
@@ -219,11 +295,23 @@ export interface AgentTask {
   supportedSteerModes?: SteerMode[];
 }
 
-export type ProviderName = "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+export type ProviderName =
+  | "claude"
+  | "codex"
+  | "pi"
+  | "devin"
+  | "claude-managed"
+  | "opencode"
+  | "acp"
+  | "dsh";
 export type DevinProviderMeta = {
   sessionUrl: string;
   maxAcuLimit?: number;
   acuCostUsd?: number;
+};
+/** Persisted by the worker at session init (`providerMeta.transport`). */
+export type ClaudeProviderMeta = {
+  transport?: ClaudeTransport;
 };
 
 // ============================================================================
@@ -249,6 +337,7 @@ export interface SteeringMessage {
   /** Mode the worker actually delivered in — may differ from `mode` after a degrade. */
   deliveredMode?: SteerMode;
   source: SteeringSource;
+  senderLabel?: string;
   createdByKind: "user" | "agent" | "system";
   createdByUserId?: string;
   createdByAgentId?: string;
@@ -515,7 +604,8 @@ export type InboxItemType =
   | "credential_missing"
   | "broken_task"
   | "to_read"
-  | "to_start_template";
+  | "to_start_template"
+  | "notification";
 
 export type InboxItemStatus = "open" | "snoozed" | "dismissed" | "done";
 
@@ -528,6 +618,8 @@ export interface InboxItemState {
   snoozeUntil?: string;
   dismissedAt?: string;
   doneAt?: string;
+  /** First-viewed timestamp, set once on first notification panel open. */
+  readAt?: string;
   createdAt: string;
   lastUpdatedAt: string;
 }
@@ -873,6 +965,8 @@ export interface UsageSummaryTotals {
   excludedCostUsd?: number;
   /** Distinct tasks behind `excludedCostUsd` — name the exclusion, don't just show a percentage. */
   excludedTaskCount?: number;
+  /** API-priced cost of sessions on subscription credentials (Claude OAuth, Codex OAuth). Older API servers omit it. */
+  subscriptionCostUsd?: number;
 }
 
 /**
@@ -900,6 +994,44 @@ export interface UsageSummaryDailyRow {
   inputTokens: number;
   outputTokens: number;
   sessions: number;
+  /** Part of `costUsd` on subscription credentials. Older API servers omit it. */
+  subscriptionCostUsd?: number;
+}
+
+/** Spend per credential in the window (`groupBy=both` only). */
+export interface UsageSummaryByCredentialRow {
+  /** `null` when the task recorded no credential. */
+  keyType: string | null;
+  keySuffix: string | null;
+  /** Label set on the API Keys page. */
+  name: string | null;
+  /** Billed as a flat subscription (Claude OAuth, Codex OAuth) rather than per token. */
+  subscription: boolean;
+  /** Plan id from `GET /api/keys/plans`, or null when unknown. */
+  plan: string | null;
+  /** `estimated` = Claude plan guessed from rate-limit utilization. The server applies the precedence. */
+  planSource: "detected" | "manual" | "estimated" | null;
+  /** API-priced cost of the sessions. */
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  sessions: number;
+  firstSessionAt: string;
+  lastSessionAt: string;
+}
+
+export interface SubscriptionPlan {
+  id: string;
+  label: string;
+  keyType: string;
+  /** Monthly list price in USD. */
+  monthlyUsd: number;
+}
+
+export interface SubscriptionPlansResponse {
+  /** Date the list prices were checked. */
+  checkedAt: string;
+  plans: SubscriptionPlan[];
 }
 
 export interface UsageSummaryByAgentRow {
@@ -926,6 +1058,8 @@ export interface UsageSummaryResponse {
   daily: UsageSummaryDailyRow[];
   byAgent: UsageSummaryByAgentRow[];
   byUser?: UsageSummaryByUserRow[];
+  /** Spend per credential (`groupBy=both` only). Older API servers omit it. */
+  byCredential?: UsageSummaryByCredentialRow[];
 }
 
 export interface DashboardCostResponse {
@@ -961,6 +1095,14 @@ export interface AgentUsageSummary {
 }
 
 export type ScheduledTaskTargetType = "agent-task" | "workflow" | "script";
+export type AutomationIntegrationId =
+  | "slack"
+  | "github"
+  | "linear"
+  | "jira"
+  | "gsc"
+  | "agentmail"
+  | "agentfs";
 
 export interface ScheduledTask {
   id: string;
@@ -986,6 +1128,12 @@ export interface ScheduledTask {
   workflowId?: string;
   scriptName?: string;
   scriptArgs?: Record<string, unknown>;
+  /** Setup values injected into the automation template at run time. */
+  params?: Record<string, unknown>;
+  /** Parameter names which must be set before the automation can run. */
+  requiredParams?: string[];
+  /** Integrations that must be verified before the automation can run. */
+  requires?: AutomationIntegrationId[];
   createdAt: string;
   lastUpdatedAt: string;
   favorite?: boolean;
@@ -1140,6 +1288,12 @@ export interface Workflow {
   createdAt: string;
   lastUpdatedAt: string;
   favorite?: boolean;
+  /** Setup values injected into the workflow at trigger time. */
+  params?: Record<string, unknown>;
+  /** Parameter names which must be set before the workflow can run. */
+  requiredParams?: string[];
+  /** Integrations that must be verified before the workflow can run. */
+  requires?: AutomationIntegrationId[];
 }
 
 export type WorkflowRunStatus = "running" | "waiting" | "completed" | "failed" | "skipped";
@@ -1343,6 +1497,172 @@ export interface ScriptTypeDefs {
 
 export interface ScriptsResponse {
   scripts: ScriptListItem[];
+}
+
+// Extensions (`extensions` table — mirrors Extension/ExtensionVersion/ExtensionRun in src/types.ts)
+
+export type ExtensionRuntime = "api" | "worker";
+
+export type ExtensionStatus = "disabled" | "enabled" | "error" | "auto-disabled";
+
+/** A global script a bundle ships — mirrors `ExtensionScriptAssetSchema` in src/types.ts. */
+export interface ExtensionScriptAsset {
+  /** Global script name; starts with `<extension name>-`. */
+  name: string;
+  /** Bundle path of the script source. */
+  file: string;
+  description: string;
+  intent?: string;
+}
+
+/** A schedule a bundle ships — mirrors `ExtensionScheduleAssetSchema` in src/types.ts. */
+export interface ExtensionScheduleAsset {
+  /** Schedule name; starts with `<extension name>-`. */
+  name: string;
+  description?: string;
+  /** Name of a script declared in `assets.scripts`. */
+  script: string;
+  cronExpression?: string;
+  intervalMs?: number;
+  timezone?: string;
+  args?: Record<string, unknown>;
+}
+
+/** Bundle manifest — mirrors `ExtensionManifestSchema` in src/types.ts. */
+export interface ExtensionManifest {
+  $schema?: string;
+  name: string;
+  description: string;
+  version: string;
+  runtime: ExtensionRuntime;
+  assets: {
+    hooks: string;
+    scripts?: ExtensionScriptAsset[];
+    schedules?: ExtensionScheduleAsset[];
+    /** Each skill ships as a directory holding SKILL.md and optional files/. */
+    skills?: Array<{ dir: string }>;
+    /** Each workflow ships as a YAML or JSON file. */
+    workflows?: Array<{ file: string }>;
+  };
+  homepage?: string;
+  author?: string;
+}
+
+/** Row served by `GET /api/extensions/catalog` — a predefined bundle from `templates/extensions/`. */
+export interface ExtensionCatalogItem {
+  name: string;
+  description: string;
+  /** Semver of the catalog manifest. */
+  version: string;
+  /** `manifest.yaml`, `manifest.yml`, or `manifest.json`. */
+  manifestFile: string;
+  /** Declared asset counts by kind (`scripts`, `schedules`, `skills`, `workflows`); hooks are not counted. */
+  assets: Record<string, number>;
+  /** README markdown, when the template ships one. */
+  readme: string | null;
+  installed: { id: string; version: number; enabled: boolean } | null;
+}
+
+export interface Extension {
+  id: string;
+  name: string;
+  description: string;
+  runtime: ExtensionRuntime;
+  manifestJson: string;
+  contentHash: string;
+  version: number;
+  activeVersion: number;
+  enabled: boolean;
+  priority: number;
+  /** Scrubbed server-side on every read path — never round-trip it back into a PATCH. */
+  configJson: string;
+  status: ExtensionStatus;
+  consecutiveFailures: number;
+  lastError: string | null;
+  agentId: string | null;
+  createdByAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Row served by `GET /api/extensions/{id}/versions`. */
+export interface ExtensionVersion {
+  id: string;
+  extensionId: string;
+  version: number;
+  manifestJson: string;
+  filesJson: string;
+  contentHash: string;
+  changedByAgentId: string | null;
+  changedAt: string;
+  changeReason: string | null;
+}
+
+export type ExtensionRunAction =
+  | "continue"
+  | "modify"
+  | "block"
+  | "error"
+  | "timeout"
+  | "load-error";
+
+/** Row served by `GET /api/extensions/{id}/runs`. */
+export interface ExtensionRun {
+  id: string;
+  extensionId: string;
+  version: number;
+  event: string;
+  action: ExtensionRunAction;
+  durationMs: number | null;
+  message: string | null;
+  agentId: string | null;
+  subject: string | null;
+  createdAt: string;
+}
+
+/** `GET /api/extensions/{id}` — the stored record plus its parsed manifest and files. */
+export interface ExtensionBundle {
+  extension: Extension;
+  manifest: ExtensionManifest;
+  files: Record<string, string>;
+}
+
+/**
+ * `POST /api/extensions/install` body. Only catalog templates install; an
+ * inline `manifest`/`files` bundle is rejected with `inline_install_disabled`.
+ */
+export interface ExtensionInstallInput {
+  /** Catalog name from `GET /api/extensions/catalog`. */
+  template: string;
+  priority?: number;
+  config?: Record<string, unknown>;
+}
+
+/** Global assets the install reconciled, by name. */
+export interface ExtensionInstallAssets {
+  created: string[];
+  updated: string[];
+  skipped: string[];
+}
+
+export interface ExtensionInstallResult {
+  extension: Extension;
+  manifest: ExtensionManifest;
+  /** True when the template matched the stored content, so no new version was staged. */
+  contentDeduped: boolean;
+  assets?: ExtensionInstallAssets;
+}
+
+/** `DELETE /api/extensions/{id}` response. */
+export interface ExtensionDeleteResult {
+  deleted: true;
+  assets?: { deleted: string[]; detached: string[] };
+}
+
+export interface ExtensionPatchInput {
+  priority?: number;
+  config?: Record<string, unknown>;
+  description?: string;
 }
 
 // Script connections (`ctx.api.<slug>` / `ctx.mcp.<slug>`)
@@ -1825,7 +2145,7 @@ export interface RenderResponse {
 
 // Approval Requests
 
-export type ApprovalRequestStatus = "pending" | "approved" | "rejected" | "timeout";
+export type ApprovalRequestStatus = "pending" | "approved" | "rejected" | "timeout" | "cancelled";
 
 export interface ApprovalQuestion {
   id: string;
@@ -1854,6 +2174,7 @@ export interface ApprovalRequest {
   responses: Record<string, unknown> | null;
   resolvedBy: string | null;
   resolvedAt: string | null;
+  resolutionReason: string | null;
   workflowRunId: string | null;
   workflowRunStepId: string | null;
   sourceTaskId: string | null;
@@ -2087,6 +2408,9 @@ export interface ApiKeyStatus {
   provider: string;
   /** Optional human-friendly label set from the dashboard. */
   name: string | null;
+  /** Subscription plan id (see `GET /api/keys/plans`), when known. */
+  plan: string | null;
+  planSource: "manual" | "detected" | "estimated" | null;
   rateLimitWindows: Record<
     string,
     {
@@ -2098,6 +2422,14 @@ export interface ApiKeyStatus {
       lastSeenAt: string;
     }
   >;
+  /** Derived, readable view of any rejected model-scoped window (Fable/Opus/Sonnet) on this key. */
+  modelLimits: Array<{
+    model: string;
+    window: string;
+    resetsAt: number;
+    resetsAtIso: string;
+    active: boolean;
+  }>;
   createdAt: string;
   updatedAt: string;
 }
@@ -2287,10 +2619,14 @@ export type SetupMilestoneState = "unverified" | "configured" | "verified";
 
 export type MilestoneId =
   | "harness"
+  | "embeddings"
   | "slack"
   | "github"
   | "linear"
   | "jira"
+  | "gsc"
+  | "agentmail"
+  | "agentfs"
   | "workers"
   | "first_task";
 
@@ -2319,6 +2655,21 @@ export interface StatusIdentity {
   org_id: string | null;
 }
 
+export interface FeedbackInput {
+  submission_id: string;
+  user_id: string;
+  install_id: string | null;
+  installed_at: string | null;
+  org_name: string;
+  swarm_version: string;
+  name?: string;
+  email?: string;
+  newsletter_consent: boolean;
+  nps?: 1 | 2 | 3 | 4 | 5;
+  message?: string;
+  submitted_at: string;
+}
+
 export interface StatusActivity {
   agents_online: number;
   leads_online: number;
@@ -2332,6 +2683,21 @@ export interface StatusAgentFs {
   capabilities: Record<string, unknown>;
 }
 
+export interface StatusAutomation {
+  id: string;
+  name: string;
+  kind: "schedule" | "workflow";
+  state: "running" | "needs_setup";
+  missing: {
+    params: string[];
+    integrations: string[];
+  };
+  fixes: Array<
+    { type: "param"; key: string; url: string } | { type: "integration"; key: string; url: string }
+  >;
+  fixUrl: string;
+}
+
 /**
  * Phase 2: Aggregate health rolled up server-side from the setup milestones.
  * Drives the always-on header badge color.
@@ -2343,6 +2709,11 @@ export interface StatusResponse {
   setup: SetupMilestone[];
   activity: StatusActivity;
   agent_fs: StatusAgentFs;
+  /**
+   * Added in v1.142.0 (#1330). Absent when the dashboard talks to an older API,
+   * so every consumer must treat it as optional.
+   */
+  automations?: StatusAutomation[];
   /** Phase 2: rolled-up health for the always-on header badge. */
   health: StatusHealth;
 }
@@ -2762,3 +3133,138 @@ export type AppRow = Record<string, unknown> & {
   createdAt: string;
   updatedAt: string;
 };
+
+// ─── Onboarding (GET/PUT /api/onboarding) ────────────────────────────────────
+// Contract: thoughts/taras/plans-yolo/2026-09-24-ui-onboarding.md § API contract.
+
+export type OnboardingStepId =
+  | "connect"
+  | "name"
+  | "ai"
+  | "agents"
+  | "memory"
+  | "integrations"
+  | "first_task";
+
+export type OnboardingStepStatus = "todo" | "done" | "skipped" | "failed";
+
+export type OnboardingErrorClass =
+  | "auth"
+  | "network"
+  | "timeout"
+  | "dimension"
+  | "model"
+  | "not_enabled"
+  | "expired"
+  | "unknown";
+
+export type OnboardingAiMethod =
+  | "claude_setup_token"
+  | "claude_api_key"
+  | "codex_device"
+  | "codex_cli"
+  | "openrouter"
+  | "openai_gateway"
+  | "deepseek"
+  | "devin";
+
+/** The dial level every agent got, or `mixed` (different levels or a custom model). */
+export type OnboardingAgentsMethod = "cheap" | "optimal" | "max" | "mixed";
+
+export type OnboardingMemoryPreset = "openai" | "openrouter" | "vercel" | "custom" | "existing";
+
+export type OnboardingIntegrationMethod =
+  | "slack"
+  | "github"
+  | "gitlab"
+  | "linear_oauth"
+  | "jira_oauth";
+
+export interface OnboardingStepState {
+  status: OnboardingStepStatus;
+  at: string | null;
+  method: string | null;
+  errorClass: OnboardingErrorClass | null;
+}
+
+export interface OnboardingState {
+  version: 1;
+  startedAt: string;
+  currentStep: OnboardingStepId;
+  minimizedAt: string | null;
+  dismissedAt: string | null;
+  completedAt: string | null;
+  autoCompleted: boolean;
+  firstTaskId: string | null;
+  steps: Record<OnboardingStepId, OnboardingStepState>;
+}
+
+export interface OnboardingProviderSignal {
+  provider: ProviderName;
+  state: "unverified" | "configured" | "verified";
+  workers: number;
+  verifiedWorkers: number;
+}
+
+export interface OnboardingSignals {
+  providers: OnboardingProviderSignal[];
+  embeddings: { configured: boolean; dimensions: number };
+  integrations: {
+    slack: boolean;
+    github: boolean;
+    gitlab: boolean;
+    linear: boolean;
+    jira: boolean;
+  };
+  agents: { leadsOnline: number; workersOnline: number };
+  firstTask: { id: string; status: string } | null;
+}
+
+export interface OnboardingResponse {
+  state: OnboardingState;
+  signals: OnboardingSignals;
+}
+
+export type OnboardingAction =
+  | { action: "view"; step: OnboardingStepId }
+  | { action: "complete"; step: "connect"; method: "api_key" }
+  | { action: "complete"; step: "name"; method: "custom_name" | "default_name" }
+  | { action: "complete"; step: "ai"; method: OnboardingAiMethod }
+  | { action: "complete"; step: "agents"; method: OnboardingAgentsMethod }
+  | { action: "complete"; step: "integrations"; method: OnboardingIntegrationMethod }
+  | { action: "skip"; step: Exclude<OnboardingStepId, "connect"> }
+  | { action: "fail"; step: OnboardingStepId; errorClass: OnboardingErrorClass }
+  | { action: "first_task"; taskId: string; method: "suggestion" | "free_form" }
+  | { action: "minimize" }
+  | { action: "resume" }
+  | { action: "dismiss" };
+
+export interface OnboardingMemoryTestRequest {
+  preset: OnboardingMemoryPreset;
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
+  reuseKey?: "OPENAI_API_KEY" | "OPENROUTER_API_KEY";
+}
+
+export interface OnboardingMemoryTestResponse {
+  ok: boolean;
+  dimensions?: number;
+  latencyMs: number;
+  error?: string;
+  errorClass?: OnboardingErrorClass;
+}
+
+export interface CodexDeviceStartResponse {
+  flowId: string;
+  userCode: string;
+  verificationUrl: string;
+  intervalSeconds: number;
+  expiresAt: string;
+}
+
+export interface CodexDevicePollResponse {
+  status: "pending" | "complete" | "failed" | "expired";
+  slot?: number;
+  error?: string;
+}

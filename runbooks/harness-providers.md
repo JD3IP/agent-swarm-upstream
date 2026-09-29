@@ -1,17 +1,83 @@
 # Harness providers runbook
 
-Operational rules for editing or adding harness providers (claude, codex, opencode, pi, devin, future).
+Operational rules for editing or adding harness providers (claude, codex, opencode, pi, devin, acp, future).
 
 ## Supported providers
 
 | Provider | `HARNESS_PROVIDER` | Adapter | Notes |
 |----------|--------------------|---------|-------|
-| Claude Code | `claude` | `ClaudeAdapter` | Default; spawns `claude` CLI |
-| Codex | `codex` | `CodexAdapter` | Spawns `codex` CLI; OpenAI/ChatGPT OAuth |
+| Claude Code | `claude` | `ClaudeAdapter` | CLI by default; optional Agent SDK transport |
+| Codex | `codex` | `CodexAdapter` | Starts a fresh `codex app-server` for each task. OpenAI/ChatGPT OAuth |
 | opencode | `opencode` | `OpencodeAdapter` | Spawns `opencode` CLI; OpenRouter primary; agent-swarm plugin auto-injected. See [harness-configuration § Opencode](/docs/guides/harness-configuration#opencode) |
 | pi-mono | `pi` | `PiMonoAdapter` | In-process library; OpenRouter, Anthropic, or Amazon Bedrock (via `MODEL_OVERRIDE=amazon-bedrock/*` — see Bedrock auth below) |
 | Devin | `devin` | `DevinAdapter` | Cloud-managed via Cognition `/sessions` API |
 | Claude Managed | `claude-managed` | `ClaudeManagedAdapter` | Anthropic managed sandbox; SSE relay |
+| ACP | `acp` | `ACPAdapter` | Curated `opencode` preset or a custom [Agent Client Protocol](https://agentclientprotocol.com) command. Session knobs such as model use `session/set_config_option` when advertised, with target-specific startup fallbacks. No swarm-side *model-provider* credential — the target owns its own model auth. The target receives the worker's swarm API key as the swarm MCP bearer, so point custom targets only at binaries you trust |
+
+## DeepSeek Harness (`dsh`)
+
+Set `HARNESS_PROVIDER=dsh` and `OPENROUTER_API_KEY` in the worker environment or
+agent-scoped config. This runs DeepSeek's own harness with the same defaults as
+pi: smol/regular `openrouter/deepseek/deepseek-v4.1-flash`, smart
+`openrouter/deepseek/deepseek-v4-pro-0813`, ultra `openrouter/anthropic/claude-opus-5.5`.
+
+Routing follows the model prefix, even when both keys are available:
+`MODEL_OVERRIDE=openrouter/<model-id>` uses the bundled `llm-pi-ai` adapter with
+`OPENROUTER_API_KEY`, strips only `openrouter/`, and honors `OPENROUTER_BASE_URL`
+(default `https://openrouter.ai/api/v1`). The selected model is explicitly declared
+so newly released IDs do not depend on the bundled catalog. For direct DeepSeek,
+set `DEEPSEEK_API_KEY` and a bare `MODEL_OVERRIDE` such as `deepseek-v4-pro`;
+this retains the native `llm-deepseek` route. The native Flash ID is
+`deepseek-flash` (V4.1 Flash); OpenRouter uses `deepseek/deepseek-v4.1-flash`.
+There is no fallback across providers when the selected route's key is missing.
+
+The full worker image installs `@deepseek-ai/dsh@0.1.7-alpha.2` at build time
+in `worker-full-base`, alongside the optional tools in `/opt/global-deps-full`.
+The slim image does not include dsh: use `worker-full` or provision the pinned
+package in your custom image before starting a dsh worker. Both the entrypoint
+and adapter fail when the executable is absent; startup never downloads npm
+packages. `DSH_BINARY` selects a trusted preinstalled executable, otherwise the
+adapter finds `dsh` on PATH. Use the pinned alpha for its required stdin/JSON
+surface.
+
+The adapter launches `--profile headless --patch <temporary-file> --json -`,
+sends the task over stdin, sets the child working directory, and applies the
+model and system prompt through the profile patch. Patch files are private and
+removed after exit or cancellation. Credential readiness accepts either environment
+key; session startup requires the key matching the selected model. Readiness
+does not inspect dsh's managed credential store or verify inference.
+
+This minimal integration has local tools and final output, but no swarm MCP
+connection, live steering, native resume, or cost/context telemetry. The runner
+handles task completion from the returned output. Configure it as a worker;
+lead orchestration needs MCP. Developer-preview compatibility can change.
+
+Verified against the [upstream headless documentation](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.1.7-alpha.2/packages/bundle/headless/README.md)
+and the installed CLI's top-level and headless help.
+
+## Claude transport selection
+
+`CLAUDE_TRANSPORT=cli|sdk` selects execution inside `ClaudeAdapter`. CLI remains the default.
+The SDK uses the installed Claude executable with pinned SDK `0.3.266`.
+Both transports share configuration, credentials, normalized events, and adapter-owned summaries.
+Both transports remove the legacy `AGENT_SWARM_CLAUDE_OAUTH_TOKEN` mirror from the Claude child environment.
+Adapter-owned summaries retain their selected credentials outside that child.
+Claude filters its standard OAuth variable from command hooks, but retains API keys. Only enable trusted project hooks.
+The worker persists `providerMeta.transport` on session initialization.
+
+The runtime endpoint accepts `claude: { transport: "cli" | "sdk" | null }`.
+Omission preserves the agent's transport override. `null` deletes the override and restores inheritance.
+The dashboard shows the inherited effective value and preserves Claude settings when another harness hides the selector.
+
+Resolve transport from each session's fresh configuration, including repository scope when available.
+Do not export scoped transport values into `process.env` at boot or during reload.
+That would retain an override after its configuration row was deleted.
+In-flight sessions retain their original transport.
+
+Reject SDK selection when a supported, direct, or legacy bridge is effective.
+Preserve the bridge flag's existing fallback without OAuth credentials.
+Custom executable prefixes must speak the SDK protocol. Never silently remove their arguments.
+Swarm context preambles remain the continuation mechanism. Native SDK resume stays disabled.
 
 ## `HARNESS_PROVIDER` resolution + live re-assignment
 
@@ -29,6 +95,20 @@ Operators flip a worker's provider in either of two ways:
 The worker reconciles within ~10s (one poll cycle). In-flight task sessions stay on the old adapter; new spawns pick up the new one. Failures during swap (invalid value, adapter init error) log and stay on the current provider — never wedge the worker. Implementation: `src/utils/harness-provider.ts` + the `lastHarnessReconcileAt` block in `src/commands/runner.ts`'s poll loop.
 
 Invalid `HARNESS_PROVIDER` values are rejected at write time (HTTP 400 from `PUT /api/config` or the MCP `set-config` tool) — see `validateConfigValue` in `src/be/swarm-config-guard.ts`.
+
+### ACP target configuration
+
+The dashboard runtime editor is the preferred configuration path. Selecting ACP on a non-ACP agent starts with the OpenCode preset; an older ACP agent with no `ACP_TARGET` row remains `custom` for backward compatibility. The editor writes the harness, model, and ACP target fields in one `PATCH /api/agents/{id}/runtime` transaction.
+
+OpenCode runs `opencode acp`. Before the first prompt, the adapter applies `MODEL_OVERRIDE` through ACP's advertised `model` config option. It also injects the model into `OPENCODE_CONFIG_CONTENT` before spawn, because the process environment cannot be changed after `session/new`; that startup value is the fallback when the target omits or rejects the protocol option. Missing or rejected options are logged and do not fail the session.
+
+Custom targets use `ACP_TARGET_COMMAND` plus JSON-array `ACP_TARGET_ARGS`. `ACP_TARGET_ENV_KEYS` is a JSON array of environment/config keys explicitly allowed into the child process; the adapter never forwards the complete resolved environment. `ACP_MODEL_ENV_KEY` optionally maps `MODEL_OVERRIDE` into a target-specific environment variable as its model fallback. `ACP_CONFIG_OPTIONS` is a JSON object of additional string or boolean ACP option values.
+
+All projected config-option strings pass through `scrubSecrets` before the adapter emits session metadata, including grouped choices. Boolean values and non-secret model IDs and descriptions retain their values. This protects both credential-status persistence and the diagnostic mirror.
+
+After `session/prompt` completes, the adapter persists a bounded, scrubbed `custom` raw-log entry named `acp_prompt_response`. Its `data` contains `sessionId`, `stopReason`, `usage` (`null` when absent), and `_meta` when supplied. Token classes from the optional prompt usage map directly into `CostData`; missing counters remain `undefined` at the adapter boundary. The session-cost API and DB coalesce missing input/output/cache counters to zero, so persisted costs and UI displays cannot distinguish absent usage from measured zero. The raw diagnostic retains that distinction. Context `usage_update` totals do not substitute for billing tokens. No ACP pricing identity is inferred from the target or requested model.
+
+The latest sanitized `configOptions` advertised by a target are stored in the agent's credential-status telemetry and shown read-only in the dashboard. No report means no ACP session has reported options yet; an empty list means a session explicitly advertised none.
 
 The `docker-entrypoint.sh` swarm_config-fetch step explicitly **skips** `HARNESS_PROVIDER` when exporting config to env. Baking it would shadow swarm_config deletes with the stale value persisted in `process.env`.
 
@@ -50,14 +130,19 @@ MCP tools return `isError` on the wire `CallToolResult` (see [runbooks/mcp-tool-
 | `claude-managed` | Yes | Yes | Sends ordered `user.message` events to the managed session. |
 | `opencode` | Lossy: SDK abort, then `promptAsync` | Native `promptAsync` | Interrupt discards the in-flight turn before re-prompting; queue is the zero-loss path. |
 | `devin` | No | Yes | `sendMessage` accepts a working session but does not guarantee interruption, so the adapter always reports `mode: "queue"`. |
-| `claude` | No | Conditional | Raw CLI stream-json queues input at a turn boundary; it does not interrupt. See the gate below. |
-| `codex` | No | Yes (harness-side) | No in-process channel exists (`@openai/codex-sdk` drives `codex exec` with stdin closed; native `turn/steer` is app-server-only — issue #1034). The codex-hook delivers instead. See below. |
+| `claude` | No | Conditional | Both transports queue input at a turn boundary. CLI uses the version gate below. SDK enables queueing unless explicitly disabled. |
+| `codex` | Native `turn/steer` | Adapter queue | The per-task app-server receives steering over JSON-RPC. `steer` interrupts the active turn. `queue` starts after that turn ends. See below. |
+| `acp` | No | No | ACP has one in-flight `session/prompt` and no queue primitive; `session/cancel` is a full abort, not an interrupt. Advertises `[]`. |
 
 The server-side `PROVIDER_STEER_CAPABILITIES` map in `src/types.ts` must deep-equal each adapter's `traits.steerModes ?? []`. `src/tests/provider-steering-capabilities.test.ts` iterates the canonical `ProviderNameSchema` list through `createProviderAdapter()` and names the offending provider on drift. Adding a provider requires updating the schema, factory, adapter traits, and capability map together.
 
-Steering is disabled by default; `STEERING_ENABLED=true|1` is the global opt-in (set it on the API server and worker containers). While off, new steering requests are rejected, steering MCP/UI surfaces are removed, and worker delivery polling is skipped. Existing read-only message history, in-flight worker delivery callbacks, and terminal-status promotion remain available so pre-existing rows can be inspected and drain to a terminal state.
+Steering is enabled by default; `STEERING_ENABLED=false|0` is the global opt-out (set it on the API server and worker containers). While off, new steering requests are rejected, steering MCP/UI surfaces are removed, and worker delivery polling is skipped. Existing read-only message history, in-flight worker delivery callbacks, and terminal-status promotion remain available so pre-existing rows can be inspected and drain to a terminal state.
 
 ### Claude queue-steering gate
+
+These version checks apply to the CLI transport.
+The SDK always uses streaming input and enables queued delivery unless `CLAUDE_QUEUE_STEERING` explicitly disables it.
+The SDK rejects bridge selection before starting a session.
 
 Claude's queued steering needs `--input-format stream-json`. That input mode is mutually exclusive with the long-standing `-p <prompt>` invocation, so enabling it changes startup for every Claude task, including tasks that are never steered.
 
@@ -70,14 +155,24 @@ With `CLAUDE_QUEUE_STEERING` unset, the adapter enables stream-json input only w
 
 When disabled, the adapter keeps `-p <prompt>` and the live session exposes no `deliverSteering`; an undeliverable message is promoted to a follow-up task. The provider trait remains queue-capable because the stock, supported Claude runtime implements that mode; the per-session gate is an operational availability check.
 
-### Codex harness-side delivery (codex-hook)
+### Codex app-server delivery
 
-Codex sessions have no in-process delivery seam, so `CodexSession`/`CodexSubprocessSession` set `steeringDeliveredExternally: true` and the runner's dispatch poll (`pollAndDispatchSteering`) leaves their rows `pending` instead of synthesizing an undeliverable report. Delivery happens inside the codex lifecycle:
+Production Codex sessions start a fresh `codex app-server` inside the existing isolated per-task runner. The parent adapter and task runner keep their JSONL control channel open. The task runner uses JSON-RPC with the app-server.
 
-- The worker image bakes `/etc/codex/requirements.toml` (Dockerfile.worker, worker-base) registering `agent-swarm codex-hook` for `SessionStart`, `PostToolUse`, and `Stop`. Requirements-managed hooks are "trusted by policy" — user-level `hooks.json` would be silently skipped without a per-hook `trusted_hash` review, which never happens in a headless worker.
-- `src/hooks/codex-hook.ts` polls `GET /api/steering-messages` (agent-scoped), POSTs `/delivered` per row, and only then injects the rendered envelope (`src/prompts/steering-delivery.ts`) as `hookSpecificOutput.additionalContext` (SessionStart/PostToolUse) or a one-shot `{"decision":"block","reason":...}` on Stop. Delivered-before-inject is the one-shot guarantee; a failed POST leaves the row pending for the next event.
-- `PreToolUse` is deliberately not registered: codex drops its `additionalContext` (openai/codex#19385). Empirical per-event matrix at codex-cli 0.146.0: `thoughts/taras/research/2026-07-30-steering-transport-hooks-and-artificial-steering.md` §4a-bis.
-- Rows a dying session never picks up are promoted by the terminal sweep, same as every other provider. Local dev outside Docker has no `/etc/codex/requirements.toml`, so steers on local codex tasks sit pending until terminal promotion unless you install the hooks yourself.
+- `steer` sends native `turn/steer`. Codex adds the input to the active turn.
+- `queue` stores the message in the adapter. Delivery succeeds only after Codex accepts the next native turn.
+- If the session ends before that turn starts, delivery fails and the pending message remains eligible for follow-up promotion.
+- Queue acknowledgements do not block cancellation or polling other tasks.
+- A message accepted before app-server readiness remains pending until the connection is ready.
+- `abort()` sends the native turn interrupt request. If it cannot complete within the bounded grace period, the runner terminates the task process group.
+
+The adapter creates no shared app-server daemon and never resumes a native Codex thread. Task continuity still uses the swarm context preamble.
+
+### Codex hook delivery for legacy exec sessions
+
+`src/hooks/codex-hook.ts` remains for legacy `codex exec` sessions. The worker image registers it for `SessionStart`, `PostToolUse`, and `Stop` through `/etc/codex/requirements.toml`. It polls pending steering messages, marks each row delivered, then injects the rendered envelope through hook output.
+
+App-server sessions set `SWARM_CODEX_APP_SERVER=1`. The hook exits before polling in that mode. This prevents a hook and the worker from delivering the same message. `PreToolUse` remains unregistered because Codex drops its `additionalContext`.
 
 ## Per-task `outputSchema` support
 
@@ -175,7 +270,7 @@ The dashboard's pi harness model picker prefers the worker-reported live list wh
 ### Notes
 
 - `AWS_REGION` must be set explicitly to the region where your Bedrock models are accessible; the enumeration region must match where inference runs. When `AWS_REGION` is unset the worker reports a not-ready Bedrock state with a "set AWS_REGION" hint and **does not** guess a region.
-- The enumeration runs at boot AND on a throttled periodic refresh inside the reconcile loop (`BEDROCK_REFRESH_INTERVAL_MS`, default 5 minutes), decoupled from the harness-change gate — so enabling Bedrock access after boot surfaces within a few minutes without a worker restart. Each refresh is one bounded AWS round-trip; a transient throttle error won't permanently block the worker — the next tick re-enumerates.
+- The enumeration runs at boot AND on a throttled periodic refresh inside the reconcile loop (`BEDROCK_REFRESH_INTERVAL_MS`, default 5 minutes), decoupled from the harness-change gate — so enabling Bedrock access after boot surfaces within a few minutes without a worker restart. Each refresh is one bounded AWS round-trip; a not-ready probe or failed report retries on the 30-second credential recovery interval until a ready report succeeds. The runner keeps polling and uses the same runtime identity, so recovery needs no restart. `CRED_CHECK_DISABLE=1` disables these refreshes.
 - Credential errors during inference continue to surface via structured pi-coding-agent events (handled in `PiMonoSession`) and are classified by `classifyAwsSdkError`.
 - The `validateProviderCredentials` live-test arm for `pi` + Bedrock is a pass-through (`presenceCheckOk`) — the real check is the probe above, not a second SDK call.
 - The API binary never imports `@aws-sdk/client-bedrock`; all SDK work is worker-side.
@@ -232,13 +327,17 @@ Internal refactors that don't change observable behavior don't need a doc update
 7. Add adapter tests for advertised steering modes and SDK rejection.
 8. Verify the docs build per [docs-site/CLAUDE.md](../docs-site/CLAUDE.md).
 
-## Alt-binary: claude-bridge (subscription-pool variant)
+## Alt-binary: claude-bridge
 
 User-facing guide: [docs-site/.../guides/claude-bridge-experimental.mdx](../docs-site/content/docs/(documentation)/guides/claude-bridge-experimental.mdx). Engineering notes below.
 
 [`@desplega.ai/claude-bridge`](https://github.com/desplega-ai/claude-bridge) is a Desplega-owned drop-in front for common `claude -p` automation. It drives interactive `claude` inside `tmux`, sends the prompt through the pane, tails Claude's JSONL transcript, and emits Claude-compatible `text`, `json`, or `stream-json`. It accepts the flags the swarm passes today (`-p`, `--model`, `--verbose`, `--output-format stream-json`, `--permission-mode`, `--append-system-prompt`, `--mcp-config`, `--strict-mcp-config`, `--dangerously-skip-permissions`), so `ClaudeAdapter.buildCommand()` does not branch — only the argv prefix changes.
 
-**Why it exists.** Starting **2026-06-15**, `claude -p` (and the Agent SDK / GitHub Actions surfaces) draws from a dedicated programmatic-credit pool rather than the Max/Pro subscription quota. Interactive `claude` sessions stay on the subscription pool. Routing the harness through claude-bridge keeps swarm runs on the subscription pool for users who pay for one.
+**Billing guidance, checked September 9, 2026.** Anthropic paused the separate SDK credit pool on June 15.
+Its [support update](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) says SDK and `claude -p` usage still consume subscription limits.
+OAuth success alone does not prove account billing behavior.
+Existing bridge configuration remains effective on CLI.
+SDK sessions reject an effective bridge because it cannot speak the SDK control protocol.
 
 ### Bridge toggle
 

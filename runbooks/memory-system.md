@@ -12,6 +12,18 @@ Provider abstractions live in `src/be/memory/`:
 
 Tuning constants are env-overridable in `src/be/memory/constants.ts`.
 
+## Edit authorization
+
+The `memory-edit` MCP tool and `POST /api/memory/edit` require the memory owner
+or a Lead. By-ID edits evaluate `memory.edit.any`; key+scope edits are already
+filtered to the caller's ownership by the store. Lead may edit another agent's
+private (`agent`) scope by ID. This intentionally differs from `memory.delete.any`,
+which permits Lead to delete another agent's memory only in `swarm` scope.
+
+Authorization stays at these entrypoints. Internal `indexMemoryContent()`
+re-indexing, boot and HTTP re-embedding, and link refresh retain their cross-agent
+store access.
+
 ## Memory raters (v1.5)
 
 The v1.5 wedge adds a small framework that lets the swarm learn which memories
@@ -50,7 +62,7 @@ server-side `implicit-citation` source.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `MEMORY_RATERS` | `` (empty — no raters fire) | Comma-separated allow-list, e.g. `implicit-citation,llm,explicit-self`. Unset/empty means the framework no-ops and `applyRating` is never called from the rater paths — by-design "byte-identical when off" guarantee. |
+| `MEMORY_RATERS` | `implicit-citation,explicit-self` | Comma-separated allow-list, e.g. `implicit-citation,llm,explicit-self`. Unset enables citation ratings and self-rating hints, including on existing deployments. An explicitly empty value disables all raters. Deleting a swarm config override restores the deployment value, or the runtime default when unset. |
 | `MEMORY_RATER_WEIGHTS` | unset (all multipliers = 1.0) | Optional `name:multiplier,...` per-rater weight overrides clamped into `[0, 1]`. Used to dial down a noisy rater without yanking it from the allow-list. |
 | `MEMORY_DEMOTION_FLOOR` | `1.0` (no demotion) | Lower bound for `usefulness(α, β)` in the reranker. Default `1.0` means a thoroughly-disliked memory never ranks below baseline; lower it (e.g. `0.5`) per deployment once telemetry shows the negative signal is reliable (Q1 resolution from the v1.5 plan). |
 

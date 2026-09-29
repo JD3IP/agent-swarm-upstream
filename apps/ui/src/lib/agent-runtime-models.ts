@@ -19,13 +19,31 @@ const REASONING_EFFORT_LEVELS: readonly ReasoningEffortLevel[] = [
   "max",
 ];
 
-export type LocalHarnessProvider = "claude" | "codex" | "pi" | "opencode";
+/**
+ * Nearest supported level by canonical-order distance. On a tie the first
+ * listed level wins (the lower one, as `levels` come in canonical order).
+ * `null` when `levels` is empty.
+ */
+export function nearestSupportedLevel(
+  level: ReasoningEffortLevel,
+  levels: ReadonlyArray<ReasoningEffortLevel>,
+): ReasoningEffortLevel | null {
+  if (levels.length === 0) return null;
+  const idx = REASONING_EFFORT_LEVELS.indexOf(level);
+  return [...levels].sort(
+    (a, b) =>
+      Math.abs(REASONING_EFFORT_LEVELS.indexOf(a) - idx) -
+      Math.abs(REASONING_EFFORT_LEVELS.indexOf(b) - idx),
+  )[0];
+}
+
+export type LocalHarnessProvider = "claude" | "codex" | "pi" | "opencode" | "acp";
 
 export interface ModelOption {
   id: string;
   label: string;
   provider: string;
-  providerId: ProviderIconKey;
+  providerId: ProviderIconKey | null;
   requiredKey: string;
   cost?: { input?: number; output?: number };
   contextWindow?: number;
@@ -56,6 +74,8 @@ export interface ModelGroup {
 
 export type SnapshotProviderId = "openrouter" | "anthropic" | "openai" | "amazon-bedrock";
 
+type CatalogProviderId = SnapshotProviderId | "opencode";
+
 interface CachedReasoningOption {
   type: string;
   values?: string[];
@@ -83,9 +103,9 @@ interface CachedProvider {
  * provider is present here it is preferred over the build-time snapshot;
  * when the fetch hasn't resolved the snapshot keeps the picker non-blank.
  */
-export type LiveModelsCatalog = Partial<Record<SnapshotProviderId, CachedProvider>>;
+export type LiveModelsCatalog = Partial<Record<CatalogProviderId, CachedProvider>>;
 
-const CACHE = modelsCache as Record<SnapshotProviderId, CachedProvider | undefined>;
+const CACHE = modelsCache as Record<CatalogProviderId, CachedProvider | undefined>;
 
 // --- Reasoning-effort capability mirror ---------------------------------------
 // Client-side mirror of the resolution order in `reasoningCapability()`
@@ -180,7 +200,7 @@ function reasoningLevelsFromCache(
   return levels.length > 0 ? levels : undefined;
 }
 
-export const LOCAL_HARNESSES: LocalHarnessProvider[] = ["claude", "codex", "pi", "opencode"];
+export const LOCAL_HARNESSES: LocalHarnessProvider[] = ["claude", "codex", "pi", "opencode", "acp"];
 
 export const HARNESS_LABEL: Record<ProviderName | string, string> = {
   claude: "Claude",
@@ -189,7 +209,13 @@ export const HARNESS_LABEL: Record<ProviderName | string, string> = {
   devin: "Devin",
   opencode: "Opencode",
   pi: "Pi-Mono",
+  acp: "ACP",
+  dsh: "DeepSeek (dsh)",
 };
+
+export function harnessSupportsModelSelection(harness: LocalHarnessProvider): boolean {
+  return harness !== "acp";
+}
 
 const ANTHROPIC_META = {
   provider: "Anthropic",
@@ -220,6 +246,9 @@ function directModel(
 
 const DIRECT_MODELS: Record<"claude" | "codex", ModelOption[]> = {
   claude: [
+    directModel("claude", "claude-fable-5-1", "Claude Fable 5.1", ANTHROPIC_META),
+    directModel("claude", "claude-mythos-5-1", "Claude Mythos 5.1", ANTHROPIC_META),
+    directModel("claude", "claude-opus-5-5", "Claude Opus 5.5", ANTHROPIC_META),
     directModel("claude", "claude-opus-5", "Claude Opus 5", ANTHROPIC_META),
     directModel("claude", "claude-fable-5", "Claude Fable 5", ANTHROPIC_META),
     directModel("claude", "claude-mythos-5", "Claude Mythos 5", ANTHROPIC_META),
@@ -231,6 +260,9 @@ const DIRECT_MODELS: Record<"claude" | "codex", ModelOption[]> = {
     directModel("claude", "claude-haiku-4-5", "Claude Haiku 4.5", ANTHROPIC_META),
   ],
   codex: [
+    directModel("codex", "gpt-6-astra", "GPT-6 Astra", OPENAI_META),
+    directModel("codex", "gpt-6-sol", "GPT-6 Sol", OPENAI_META),
+    directModel("codex", "gpt-6-luna", "GPT-6 Luna", OPENAI_META),
     directModel("codex", "gpt-5.6-sol", "GPT-5.6 Sol", OPENAI_META),
     directModel("codex", "gpt-5.6-terra", "GPT-5.6 Terra", OPENAI_META),
     directModel("codex", "gpt-5.6-luna", "GPT-5.6 Luna", OPENAI_META),
@@ -281,10 +313,11 @@ const SNAPSHOT_META: Record<
 };
 
 const FALLBACK_MODEL: Record<LocalHarnessProvider, string> = {
-  claude: "claude-opus-5",
+  claude: "claude-opus-5-5",
   codex: "gpt-5.6-terra",
   pi: "openrouter/google/gemini-3-flash-preview",
   opencode: "openrouter/qwen/qwen3-coder-flash",
+  acp: "",
 };
 
 function hasConfigKey(configs: SwarmConfig[] | undefined, key: string): boolean {
@@ -332,6 +365,8 @@ export function modelGroupsForHarness(
   liveBedrockStatus?: LiveBedrockStatus | null,
   liveCatalog?: LiveModelsCatalog | null,
 ): ModelGroup[] {
+  if (harness === "acp") return [];
+
   const providerCache = (providerId: SnapshotProviderId): CachedProvider | undefined =>
     liveCatalog?.[providerId] ?? CACHE[providerId];
 
@@ -433,6 +468,49 @@ export function modelGroupsForHarness(
   return snapshotGroups;
 }
 
+/**
+ * Best-effort model suggestions for ACP targets whose model namespace is known.
+ * The value remains free-form because ACP servers can expose models outside
+ * models.dev and custom targets have no catalog we can infer safely.
+ */
+export function modelGroupsForAcpTarget(
+  target: "opencode" | "custom",
+  liveCatalog?: LiveModelsCatalog | null,
+): ModelGroup[] {
+  if (target !== "opencode") return [];
+
+  const opencodeCache = liveCatalog?.opencode ?? CACHE.opencode;
+  const opencodeModels: ModelOption[] = Object.values(opencodeCache?.models ?? {})
+    .map((model) => ({
+      id: `opencode/${model.id}`,
+      label: model.name ?? model.id,
+      provider: opencodeCache?.name ?? "OpenCode Zen",
+      providerId: null,
+      requiredKey: "",
+      cost: model.cost,
+      contextWindow: model.limit?.context,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+
+  const providerGroups = modelGroupsForHarness(
+    "opencode",
+    undefined,
+    undefined,
+    null,
+    liveCatalog,
+  ).map((group) => ({ ...group, enabled: true, disabledReason: undefined }));
+
+  return [
+    {
+      provider: opencodeCache?.name ?? "OpenCode Zen",
+      models: opencodeModels,
+      requiredKey: "",
+      enabled: true,
+    },
+    ...providerGroups,
+  ];
+}
+
 export function findModelOption(
   model: string | null | undefined,
   groups: ModelGroup[],
@@ -449,20 +527,25 @@ export function findModelOption(
 // may report these verbatim — we map them to the canonical id so the row reads
 // "Claude Sonnet 5" instead of a bare "sonnet".
 const ANTHROPIC_SHORTNAME_TO_ID: Record<string, string> = {
-  fable: "claude-fable-5",
-  mythos: "claude-mythos-5",
-  opus: "claude-opus-5",
+  fable: "claude-fable-5-1",
+  mythos: "claude-mythos-5-1",
+  opus: "claude-opus-5-5",
   sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5",
 };
 
 /**
- * Stateless lookup across every known harness/snapshot — for read-only surfaces
- * (agent list, telemetry rows) that don't have configs/env presence in scope.
- * Returns `null` for custom or unknown model ids.
+ * Lookup across the live catalog first, then every known harness/snapshot — for
+ * read-only surfaces (agent list, telemetry rows) that don't have configs/env
+ * presence in scope. Returns `null` for custom or unknown model ids.
  */
-export function findKnownModel(model: string | null | undefined): ModelOption | null {
+export function findKnownModel(
+  model: string | null | undefined,
+  liveCatalog?: LiveModelsCatalog,
+): ModelOption | null {
   if (!model) return null;
+  const live = findLiveModel(model, liveCatalog);
+  if (live) return live;
   const aliased = ANTHROPIC_SHORTNAME_TO_ID[model] ?? model;
   for (const arr of Object.values(DIRECT_MODELS)) {
     const found = arr.find((m) => m.id === aliased);
@@ -506,6 +589,52 @@ export function findKnownModel(model: string | null | undefined): ModelOption | 
   return null;
 }
 
+function findLiveModel(model: string, catalog?: LiveModelsCatalog): ModelOption | null {
+  if (!catalog) return null;
+  const separator = model.indexOf("/");
+  const providerId = separator < 0 ? null : model.slice(0, separator);
+  const tail = separator < 0 ? model : model.slice(separator + 1);
+
+  // Provider-qualified IDs are resolved first, preserving nested OpenRouter
+  // IDs such as `openrouter/deepseek/deepseek-v4.1-flash`.
+  if (providerId && Object.hasOwn(catalog, providerId)) {
+    const provider = catalog[providerId as keyof LiveModelsCatalog];
+    const cached = provider?.models[tail];
+    if (cached && provider) return liveModelOption(model, providerId, provider, cached);
+  }
+
+  // Bare model IDs can be reported by harnesses that omit the provider.
+  for (const [id, provider] of Object.entries(catalog)) {
+    if (!provider) continue;
+    const cached = provider.models[model];
+    if (cached) return liveModelOption(model, id, provider, cached);
+  }
+  return null;
+}
+
+function liveModelOption(
+  id: string,
+  providerId: string,
+  provider: CachedProvider,
+  model: CachedModel,
+): ModelOption {
+  const iconByProvider: Partial<Record<string, ProviderIconKey>> = {
+    anthropic: "anthropic",
+    openai: "openai",
+    openrouter: "openrouter",
+    "amazon-bedrock": "amazon-bedrock",
+  };
+  return {
+    id,
+    label: model.name ?? model.id,
+    provider: provider.name ?? providerId,
+    providerId: iconByProvider[providerId] ?? null,
+    requiredKey: "",
+    cost: model.cost,
+    contextWindow: model.limit?.context,
+  };
+}
+
 function findByLabel(raw: string): ModelOption | null {
   const candidates = new Set<string>();
   candidates.add(raw);
@@ -541,7 +670,15 @@ function findByLabel(raw: string): ModelOption | null {
 function humanizeModelTail(tail: string): string {
   const last = tail.split("/").pop() ?? tail;
   if (!last) return tail;
-  return last.charAt(0).toUpperCase() + last.slice(1);
+  return humanizeModelId(last);
+}
+
+/** Title-case slug segments while preserving dotted numeric versions. */
+export function humanizeModelId(id: string): string {
+  const words = id.match(/[a-z]+\d+(?:\.\d+)+|[a-z]+\d*|\d+(?:\.\d+)+|[A-Z]+\d*|\d+/g) ?? [id];
+  return words
+    .map((word) => (/[a-z]/i.test(word) ? word[0].toUpperCase() + word.slice(1) : word))
+    .join(" ");
 }
 
 export function pickDefaultModelForHarness(
@@ -557,5 +694,11 @@ export function pickDefaultModelForHarness(
 export function isLocalHarness(
   value: ProviderName | string | null | undefined,
 ): value is LocalHarnessProvider {
-  return value === "claude" || value === "codex" || value === "pi" || value === "opencode";
+  return (
+    value === "claude" ||
+    value === "codex" ||
+    value === "pi" ||
+    value === "opencode" ||
+    value === "acp"
+  );
 }

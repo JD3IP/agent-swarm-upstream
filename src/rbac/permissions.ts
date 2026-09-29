@@ -69,6 +69,10 @@ export const PERMISSIONS = {
     description: "Inject a learning into another agent's memory.",
     namespace: "memory",
   },
+  "memory.edit.any": {
+    description: "Edit a memory entry (own entries, or any scope as lead).",
+    namespace: "memory",
+  },
   "memory.delete.any": {
     description: "Delete a memory entry (own entries, or swarm-scoped entries as lead).",
     namespace: "memory",
@@ -252,6 +256,14 @@ export const PERMISSIONS = {
   "script.api.delete": {
     description: "Delete an external script API endpoint.",
     namespace: "script",
+  },
+  "extension.write": {
+    description: "Install, update, or uninstall a swarm extension.",
+    namespace: "extension",
+  },
+  "extension.activate": {
+    description: "Enable, disable, or activate a version of a swarm extension.",
+    namespace: "extension",
   },
 } as const satisfies Record<string, { description: string; namespace: string }>;
 

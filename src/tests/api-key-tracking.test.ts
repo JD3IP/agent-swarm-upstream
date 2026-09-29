@@ -29,7 +29,7 @@ describe("selectCredential", () => {
   });
 
   test("comma-separated picks one randomly", () => {
-    const value = "key-aaa11,key-bbb22,key-ccc33";
+    const value = "example-key-aaa11,example-key-bbb22,example-key-ccc33";
     const results = new Set<string>();
     for (let i = 0; i < 100; i++) {
       const result = selectCredential(value);
@@ -44,47 +44,47 @@ describe("selectCredential", () => {
   });
 
   test("respects availableIndices for rate-limit-aware selection", () => {
-    const value = "key-aaa11,key-bbb22,key-ccc33";
+    const value = "example-key-aaa11,example-key-bbb22,example-key-ccc33";
     for (let i = 0; i < 50; i++) {
       const result = selectCredential(value, [1]); // Only index 1 is available
-      expect(result.selected).toBe("key-bbb22");
+      expect(result.selected).toBe("example-key-bbb22");
       expect(result.index).toBe(1);
     }
   });
 
   test("falls back to random when all keys are rate-limited (empty availableIndices)", () => {
-    const value = "key-aaa11,key-bbb22";
+    const value = "example-key-aaa11,example-key-bbb22";
     const result = selectCredential(value, []);
-    expect(["key-aaa11", "key-bbb22"]).toContain(result.selected);
+    expect(["example-key-aaa11", "example-key-bbb22"]).toContain(result.selected);
     expect(result.isRateLimitFallback).toBe(true);
   });
 
   test("filters out-of-range availableIndices", () => {
-    const value = "key-aaa11,key-bbb22";
+    const value = "example-key-aaa11,example-key-bbb22";
     const result = selectCredential(value, [99]); // Out of range
     // Falls back to random
-    expect(["key-aaa11", "key-bbb22"]).toContain(result.selected);
+    expect(["example-key-aaa11", "example-key-bbb22"]).toContain(result.selected);
     expect(result.isRateLimitFallback).toBe(true);
   });
 
   test("isRateLimitFallback is false when indices are available", () => {
-    const result = selectCredential("key-aaa11,key-bbb22", [0, 1]);
+    const result = selectCredential("example-key-aaa11,example-key-bbb22", [0, 1]);
     expect(result.isRateLimitFallback).toBe(false);
   });
 
   test("isRateLimitFallback is false when no availability info", () => {
-    const result = selectCredential("key-aaa11,key-bbb22");
+    const result = selectCredential("example-key-aaa11,example-key-bbb22");
     expect(result.isRateLimitFallback).toBe(false);
   });
 
   test("single key with empty availableIndices sets isRateLimitFallback", () => {
-    const result = selectCredential("single-key", []);
+    const result = selectCredential("example-single-key", []);
     expect(result.isRateLimitFallback).toBe(true);
-    expect(result.selected).toBe("single-key");
+    expect(result.selected).toBe("example-single-key");
   });
 
   test("keySuffix is last 5 chars of selected key", () => {
-    const result = selectCredential("sk-ant-api03-abcde12345");
+    const result = selectCredential("example-sk-ant-api03-abcde12345");
     expect(result.keySuffix).toBe("12345");
   });
 
@@ -102,31 +102,31 @@ describe("selectCredential", () => {
 describe("resolveCredentialPools", () => {
   test("returns selections for pool vars", async () => {
     const env: Record<string, string | undefined> = {
-      ANTHROPIC_API_KEY: "key-aaa11,key-bbb22",
+      ANTHROPIC_API_KEY: "example-key-aaa11,example-key-bbb22",
     };
     const selections = await resolveCredentialPools(env);
     expect(selections.length).toBe(1);
     expect(selections[0]!.total).toBe(2);
     expect(selections[0]!.keyType).toBe("ANTHROPIC_API_KEY");
     // Env should be mutated to the selected key
-    expect(["key-aaa11", "key-bbb22"]).toContain(env.ANTHROPIC_API_KEY);
+    expect(["example-key-aaa11", "example-key-bbb22"]).toContain(env.ANTHROPIC_API_KEY);
   });
 
   test("passes availableIndicesMap through", async () => {
     const env: Record<string, string | undefined> = {
-      ANTHROPIC_API_KEY: "key-aaa11,key-bbb22,key-ccc33",
+      ANTHROPIC_API_KEY: "example-key-aaa11,example-key-bbb22,example-key-ccc33",
     };
     const selections = await resolveCredentialPools(env, {
-      availableIndicesMap: { ANTHROPIC_API_KEY: [2] },
+      availableIndicesMap: { ANTHROPIC_API_KEY: { availableIndices: [2] } },
     });
     expect(selections.length).toBe(1);
     expect(selections[0]!.index).toBe(2);
-    expect(env.ANTHROPIC_API_KEY).toBe("key-ccc33");
+    expect(env.ANTHROPIC_API_KEY).toBe("example-key-ccc33");
   });
 
   test("single keys are tracked with index 0", async () => {
     const env: Record<string, string | undefined> = {
-      ANTHROPIC_API_KEY: "single-key",
+      ANTHROPIC_API_KEY: "example-single-key",
     };
     const selections = await resolveCredentialPools(env);
     expect(selections.length).toBe(1);
@@ -134,7 +134,7 @@ describe("resolveCredentialPools", () => {
     expect(selections[0]!.total).toBe(1);
     expect(selections[0]!.keySuffix).toBe("e-key");
     expect(selections[0]!.keyType).toBe("ANTHROPIC_API_KEY");
-    expect(env.ANTHROPIC_API_KEY).toBe("single-key");
+    expect(env.ANTHROPIC_API_KEY).toBe("example-single-key");
   });
 });
 
@@ -183,10 +183,10 @@ describe("API key tracking DB queries", () => {
   test("getAvailableKeyIndices excludes rate-limited keys", async () => {
     // Key 0 is rate-limited from above, add key 1 as available
     await recordKeyUsage("ANTHROPIC_API_KEY", "bbb22", 1, null);
-    const available = await getAvailableKeyIndices("ANTHROPIC_API_KEY", 3);
-    expect(available).toContain(1);
-    expect(available).toContain(2); // Never tracked, so available
-    expect(available).not.toContain(0); // Rate-limited
+    const { availableIndices } = await getAvailableKeyIndices("ANTHROPIC_API_KEY", 3);
+    expect(availableIndices).toContain(1);
+    expect(availableIndices).toContain(2); // Never tracked, so available
+    expect(availableIndices).not.toContain(0); // Rate-limited
   });
 
   test("getAvailableKeyIndices auto-clears expired rate limits", async () => {
@@ -195,8 +195,8 @@ describe("API key tracking DB queries", () => {
     await markKeyRateLimited("ANTHROPIC_API_KEY", "ccc33", 2, pastDate);
 
     // Should auto-clear and return as available
-    const available = await getAvailableKeyIndices("ANTHROPIC_API_KEY", 3);
-    expect(available).toContain(2);
+    const { availableIndices } = await getAvailableKeyIndices("ANTHROPIC_API_KEY", 3);
+    expect(availableIndices).toContain(2);
   });
 
   test("getKeyStatuses filters by keyType", async () => {
@@ -300,6 +300,179 @@ describe("API key tracking DB queries", () => {
         resetsAt: 1781270000,
         lastSeenAt: "2026-06-12T01:00:00.000Z",
       },
+    });
+  });
+
+  describe("getAvailableKeyIndices — model-scoped window filtering", () => {
+    const KEY_TYPE = "CLAUDE_CODE_OAUTH_TOKEN";
+
+    test("model=fable omits an index with an active Fable block and reports it in modelBlockedIndices", async () => {
+      await recordKeyUsage(KEY_TYPE, "fbl01", 0, null);
+      const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+      await recordKeyRateLimitWindows(KEY_TYPE, "fbl01", 0, {
+        seven_day_overage_included: {
+          status: "rejected",
+          resetsAt: futureResetsAtSec,
+          lastSeenAt: new Date().toISOString(),
+        },
+      });
+
+      const result = await getAvailableKeyIndices(KEY_TYPE, 1, "global", null, "fable");
+      expect(result.availableIndices).not.toContain(0);
+      expect(result.modelBlockedIndices).toEqual([0]);
+      expect(result.earliestModelResetAt).toBe(new Date(futureResetsAtSec * 1000).toISOString());
+    });
+
+    test("model=opus includes the same index (block is Fable-only)", async () => {
+      const result = await getAvailableKeyIndices(KEY_TYPE, 1, "global", null, "opus");
+      expect(result.availableIndices).toContain(0);
+      expect(result.modelBlockedIndices).toEqual([]);
+    });
+
+    test("no model param includes the index (legacy behavior, no filtering)", async () => {
+      const result = await getAvailableKeyIndices(KEY_TYPE, 1, "global", null);
+      expect(result.availableIndices).toContain(0);
+      expect(result.modelBlockedIndices).toEqual([]);
+      expect(result.earliestModelResetAt).toBeNull();
+    });
+
+    test("a row with resetsAt in the past is included for model=fable", async () => {
+      const pastResetsAtSec = Math.floor(Date.now() / 1000) - 3600;
+      await recordKeyRateLimitWindows(KEY_TYPE, "fbl01", 0, {
+        seven_day_overage_included: {
+          status: "rejected",
+          resetsAt: pastResetsAtSec,
+          lastSeenAt: new Date().toISOString(),
+        },
+      });
+
+      const result = await getAvailableKeyIndices(KEY_TYPE, 1, "global", null, "fable");
+      expect(result.availableIndices).toContain(0);
+      expect(result.modelBlockedIndices).toEqual([]);
+    });
+
+    test("a key-wide rate_limited status and an active model block coexist without double-listing", async () => {
+      await recordKeyUsage(KEY_TYPE, "fbl02", 1, null);
+      const until = new Date(Date.now() + 300_000).toISOString();
+      await markKeyRateLimited(KEY_TYPE, "fbl02", 1, until);
+      const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+      await recordKeyRateLimitWindows(KEY_TYPE, "fbl02", 1, {
+        seven_day_overage_included: {
+          status: "rejected",
+          resetsAt: futureResetsAtSec,
+          lastSeenAt: new Date().toISOString(),
+        },
+      });
+
+      const result = await getAvailableKeyIndices(KEY_TYPE, 2, "global", null, "fable");
+      // Key-wide blocked: absent from availableIndices, and not double-reported in modelBlockedIndices.
+      expect(result.availableIndices).not.toContain(1);
+      expect(result.modelBlockedIndices).not.toContain(1);
+    });
+
+    test("concurrent Fable and Opus rejections for one key both survive", async () => {
+      // Own scope so rows from the tests above do not share keyIndex 0.
+      const scopeId = "race-concurrent";
+      const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+      const lastSeenAt = new Date().toISOString();
+      await Promise.all([
+        recordKeyRateLimitWindows(
+          KEY_TYPE,
+          "rac01",
+          0,
+          {
+            seven_day_overage_included: {
+              status: "rejected",
+              resetsAt: futureResetsAtSec,
+              lastSeenAt,
+            },
+          },
+          "agent",
+          scopeId,
+        ),
+        recordKeyRateLimitWindows(
+          KEY_TYPE,
+          "rac01",
+          0,
+          { seven_day_opus: { status: "rejected", resetsAt: futureResetsAtSec, lastSeenAt } },
+          "agent",
+          scopeId,
+        ),
+      ]);
+
+      const [key] = await getKeyStatuses(KEY_TYPE, "agent", scopeId);
+      expect(Object.keys(key?.rateLimitWindows ?? {}).sort()).toEqual([
+        "seven_day_opus",
+        "seven_day_overage_included",
+      ]);
+      const fable = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable");
+      expect(fable.availableIndices).toEqual([]);
+      const opus = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "opus");
+      expect(opus.availableIndices).toEqual([]);
+    });
+
+    test("an older allowed snapshot after a terminal rejection does not reopen the window", async () => {
+      const scopeId = "race-freshness";
+      const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+      const rejectedAt = new Date().toISOString();
+      const olderSnapshotAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      await recordKeyRateLimitWindows(
+        KEY_TYPE,
+        "rac02",
+        0,
+        {
+          seven_day_overage_included: {
+            status: "rejected",
+            resetsAt: futureResetsAtSec,
+            lastSeenAt: rejectedAt,
+          },
+        },
+        "agent",
+        scopeId,
+      );
+      // Another worker's session reports telemetry read before the rejection.
+      await recordKeyRateLimitWindows(
+        KEY_TYPE,
+        "rac02",
+        0,
+        {
+          seven_day_overage_included: {
+            status: "allowed",
+            utilization: 0.4,
+            resetsAt: futureResetsAtSec,
+            lastSeenAt: olderSnapshotAt,
+          },
+          five_hour: { status: "allowed", utilization: 0.1, lastSeenAt: olderSnapshotAt },
+        },
+        "agent",
+        scopeId,
+      );
+
+      const [key] = await getKeyStatuses(KEY_TYPE, "agent", scopeId);
+      expect(key?.rateLimitWindows.seven_day_overage_included?.status).toBe("rejected");
+      // The older payload's other windows still land.
+      expect(key?.rateLimitWindows.five_hour?.status).toBe("allowed");
+      const fable = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable");
+      expect(fable.availableIndices).toEqual([]);
+
+      // A snapshot observed after the rejection is an explicit recovery.
+      await recordKeyRateLimitWindows(
+        KEY_TYPE,
+        "rac02",
+        0,
+        {
+          seven_day_overage_included: {
+            status: "allowed",
+            utilization: 0.1,
+            resetsAt: futureResetsAtSec,
+            lastSeenAt: new Date(Date.now() + 1000).toISOString(),
+          },
+        },
+        "agent",
+        scopeId,
+      );
+      const recovered = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable");
+      expect(recovered.availableIndices).toEqual([0]);
     });
   });
 });

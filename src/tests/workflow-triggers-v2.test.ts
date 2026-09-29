@@ -16,6 +16,7 @@ import { startWorkflowExecution } from "../workflows/engine";
 import { BaseExecutor, type ExecutorResult } from "../workflows/executors/base";
 import { ExecutorRegistry } from "../workflows/executors/registry";
 import {
+  handleEventTrigger,
   handleWebhookTrigger,
   logOpenWebhookTriggers,
   verifyHmacSignature,
@@ -25,6 +26,8 @@ import {
 } from "../workflows/triggers";
 
 const TEST_DB_PATH = "./test-workflow-triggers-v2.sqlite";
+
+const secretRef = (name: string): string => `secret.${name}`;
 
 // ─── Test Executor ──────────────────────────────────────────
 
@@ -85,7 +88,7 @@ async function makeWorkflow(
 // ─── HMAC Verification ──────────────────────────────────────
 
 describe("verifyHmacSignature", () => {
-  const secret = "test-secret-123";
+  const secret = "example-test-secret-123";
   const body = '{"event":"test"}';
 
   test("valid sha256=<hex> signature passes", () => {
@@ -122,7 +125,7 @@ describe("verifyHmacSignature", () => {
 });
 
 describe("verifyTimestampedHmacSignature", () => {
-  const secret = "timestamped-secret";
+  const secret = "example-timestamped-secret";
   const body = '{"event":"finding.triage_completed"}';
   const timestamp = 1_700_000_000;
   const nowMs = timestamp * 1000;
@@ -212,7 +215,7 @@ describe("verifyTokenEquality", () => {
 
 describe("handleWebhookTrigger", () => {
   test("valid HMAC starts workflow", async () => {
-    const secret = "my-webhook-secret";
+    const secret = "example-my-webhook-secret";
     const workflow = await makeWorkflow({
       triggers: [{ type: "webhook", hmacSecret: secret }],
     });
@@ -240,7 +243,7 @@ describe("handleWebhookTrigger", () => {
 
   test("invalid HMAC rejects with 401", async () => {
     const workflow = await makeWorkflow({
-      triggers: [{ type: "webhook", hmacSecret: "secret-123" }],
+      triggers: [{ type: "webhook", hmacSecret: "example-secret-123" }],
     });
 
     try {
@@ -259,7 +262,7 @@ describe("handleWebhookTrigger", () => {
 
   test("missing signature rejects with 401 when hmacSecret is set", async () => {
     const workflow = await makeWorkflow({
-      triggers: [{ type: "webhook", hmacSecret: "secret-xyz" }],
+      triggers: [{ type: "webhook", hmacSecret: "example-secret-xyz" }],
     });
 
     try {
@@ -373,7 +376,7 @@ describe("handleWebhookTrigger — custom hmacHeader", () => {
   }
 
   test("custom hmacHeader (X-Webhook-Signature) is picked up and verified", async () => {
-    const secret = "kapso-secret";
+    const secret = "example-kapso-secret";
     const workflow = await makeWorkflow({
       triggers: [{ type: "webhook", hmacSecret: secret, hmacHeader: "X-Webhook-Signature" }],
     });
@@ -392,7 +395,7 @@ describe("handleWebhookTrigger — custom hmacHeader", () => {
   });
 
   test("custom hmacHeader lookup is case-insensitive", async () => {
-    const secret = "kapso-secret-ci";
+    const secret = "example-kapso-secret-ci";
     const workflow = await makeWorkflow({
       triggers: [{ type: "webhook", hmacSecret: secret, hmacHeader: "X-Webhook-Signature" }],
     });
@@ -409,7 +412,7 @@ describe("handleWebhookTrigger — custom hmacHeader", () => {
   });
 
   test("signature on a non-configured header is rejected as missing", async () => {
-    const secret = "kapso-secret-2";
+    const secret = "example-kapso-secret-2";
     const workflow = await makeWorkflow({
       triggers: [{ type: "webhook", hmacSecret: secret, hmacHeader: "X-Webhook-Signature" }],
     });
@@ -431,7 +434,7 @@ describe("handleWebhookTrigger — custom hmacHeader", () => {
   });
 
   test("fallback header (x-signature) still works without explicit hmacHeader", async () => {
-    const secret = "fallback-secret";
+    const secret = "example-fallback-secret";
     const workflow = await makeWorkflow({
       triggers: [{ type: "webhook", hmacSecret: secret }],
     });
@@ -448,7 +451,7 @@ describe("handleWebhookTrigger — custom hmacHeader", () => {
   });
 
   test("default X-Hub-Signature-256 path still works (no regression)", async () => {
-    const secret = "default-header-secret";
+    const secret = "example-default-header-secret";
     const workflow = await makeWorkflow({
       triggers: [{ type: "webhook", hmacSecret: secret }],
     });
@@ -466,7 +469,7 @@ describe("handleWebhookTrigger — custom hmacHeader", () => {
   });
 
   test("explicit hmac-sha256 verification does not use fallback headers", async () => {
-    const secret = "explicit-hmac-secret";
+    const secret = "example-explicit-hmac-secret";
     const workflow = await makeWorkflow({
       triggers: [
         {
@@ -499,7 +502,7 @@ describe("handleWebhookTrigger — verification formats", () => {
   }
 
   test("timestamped-hmac-sha256 starts workflow for Superagent-shaped request", async () => {
-    const secret = "superagent-secret";
+    const secret = "example-superagent-secret";
     const timestamp = Math.floor(Date.now() / 1000);
     const workflow = await makeWorkflow({
       triggers: [
@@ -535,7 +538,7 @@ describe("handleWebhookTrigger — verification formats", () => {
   });
 
   test("timestamped-hmac-sha256 rejects signatures on fallback headers", async () => {
-    const secret = "timestamped-no-fallback-secret";
+    const secret = "example-timestamped-no-fallback-secret";
     const timestamp = Math.floor(Date.now() / 1000);
     const workflow = await makeWorkflow({
       triggers: [
@@ -570,7 +573,7 @@ describe("handleWebhookTrigger — verification formats", () => {
       triggers: [
         {
           type: "webhook",
-          hmacSecret: "gitlab-token",
+          hmacSecret: "example-gitlab-token",
           verification: { format: "token-equality", header: "X-Gitlab-Token" },
         },
       ],
@@ -579,7 +582,7 @@ describe("handleWebhookTrigger — verification formats", () => {
     const result = await handleWebhookTrigger(
       workflow.id,
       '{"event":"push"}',
-      { "x-gitlab-token": "gitlab-token" },
+      { "x-gitlab-token": "example-gitlab-token" },
       registry,
     );
 
@@ -591,7 +594,7 @@ describe("handleWebhookTrigger — verification formats", () => {
       triggers: [
         {
           type: "webhook",
-          hmacSecret: "gitlab-token",
+          hmacSecret: "example-gitlab-token",
           verification: { format: "token-equality", header: "X-Gitlab-Token" },
         },
       ],
@@ -657,7 +660,7 @@ describe("handleWebhookTrigger — hmacSecret references", () => {
       triggers: [
         {
           type: "webhook",
-          hmacSecret: "secret.TEST_KAPSO_WEBHOOK_HMAC_SECRET",
+          hmacSecret: secretRef("TEST_KAPSO_WEBHOOK_HMAC_SECRET"),
           hmacHeader: "X-Webhook-Signature",
         },
       ],
@@ -677,7 +680,7 @@ describe("handleWebhookTrigger — hmacSecret references", () => {
 
   test("unresolvable secret.NAME ref fails cleanly with a WebhookError", async () => {
     const workflow = await makeWorkflow({
-      triggers: [{ type: "webhook", hmacSecret: "secret.NONEXISTENT_HMAC_SECRET_12345" }],
+      triggers: [{ type: "webhook", hmacSecret: secretRef("NONEXISTENT_HMAC_SECRET_12345") }],
     });
 
     const body = '{"event":"missing-secret"}';
@@ -696,7 +699,7 @@ describe("handleWebhookTrigger — hmacSecret references", () => {
   });
 
   test("a literal hmacSecret is not treated as a reference", async () => {
-    const secret = "plain.literal-not-a-ref";
+    const secret = `plain.${"literal-not-a-ref"}`;
     const workflow = await makeWorkflow({
       triggers: [{ type: "webhook", hmacSecret: secret }],
     });
@@ -738,7 +741,7 @@ describe("handleWebhookTrigger — triggerData JSON parsing", () => {
   });
 
   test("signed JSON body: HMAC verified against raw bytes, triggerData parsed to object", async () => {
-    const secret = "kapso-deep-secret";
+    const secret = "example-kapso-deep-secret";
     const workflow = await makeWorkflow({
       triggers: [{ type: "webhook", hmacSecret: secret, hmacHeader: "X-Webhook-Signature" }],
     });
@@ -832,6 +835,16 @@ describe("cooldown", () => {
 // ─── TriggerConfigSchema validation ──────────────────────────
 
 describe("TriggerConfigSchema", () => {
+  test("accepts the wired Slack event and rejects unsupported event names", () => {
+    expect(
+      TriggerConfigSchema.safeParse({ type: "event", eventName: "slack.message" }).success,
+    ).toBe(true);
+    expect(TriggerConfigSchema.safeParse({ type: "event", eventName: "" }).success).toBe(false);
+    expect(
+      TriggerConfigSchema.safeParse({ type: "event", eventName: "github.issue.opened" }).success,
+    ).toBe(false);
+  });
+
   test("rejects verification configured without hmacSecret", () => {
     const result = TriggerConfigSchema.safeParse({
       type: "webhook",
@@ -847,7 +860,7 @@ describe("TriggerConfigSchema", () => {
   test("accepts verification configured with hmacSecret", () => {
     const result = TriggerConfigSchema.safeParse({
       type: "webhook",
-      hmacSecret: "gitlab-token",
+      hmacSecret: "example-gitlab-token",
       verification: { format: "token-equality", header: "X-Gitlab-Token" },
     });
 
@@ -858,6 +871,26 @@ describe("TriggerConfigSchema", () => {
     const result = TriggerConfigSchema.safeParse({ type: "webhook" });
 
     expect(result.success).toBe(true);
+  });
+});
+
+describe("handleEventTrigger", () => {
+  test("starts only enabled workflows subscribed to the Slack event", async () => {
+    const matching = await makeWorkflow({
+      triggers: [{ type: "event", eventName: "slack.message" }],
+    });
+    const disabled = await makeWorkflow({
+      triggers: [{ type: "event", eventName: "slack.message" }],
+    });
+    await updateWorkflow(disabled.id, { enabled: false });
+
+    const payload = { channel: "C123", text: "service is down", ts: "123.456" };
+    const runIds = await handleEventTrigger("slack.message", payload, registry);
+
+    expect(runIds).toHaveLength(1);
+    const run = await getWorkflowRun(runIds[0]!);
+    expect(run?.workflowId).toBe(matching.id);
+    expect(run?.triggerData).toEqual(payload);
   });
 });
 

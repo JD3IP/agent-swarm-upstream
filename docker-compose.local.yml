@@ -13,9 +13,10 @@
 #   docker compose -f docker-compose.local.yml down
 
 services:
+  # Use quay.io because MinIO's Docker Hub repositories were removed.
   minio:
     container_name: swarm-agent-fs-minio
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -33,7 +34,7 @@ services:
     restart: unless-stopped
 
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     depends_on:
       minio:
         condition: service_healthy
@@ -45,7 +46,7 @@ services:
 
   agent-fs:
     container_name: swarm-agent-fs
-    image: ghcr.io/desplega-ai/agent-fs:0.13.2
+    image: ghcr.io/desplega-ai/agent-fs:0.13.10
     platform: linux/amd64
     depends_on:
       minio-init:
@@ -91,6 +92,10 @@ services:
       context: .
       dockerfile: Dockerfile
     stop_grace_period: 60s
+    # Independent per-container cgroup pids ceiling — see the sizing
+    # arithmetic and rationale in docker-compose.example.yml's `api.pids_limit`
+    # comment (issue #1332).
+    pids_limit: 1024
     depends_on:
       agent-fs:
         condition: service_healthy

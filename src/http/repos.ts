@@ -7,7 +7,8 @@ import {
   getSwarmRepos,
   updateSwarmRepo,
 } from "../be/db";
-import { RepoGuidelinesSchema, RepoHooksSchema, SwarmRepoSchema } from "../types";
+import { emitIntegrationConnected } from "../telemetry";
+import { RepoGuidelinesInputSchema, RepoHooksSchema, SwarmRepoSchema } from "../types";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
@@ -57,7 +58,7 @@ const createRepo = route({
     defaultBranch: z.string().optional(),
     autoClone: z.boolean().optional(),
     hooks: RepoHooksSchema.optional(),
-    guidelines: RepoGuidelinesSchema.nullable().optional(),
+    guidelines: RepoGuidelinesInputSchema.nullable().optional(),
   }),
   responses: {
     201: { description: "Repo created", schema: SwarmRepoSchema },
@@ -80,7 +81,7 @@ const updateRepo = route({
     defaultBranch: z.string().optional(),
     autoClone: z.boolean().optional(),
     hooks: RepoHooksSchema.nullable().optional(),
-    guidelines: RepoGuidelinesSchema.nullable().optional(),
+    guidelines: RepoGuidelinesInputSchema.nullable().optional(),
   }),
   responses: {
     200: { description: "Repo updated", schema: SwarmRepoSchema },
@@ -146,6 +147,11 @@ export async function handleRepos(
         hooks: parsed.body.hooks,
         guidelines: parsed.body.guidelines,
       });
+      try {
+        emitIntegrationConnected("code_repo", repo.url, (await getSwarmRepos()).length === 1);
+      } catch {
+        // Telemetry must never break repo creation.
+      }
       json(res, repo, 201);
     } catch (error) {
       const msg = (error as Error).message;

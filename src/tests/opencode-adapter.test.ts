@@ -28,7 +28,7 @@ function testConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSes
     agentId: "agent-1",
     taskId: "task-1",
     apiUrl: "http://localhost:0",
-    apiKey: "test-key",
+    apiKey: "example-test-key",
     cwd: "/tmp/test",
     logFile: "/tmp/test.log",
     ...overrides,
@@ -666,7 +666,7 @@ describe("OpencodeSession — cost aggregation", () => {
     expect(result.cost?.cacheReadTokens).toBe(30);
     expect(result.cost?.cacheWriteTokens).toBe(8);
     expect(result.cost?.numTurns).toBe(1);
-  });
+  }, 30_000);
 
   test("reasoning tokens are summed across distinct finalized messages", async () => {
     const { result } = await driveSession([
@@ -779,7 +779,7 @@ describe("OpencodeSession — raw_log persistence", () => {
         expect(() => JSON.parse(rl.content)).not.toThrow();
       }
     }
-  });
+  }, 30_000);
 });
 
 // ── Phase 9: context_usage emission ───────────────────────────────────────────
@@ -1242,5 +1242,45 @@ describe("OpencodeAdapter — context-mode plugin wiring (phase 4)", () => {
     const built = getBuiltConfig();
     expect(built.mcp).toBeDefined();
     expect(built.mcp?.["context-mode"]).toBeUndefined();
+  });
+});
+
+describe("OpencodeAdapter: session create timeout", () => {
+  let prevTimeout: string | undefined;
+
+  beforeEach(() => {
+    prevTimeout = process.env.OPENCODE_SERVER_TIMEOUT_MS;
+    mock.restore();
+  });
+
+  afterEach(() => {
+    if (prevTimeout === undefined) delete process.env.OPENCODE_SERVER_TIMEOUT_MS;
+    else process.env.OPENCODE_SERVER_TIMEOUT_MS = prevTimeout;
+    Bun.$`rm -rf /tmp/opencode-task-timeout.json /tmp/opencode-data-task-timeout`.quiet().nothrow();
+    Bun.$`rm -rf /tmp/test/.opencode`.quiet().nothrow();
+  });
+
+  test("a hung session.create fails the spawn after OPENCODE_SERVER_TIMEOUT_MS and closes the server", async () => {
+    process.env.OPENCODE_SERVER_TIMEOUT_MS = "50";
+    const closeServer = mock(() => {});
+    const fakeServer = { url: "http://127.0.0.1:12345", close: closeServer };
+    const fakeClient = {
+      session: {
+        create: () => new Promise<never>(() => {}),
+        prompt: async () => ({ data: {}, error: undefined }),
+      },
+      event: { subscribe: async () => ({ stream: makeStream([]) }) },
+    };
+    mock.module("@opencode-ai/sdk", () => ({
+      createOpencode: async () => ({ client: fakeClient, server: fakeServer }),
+    }));
+
+    const { OpencodeAdapter } = await import("../providers/opencode-adapter");
+    const adapter = new OpencodeAdapter();
+
+    await expect(adapter.createSession(testConfig({ taskId: "task-timeout" }))).rejects.toThrow(
+      "opencode session create timed out after 50ms",
+    );
+    expect(closeServer).toHaveBeenCalledTimes(1);
   });
 });

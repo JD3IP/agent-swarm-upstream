@@ -32,6 +32,7 @@ import type { ComponentType, ReactNode, SVGProps } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
+import { useModelsCatalog } from "@/api/hooks/use-models-catalog";
 import { useUsers } from "@/api/hooks/use-users";
 import type { AgentTask, User } from "@/api/types";
 import { AgentAvatar } from "@/components/shared/agent-avatar";
@@ -50,9 +51,11 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { findKnownModel } from "@/lib/agent-runtime-models";
+import type { LiveModelsCatalog } from "@/lib/agent-runtime-models";
+import { getAgentModelPresentation } from "@/lib/agents-list-model-display";
 import { formatCost } from "@/lib/cost-format";
 import { modelTierLabel } from "@/lib/model-tiers";
+import { taskListTitle } from "@/lib/task-title";
 import { cn, formatElapsed, formatSmartTime } from "@/lib/utils";
 
 // ─── Column model ────────────────────────────────────────────────────────────
@@ -187,7 +190,9 @@ function StatusCell({ task }: { task: AgentTask }) {
  * so nothing is hidden behind the shorter label.
  */
 function DescriptionCell({ title, prompt }: { title?: string; prompt?: string }) {
-  const label = title?.trim() || prompt || "";
+  // Most prompts open with the same "Repo: <url>." line, which made every row
+  // read alike. Show the title or the first real line; the tooltip keeps all.
+  const label = taskListTitle({ title, task: prompt ?? "" });
   if (!label) return DASH;
   const tooltipText = prompt?.trim() || label;
   return (
@@ -205,9 +210,11 @@ function DescriptionCell({ title, prompt }: { title?: string; prompt?: string })
 function ModelCell({
   model,
   modelTier,
+  liveCatalog,
 }: {
   model: string | undefined;
   modelTier: string | undefined;
+  liveCatalog?: LiveModelsCatalog;
 }) {
   if (!model && !modelTier) return DASH;
   if (!model) {
@@ -217,12 +224,11 @@ function ModelCell({
       </Badge>
     );
   }
-  const value = model;
-  const known = findKnownModel(value);
+  const presentation = getAgentModelPresentation(model, liveCatalog);
   return (
     <span className="inline-flex items-center gap-1.5">
-      <ProviderIcon provider={known?.providerId} className="h-3.5 w-3.5" />
-      <span className="truncate">{known?.label ?? value}</span>
+      <ProviderIcon provider={presentation?.providerId} className="h-3.5 w-3.5" />
+      <span className="truncate">{presentation?.label ?? model}</span>
     </span>
   );
 }
@@ -563,6 +569,7 @@ export function TasksTable({
   pagination,
   paginationQueryKey,
 }: TasksTableProps) {
+  const { data: modelsCatalog } = useModelsCatalog();
   // Build a `userId → User` lookup for the "Requested by" column. We skip the
   // network call entirely on swarms that don't support the column — the
   // gate-hidden set already filters the column out of `columnDefs`, so the
@@ -594,10 +601,10 @@ export function TasksTable({
         field: "task",
         headerName: "Description",
         flex: 1,
-        minWidth: 240,
+        minWidth: 360,
         // Sort / filter / quick-search on the same string the cell displays,
         // otherwise a titled row sorts by a prompt the user can't see.
-        valueGetter: (p) => p.data?.title?.trim() || p.data?.task || "",
+        valueGetter: (p) => (p.data ? taskListTitle(p.data) : ""),
         cellRenderer: (p: { data?: AgentTask }) => (
           <DescriptionCell title={p.data?.title} prompt={p.data?.task} />
         ),
@@ -635,7 +642,11 @@ export function TasksTable({
         width: 180,
         ...fixed,
         cellRenderer: (p: { data?: AgentTask }) => (
-          <ModelCell model={p.data?.model} modelTier={p.data?.modelTier} />
+          <ModelCell
+            model={p.data?.model}
+            modelTier={p.data?.modelTier}
+            liveCatalog={modelsCatalog?.providers}
+          />
         ),
       },
       {
@@ -731,7 +742,7 @@ export function TasksTable({
     ];
 
     return all.filter((c) => !columns.isHidden(c._id)).map(({ _id, ...col }) => col);
-  }, [agentNameById, columns, userById]);
+  }, [agentNameById, columns, userById, modelsCatalog?.providers]);
 
   return (
     <DataGrid

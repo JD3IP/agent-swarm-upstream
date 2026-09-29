@@ -1,5 +1,11 @@
 import { asString, isRecord, makeItem, resultBlockText } from "./helpers";
+import { resultImages } from "./result-images";
 import type { DecodedRecord, LogRole, NormalizedItem } from "./types";
+
+// Exact Codex CLI advisories only; unknown error items must remain errors.
+const CODEX_ADVISORIES = new Set([
+  "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.",
+]);
 
 export function normalizeAnthropic(ordered: DecodedRecord[]): NormalizedItem[] {
   const items: NormalizedItem[] = [];
@@ -104,9 +110,216 @@ export function normalizeAnthropic(ordered: DecodedRecord[]): NormalizedItem[] {
   return items;
 }
 
+export function normalizeAcp(ordered: DecodedRecord[]): NormalizedItem[] {
+  const items: NormalizedItem[] = [];
+  const toolCalls = new Map<string, NormalizedItem>();
+
+  for (const d of ordered) {
+    const ev = d.event;
+    if (isParseError(ev)) {
+      items.push(makeItem(d, "parse_error", { role: "system", raw: ev.raw }));
+      continue;
+    }
+    if (!isRecord(ev)) {
+      items.push(makeItem(d, "unknown", { role: "system", raw: ev }));
+      continue;
+    }
+
+    if (emitStderr(items, d, ev)) continue;
+
+    const rawUpdate = isRecord(ev.update) ? ev.update : undefined;
+    if (
+      typeof rawUpdate?.sessionUpdate === "string" ||
+      (ev.type === "acp_log_truncated" && typeof ev.sessionUpdate === "string")
+    ) {
+      // The corresponding normalized ProviderEvent is persisted immediately
+      // after this raw notification. Keep the raw row in `ordered` for
+      // diagnostics without rendering duplicate transcript content.
+      continue;
+    }
+
+    switch (ev.type) {
+      case "acp_log_truncated": {
+        // Session initialization can contain an enormous model catalog. Keep
+        // its diagnostic row, but render only the compact lifecycle marker.
+        if (ev.originalType !== "session_init") {
+          items.push(makeItem(d, "unknown", { role: "system", raw: ev }));
+          break;
+        }
+        items.push(
+          makeItem(d, "lifecycle", {
+            role: "system",
+            meta: {
+              type: "session_init",
+              sessionId: ev.sessionId,
+              truncated: true,
+            },
+          }),
+        );
+        break;
+      }
+      case "message": {
+        const role = ev.role === "user" ? "user" : "assistant";
+        appendAcpChunk(
+          items,
+          d,
+          "text",
+          role,
+          String(ev.content ?? ""),
+          typeof ev.messageId === "string" ? ev.messageId : undefined,
+        );
+        break;
+      }
+      case "tool_start": {
+        const call = makeItem(d, "tool_call", {
+          role: "assistant",
+          tool: {
+            id: String(ev.toolCallId ?? ""),
+            name: String(ev.toolName ?? "tool"),
+            input: ev.args,
+          },
+        });
+        toolCalls.set(String(ev.toolCallId ?? ""), call);
+        items.push(call);
+        break;
+      }
+      case "tool_end": {
+        const result = isRecord(ev.result) ? ev.result : undefined;
+        const call = toolCalls.get(String(ev.toolCallId ?? ""));
+        if (call) {
+          call.meta = {
+            ...(isRecord(call.meta) ? call.meta : {}),
+            ...result,
+            title: ev.toolName,
+          };
+        }
+        items.push(
+          makeItem(d, "tool_result", {
+            role: "user",
+            result: {
+              id: String(ev.toolCallId ?? ""),
+              payload: acpToolPayload(result) ?? ev.result,
+              isError: result?.status === "failed",
+            },
+          }),
+        );
+        break;
+      }
+      case "custom": {
+        const data = isRecord(ev.data) ? ev.data : undefined;
+        if (ev.name === "acp_agent_thought_chunk") {
+          const content = data?.content;
+          const text =
+            isRecord(content) && content.type === "text"
+              ? String(content.text ?? "")
+              : resultBlockText(content);
+          appendAcpChunk(
+            items,
+            d,
+            "reasoning",
+            "assistant",
+            text,
+            typeof data?.messageId === "string" ? data.messageId : undefined,
+          );
+        } else if (ev.name === "acp_tool_call_update" && data) {
+          const call = toolCalls.get(String(data.toolCallId ?? ""));
+          if (call?.tool) {
+            // ACP starts with partial input; updates are snapshots, not deltas.
+            // Keep the original tool name: later titles describe the output.
+            if (data.rawInput !== undefined) {
+              call.tool.input =
+                isRecord(call.tool.input) && isRecord(data.rawInput)
+                  ? { ...call.tool.input, ...data.rawInput }
+                  : data.rawInput;
+            }
+            call.meta = { ...(isRecord(call.meta) ? call.meta : {}), ...data };
+            call.coveredRecIds = [...(call.coveredRecIds ?? []), d.rec.id];
+          } else {
+            // Preserve unmatched updates when viewing a partial log window.
+            items.push(makeItem(d, "lifecycle", { role: "system", meta: ev }));
+          }
+        } else if (ev.name !== "acp_available_commands_update") {
+          items.push(makeItem(d, "lifecycle", { role: "system", meta: ev }));
+        }
+        break;
+      }
+      case "result": {
+        items.push(makeItem(d, "result", { role: "system", meta: ev }));
+        break;
+      }
+      case "error": {
+        items.push(
+          makeItem(d, "text", {
+            role: "system",
+            text: `[acp error] ${String(ev.message ?? "unknown error")}`,
+          }),
+        );
+        break;
+      }
+      case "progress": {
+        // Only suppress the provider's generated duplicate for a known call.
+        const match = /^ACP tool (\S+) (?:pending|in_progress|completed|failed)$/.exec(
+          String(ev.message ?? ""),
+        );
+        if (!match?.[1] || !toolCalls.has(match[1])) {
+          items.push(makeItem(d, "lifecycle", { role: "system", meta: ev }));
+        }
+        break;
+      }
+      case "session_init":
+      case "context_usage": {
+        items.push(makeItem(d, "lifecycle", { role: "system", meta: ev }));
+        break;
+      }
+      default: {
+        items.push(makeItem(d, "unknown", { role: "system", raw: ev }));
+        break;
+      }
+    }
+  }
+
+  return items;
+}
+
+function acpToolPayload(result: Record<string, unknown> | undefined): unknown {
+  if (Array.isArray(result?.content) && result.content.length > 0) {
+    // ACP wraps ContentBlocks in ToolCallContent; unwrap before the shared
+    // result renderer so plain tool output does not become protocol JSON.
+    return {
+      content: result.content.map((part) =>
+        isRecord(part) && part.type === "content" ? part.content : part,
+      ),
+    };
+  }
+  return result?.rawOutput;
+}
+
+function appendAcpChunk(
+  items: NormalizedItem[],
+  d: DecodedRecord,
+  kind: "text" | "reasoning",
+  role: LogRole,
+  text: string,
+  messageId: string | undefined,
+): void {
+  const previous = items.at(-1);
+  const previousMeta = isRecord(previous?.meta) ? previous.meta : undefined;
+  const previousMessageId =
+    typeof previousMeta?.messageId === "string" ? previousMeta.messageId : undefined;
+  if (previous?.kind === kind && previous.role === role && previousMessageId === messageId) {
+    previous.text = `${previous.text ?? ""}${text}`;
+    previous.coveredRecIds = [...(previous.coveredRecIds ?? []), d.rec.id];
+    return;
+  }
+  items.push(makeItem(d, kind, { role, text, meta: messageId ? { messageId } : undefined }));
+}
+
 export function normalizeCodex(ordered: DecodedRecord[]): NormalizedItem[] {
   const items: NormalizedItem[] = [];
   const toolCallById = new Map<string, NormalizedItem>();
+  const textByItemId = new Map<string, NormalizedItem>();
+  const unknownById = new Map<string, NormalizedItem>();
+  const completedTextKeys = new Set<string>();
 
   for (const d of ordered) {
     const ev = d.event;
@@ -146,8 +359,14 @@ export function normalizeCodex(ordered: DecodedRecord[]): NormalizedItem[] {
             // These starts contain no text. Their completed event is the single
             // readable transcript row, so intentionally omit the empty marker.
             break;
-          default:
-            items.push(makeItem(d, "unknown", { role: "system", raw: ev }));
+          default: {
+            const userMessage = codexUserMessage(item);
+            if (userMessage) {
+              upsertCodexText(items, textByItemId, d, item, "user", userMessage, "replace");
+            } else {
+              upsertCodexUnknown(items, unknownById, d, ev, item, "running");
+            }
+          }
         }
         break;
       }
@@ -157,7 +376,7 @@ export function normalizeCodex(ordered: DecodedRecord[]): NormalizedItem[] {
           // existing call in place so the transcript shows one current list.
           upsertCodexToolCall(items, toolCallById, d, item);
         } else {
-          items.push(makeItem(d, "unknown", { role: "system", raw: ev }));
+          upsertCodexUnknown(items, unknownById, d, ev, item, "running");
         }
         break;
       }
@@ -175,7 +394,10 @@ export function normalizeCodex(ordered: DecodedRecord[]): NormalizedItem[] {
                 result: {
                   id: String(item.id ?? ""),
                   payload: item.result ?? item.aggregated_output ?? "",
-                  isError: typeof item.exit_code === "number" && item.exit_code !== 0,
+                  isError:
+                    (typeof item.exit_code === "number" && item.exit_code !== 0) ||
+                    item.status === "failed" ||
+                    item.error != null,
                 },
               }),
             );
@@ -196,22 +418,40 @@ export function normalizeCodex(ordered: DecodedRecord[]): NormalizedItem[] {
           }
           case "error": {
             const message = asString(item.message) ?? "Codex error";
+            const isAdvisory = CODEX_ADVISORIES.has(message);
             items.push(
-              makeItem(d, "result", {
+              makeItem(d, isAdvisory ? "lifecycle" : "result", {
                 role: "system",
-                meta: { ...item, type: "codex_error", output: message, isError: true },
+                meta: {
+                  ...item,
+                  type: isAdvisory ? "codex_notice" : "codex_error",
+                  output: message,
+                  isError: !isAdvisory,
+                },
               }),
             );
             break;
           }
           case "agent_message": {
             if (typeof item.text === "string") {
-              items.push(makeItem(d, "text", { role: "assistant", text: item.text }));
+              upsertCodexText(items, textByItemId, d, item, "assistant", item.text, "replace");
+              const id = asString(item.id);
+              if (id) completedTextKeys.add(codexTextKey(d, id));
             }
             break;
           }
           case "reasoning": {
-            const text = typeof item.text === "string" ? item.text : asString(item.summary);
+            const summary = Array.isArray(item.summary)
+              ? item.summary
+                  .filter((value): value is string => typeof value === "string")
+                  .join("\n")
+              : asString(item.summary);
+            const content = Array.isArray(item.content)
+              ? item.content
+                  .filter((value): value is string => typeof value === "string")
+                  .join("\n")
+              : undefined;
+            const text = asString(item.text) || summary || content;
             if (text) items.push(makeItem(d, "reasoning", { role: "assistant", text }));
             break;
           }
@@ -239,10 +479,37 @@ export function normalizeCodex(ordered: DecodedRecord[]): NormalizedItem[] {
             break;
           }
           default: {
-            items.push(makeItem(d, "unknown", { role: "system", raw: ev }));
+            const userMessage = codexUserMessage(item);
+            if (userMessage) {
+              upsertCodexText(items, textByItemId, d, item, "user", userMessage, "replace");
+            } else {
+              const failed =
+                (typeof item.exit_code === "number" && item.exit_code !== 0) ||
+                item.status === "failed" ||
+                item.error != null;
+              upsertCodexUnknown(items, unknownById, d, ev, item, failed ? "failed" : "completed");
+            }
             break;
           }
         }
+        break;
+      }
+      case "message.delta": {
+        const itemId = asString(ev.item_id);
+        const delta = asString(ev.delta);
+        if (!itemId || delta === undefined) {
+          items.push(makeItem(d, "unknown", { role: "system", raw: ev }));
+          break;
+        }
+        const key = codexTextKey(d, itemId);
+        if (completedTextKeys.has(key)) {
+          const completed = textByItemId.get(key);
+          if (completed) {
+            completed.coveredRecIds = [...new Set([...(completed.coveredRecIds ?? []), d.rec.id])];
+          }
+          break;
+        }
+        upsertCodexText(items, textByItemId, d, { id: itemId }, "assistant", delta, "append");
         break;
       }
       case "turn.completed": {
@@ -362,7 +629,13 @@ export function normalizeOpencode(ordered: DecodedRecord[]): NormalizedItem[] {
   const partUpdateRecIds = new Map<string, string[]>();
   const toolPartByCallId = new Map<
     string,
-    { toolName: string; input: unknown; isError?: boolean; recIds: string[] }
+    {
+      toolName: string;
+      input: unknown;
+      isError?: boolean;
+      recIds: string[];
+      attachments?: unknown[];
+    }
   >();
   const items: NormalizedItem[] = [];
 
@@ -398,6 +671,7 @@ export function normalizeOpencode(ordered: DecodedRecord[]): NormalizedItem[] {
           toolName,
           input,
           isError,
+          attachments: Array.isArray(state?.attachments) ? state.attachments : prev?.attachments,
           recIds: [...(prev?.recIds ?? []), d.rec.id],
         });
       }
@@ -482,7 +756,13 @@ function emitOpencodeEvent(
   event: Record<string, unknown>,
   toolPartByCallId: Map<
     string,
-    { toolName: string; input: unknown; isError?: boolean; recIds: string[] }
+    {
+      toolName: string;
+      input: unknown;
+      isError?: boolean;
+      recIds: string[];
+      attachments?: unknown[];
+    }
   >,
 ) {
   switch (event.type) {
@@ -519,7 +799,10 @@ function emitOpencodeEvent(
           role: "user",
           result: {
             id: callId,
-            payload: event.result,
+            payload:
+              rich?.attachments && resultImages(rich.attachments).length > 0
+                ? { output: event.result, attachments: rich.attachments }
+                : event.result,
             isError: rich?.isError ?? event.isError === true,
           },
           coveredRecIds: rich?.recIds,
@@ -606,6 +889,46 @@ function codexToolName(item: Record<string, unknown>): string {
   return String(item.type ?? "tool");
 }
 
+function codexUserMessage(item: Record<string, unknown>): string | undefined {
+  if (item.type !== "unknown" || item.originalType !== "userMessage" || !isRecord(item.value)) {
+    return undefined;
+  }
+  const text = resultBlockText(item.value.content);
+  return text || undefined;
+}
+
+function upsertCodexText(
+  items: NormalizedItem[],
+  textByItemId: Map<string, NormalizedItem>,
+  d: DecodedRecord,
+  item: Record<string, unknown>,
+  role: LogRole,
+  text: string,
+  mode: "append" | "replace",
+): void {
+  const id = asString(item.id);
+  const key = id ? codexTextKey(d, id) : undefined;
+  const existing = key ? textByItemId.get(key) : undefined;
+  if (existing && existing.role === role) {
+    if (text) existing.text = mode === "append" ? `${existing.text ?? ""}${text}` : text;
+    existing.coveredRecIds = [...new Set([...(existing.coveredRecIds ?? []), d.rec.id])];
+    return;
+  }
+  if (!text) return;
+
+  const normalized = makeItem(d, "text", {
+    role,
+    text,
+    meta: id ? { itemId: id } : undefined,
+  });
+  items.push(normalized);
+  if (key) textByItemId.set(key, normalized);
+}
+
+function codexTextKey(d: DecodedRecord, itemId: string): string {
+  return `${d.rec.sessionId}:${d.rec.iteration}:${itemId}`;
+}
+
 function codexCallInput(item: Record<string, unknown>): unknown {
   if (item.type === "command_execution") {
     const command = Array.isArray(item.command) ? item.command.join(" ") : (item.command ?? "");
@@ -645,6 +968,30 @@ function upsertCodexToolCall(
   });
   items.push(normalized);
   if (id) toolCallById.set(id, normalized);
+}
+
+function upsertCodexUnknown(
+  items: NormalizedItem[],
+  unknownById: Map<string, NormalizedItem>,
+  d: DecodedRecord,
+  ev: Record<string, unknown>,
+  item: Record<string, unknown> | undefined,
+  status: "running" | "completed" | "failed",
+): void {
+  const id = item ? asString(item.id) : undefined;
+  const key = id ? codexTextKey(d, id) : undefined;
+  const existing = key ? unknownById.get(key) : undefined;
+  if (existing) {
+    existing.raw = ev;
+    existing.status = status;
+    if (status !== "running") existing.durationMs = Math.max(0, d.t - existing.t);
+    existing.coveredRecIds = [...new Set([...(existing.coveredRecIds ?? []), d.rec.id])];
+    return;
+  }
+
+  const normalized = makeItem(d, "unknown", { role: "system", raw: ev, status });
+  items.push(normalized);
+  if (key) unknownById.set(key, normalized);
 }
 
 function emitStderr(

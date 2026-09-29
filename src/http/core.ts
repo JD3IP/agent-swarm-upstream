@@ -38,8 +38,10 @@ import { agentWithCapacity, getPathSegments, jsonError, parseQueryParams } from 
 
 /**
  * Load global swarm_config entries into process.env.
- * When override=false (default, used at startup), existing env vars take precedence.
- * When override=true (used for reload), DB values overwrite process.env.
+ * When override=true (used at startup, on reload, and in createServer), DB
+ * values overwrite process.env, so a dashboard-saved value wins over the
+ * deployment env. When override=false, existing env vars take precedence
+ * (only used by callers that want env-first semantics; no boot path does).
  * Reserved keys are filtered before decryption because they must remain
  * environment-only, even if legacy rows still exist in the DB.
  * Returns the list of keys that were set/updated.
@@ -139,7 +141,18 @@ export async function reloadGlobalConfigsAndIntegrations(): Promise<ReloadConfig
 }
 
 async function reloadGlobalConfigsAndIntegrationsInner(): Promise<ReloadConfigResult> {
+  // Lazy import keeps http/core out of the memory module-init graph (pulls
+  // in the OpenAI SDK). Read the pre-reload configured state first — the
+  // provider memoizes its API key at construction, so this reflects whatever
+  // key (if any) was live before we hydrate the new env below.
+  const { getEmbeddingProvider, resetEmbeddingProvider } = await import("../be/memory");
+  const wasEmbeddingsConfigured = getEmbeddingProvider().isConfigured();
+
   const updated = await loadGlobalConfigsIntoEnv(true);
+
+  // Retire the old transport before any other integration can fail during
+  // reload. HTTP/invalid selection must never leave the previous socket live.
+  await stopSlackApp();
 
   // File-storage provider selection reads process.env once and memoizes; the
   // env we just (re)hydrated may flip it (local-fs → agent-fs after late
@@ -149,7 +162,34 @@ async function reloadGlobalConfigsAndIntegrationsInner(): Promise<ReloadConfigRe
   const { resetFileStorageProvider } = await import("../fs/registry");
   resetFileStorageProvider();
 
+  // Same reasoning as the file-storage provider above: the embedding
+  // provider captures EMBEDDING_API_KEY/OPENAI_API_KEY once at construction,
+  // so a key set (or rotated) via config reload stays inert until this reset.
+  resetEmbeddingProvider();
+  const isEmbeddingsConfigured = getEmbeddingProvider().isConfigured();
+
   const integrations: string[] = [];
+
+  if (isEmbeddingsConfigured) {
+    integrations.push("embeddings");
+  }
+
+  // Off-to-on transition: existing rows written while no key resolved (or
+  // with a stale dimension) never got embedded. Kick off the same backfill
+  // boot runs, fire-and-forget — it batches, swallows per-batch errors, and
+  // is idempotent, so it's safe to not await here.
+  if (!wasEmbeddingsConfigured && isEmbeddingsConfigured) {
+    import("../be/memory/boot-reembed")
+      .then(({ runBootReembed }) => runBootReembed())
+      .catch((err) => {
+        console.error("[config-reload] memory backfill failed (non-fatal):", err);
+      });
+    import("../be/scripts/boot-reembed")
+      .then(({ runBootReembedScripts }) => runBootReembedScripts())
+      .catch((err) => {
+        console.error("[config-reload] script backfill failed (non-fatal):", err);
+      });
+  }
 
   resetAgentMail();
   if (initAgentMail()) integrations.push("agentmail");
@@ -170,9 +210,7 @@ async function reloadGlobalConfigsAndIntegrationsInner(): Promise<ReloadConfigRe
   resetJira();
   if (await initJira()) integrations.push("jira");
 
-  await stopSlackApp();
-  await startSlackApp();
-  integrations.push("slack");
+  if (await startSlackApp()) integrations.push("slack");
 
   return {
     configsLoaded: updated.length,

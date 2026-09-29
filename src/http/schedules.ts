@@ -6,11 +6,13 @@ import { resolveHttpAuditUserId } from "../be/audit-user";
 import {
   createScheduledTask,
   deleteScheduledTask,
+  extensionAgentAssignmentError,
   getAgentById,
   getScheduledTaskById,
   getScheduledTaskByName,
   getScheduledTasks,
   getWorkflow,
+  isExtensionAgent,
   updateScheduledTask,
   withFavoriteFlags,
 } from "../be/db";
@@ -20,6 +22,7 @@ import { calculateNextRun, dispatchScheduleTarget } from "../scheduler/scheduler
 import {
   AgentTaskSchema,
   AssetKeySchema,
+  AutomationIntegrationIdSchema,
   ModelTierSchema,
   ScheduledTaskSchema,
   ScheduledTaskTargetTypeSchema,
@@ -51,6 +54,9 @@ const scheduleUpdateBodySchema = z.object({
   workflowId: z.string().uuid().nullable().optional(),
   scriptName: z.string().nullable().optional(),
   scriptArgs: z.record(z.string(), z.unknown()).nullable().optional(),
+  params: z.record(z.string(), z.unknown()).optional(),
+  requiredParams: z.array(z.string()).optional(),
+  requires: z.array(AutomationIntegrationIdSchema).optional(),
 });
 
 // `ScheduledTaskSchema` carries `.refine()` checks, so Zod v4 forbids the
@@ -107,6 +113,9 @@ const createSchedule = route({
     workflowId: z.string().uuid().optional(),
     scriptName: z.string().optional(),
     scriptArgs: z.record(z.string(), z.unknown()).optional(),
+    params: z.record(z.string(), z.unknown()).optional(),
+    requiredParams: z.array(z.string()).optional(),
+    requires: z.array(AutomationIntegrationIdSchema).optional(),
     delayMs: z.number().int().optional(),
     runAt: z.string().optional(),
   }),
@@ -348,6 +357,10 @@ export async function handleSchedules(
         jsonError(res, "Target agent not found", 400);
         return true;
       }
+      if (isExtensionAgent(agent)) {
+        jsonError(res, extensionAgentAssignmentError(agent), 400);
+        return true;
+      }
     }
 
     const targetType = body.targetType ?? "agent-task";
@@ -425,6 +438,9 @@ export async function handleSchedules(
         workflowId: body.workflowId,
         scriptName: body.scriptName,
         scriptArgs: body.scriptArgs,
+        params: body.params,
+        requiredParams: body.requiredParams,
+        requires: body.requires,
         createdBy: (await resolveHttpAuditUserId(req, myAgentId)) ?? undefined,
       });
 
@@ -571,6 +587,10 @@ export async function handleSchedules(
       const agent = await getAgentById(parsed.body.targetAgentId);
       if (!agent) {
         jsonError(res, "Target agent not found", 400);
+        return true;
+      }
+      if (isExtensionAgent(agent)) {
+        jsonError(res, extensionAgentAssignmentError(agent), 400);
         return true;
       }
     }

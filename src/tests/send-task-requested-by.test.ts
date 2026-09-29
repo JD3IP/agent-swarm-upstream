@@ -151,6 +151,8 @@ describe("send-task: requestedByUserId inheritance", () => {
       {
         task: "worker direct assign — inherit user",
         agentId: WORKER_ID,
+        routingReason: "human_pinned",
+        routingNote: "This test explicitly selects the target worker",
         allowDuplicate: true,
       },
       LEAD_ID,

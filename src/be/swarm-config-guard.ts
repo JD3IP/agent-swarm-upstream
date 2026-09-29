@@ -1,4 +1,6 @@
+import { normalizeSlackReactionShortcode } from "../slack/reaction-shortcode";
 import { ProviderNameSchema } from "../types";
+import { parseTaskToolManifest } from "../utils/task-tool-manifest";
 
 /**
  * Guards against storing reserved keys in the swarm_config table.
@@ -10,10 +12,30 @@ import { ProviderNameSchema } from "../types";
  *   - `SECRETS_ENCRYPTION_KEY` is required to decrypt secrets stored in
  *     swarm_config, so it cannot itself be stored encrypted there.
  *
+ * `CORS_ALLOW_ANY_ORIGIN` is deployment-only: runtime config must not
+ * re-enable unrestricted credentialed CORS.
+ *
  * Matching is case-insensitive so `api_key`, `Api_Key`, etc. are all
  * rejected at every write path (DB helpers, HTTP routes, MCP tools).
  */
-const RESERVED_KEYS = new Set(["API_KEY", "SECRETS_ENCRYPTION_KEY"]);
+// Lead activation is also deployment-only: leads can write ordinary global config.
+const RESERVED_KEYS = new Set([
+  "API_KEY",
+  "SECRETS_ENCRYPTION_KEY",
+  "CORS_ALLOW_ANY_ORIGIN",
+  "EXTENSION_ALLOW_LEAD_ACTIVATION",
+]);
+
+/** Config rows owned by dedicated API surfaces, not the generic config API. */
+export const INTERNAL_CONFIG_KEYS = new Set(["onboarding_state"]);
+
+export function isInternalConfigKey(key: string): boolean {
+  return INTERNAL_CONFIG_KEYS.has(key.toLowerCase());
+}
+
+export function internalConfigKeyError(key: string): Error {
+  return new Error(`Key '${key}' is managed by /api/onboarding`);
+}
 
 export function isReservedConfigKey(key: string): boolean {
   return RESERVED_KEYS.has(key.toUpperCase());
@@ -42,6 +64,22 @@ const BOOLEAN_LITERALS = ["true", "false", "1", "0"];
 /** A conservative window that remains representable by JavaScript Date arithmetic. */
 export const MAX_DB_RETENTION_DAYS = 1_000_000;
 
+/**
+ * The one source of truth for the retention tick's tuning ranges.
+ *
+ * db-retention.ts clamps each knob to exactly these bounds and falls back to
+ * its default outside them, and VALIDATED_KEYS below rejects out-of-range
+ * writes with the same numbers. Both sides read this constant, so the config
+ * API cannot accept a value the sweep will silently ignore. It lives here
+ * because db-retention.ts already imports from this module; the reverse
+ * direction would be a cycle.
+ */
+export const DB_RETENTION_TUNING_BOUNDS = {
+  DB_RETENTION_TICK_BUDGET_MS: { min: 1_000, max: 300_000 },
+  DB_RETENTION_CATCHUP_INTERVAL_MS: { min: 5_000, max: 3_600_000 },
+  DB_RETENTION_MAX_STATEMENT_MS: { min: 25, max: 5_000 },
+} as const;
+
 /** Build `{ KEY: validator }` entries accepting only boolean literals. */
 function booleanValidators(keys: string[]): Record<string, ConfigValidator> {
   const message = (key: string) =>
@@ -68,6 +106,18 @@ function enumValidator(key: string, options: string[]): Record<string, ConfigVal
   };
 }
 
+/** Build `{ KEY: validator }` entries accepting a Slack emoji shortcode. */
+function shortcodeValidators(keys: string[]): Record<string, ConfigValidator> {
+  const message = (key: string) =>
+    `Invalid ${key} (must be a Slack emoji shortcode: lowercase letters, digits, _ + ' -, with optional surrounding colons)`;
+  return Object.fromEntries(
+    keys.map((key) => [
+      key,
+      (value: unknown) => (normalizeSlackReactionShortcode(value) !== null ? null : message(key)),
+    ]),
+  );
+}
+
 /** Build `{ KEY: validator }` entries accepting integers >= `min`. */
 function integerValidators(keys: string[], min: number): Record<string, ConfigValidator> {
   return Object.fromEntries(
@@ -82,6 +132,17 @@ function integerValidators(keys: string[], min: number): Record<string, ConfigVa
       },
     ]),
   );
+}
+
+/** Build `{ KEY: validator }` entries from a per-key closed range. */
+function boundedIntegerValidatorsFor(
+  bounds: Record<string, { min: number; max: number }>,
+): Record<string, ConfigValidator> {
+  const validators: Record<string, ConfigValidator> = {};
+  for (const [key, { min, max }] of Object.entries(bounds)) {
+    Object.assign(validators, boundedIntegerValidators([key], min, max));
+  }
+  return validators;
 }
 
 /** Build `{ KEY: validator }` entries accepting integers inside a closed range. */
@@ -120,11 +181,62 @@ function validateFloatRange(
 }
 
 const VALIDATED_KEYS: Record<string, ConfigValidator> = {
+  TASK_TOOL_MANIFESTS: (value) => {
+    try {
+      if (typeof value !== "string") throw new Error("Expected JSON string");
+      parseTaskToolManifest(value);
+      return null;
+    } catch {
+      return "Invalid TASK_TOOL_MANIFESTS (expected JSON with taskTypes and/or schedules maps, each selecting at most 16 known swarm tools)";
+    }
+  },
+  FEEDBACK_ENDPOINT: (value) => {
+    if (typeof value !== "string") {
+      return "Invalid FEEDBACK_ENDPOINT (must use HTTPS, or HTTP on a loopback host)";
+    }
+
+    try {
+      const endpoint = new URL(value.trim());
+      const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+      if (endpoint.protocol === "https:") return null;
+      if (endpoint.protocol === "http:" && loopbackHosts.has(endpoint.hostname)) return null;
+    } catch {
+      // Fall through to the shared validation error.
+    }
+
+    return "Invalid FEEDBACK_ENDPOINT (must use HTTPS, or HTTP on a loopback host)";
+  },
+  // OpenAI-compatible model gateway for every OpenRouter consumer (OpenCode and
+  // pi-mono sessions, model refreshes, internal summarizers). Call sites append
+  // `/models` and `/chat/completions` to it, so a value carrying a query string
+  // or a fragment would build a nonsense URL — reject those here rather than
+  // letting workers fail one request at a time. Blank is meaningful and allowed:
+  // it is how an operator reverts to openrouter.ai without deleting the row.
+  OPENROUTER_BASE_URL: (value) => {
+    const invalid =
+      "Invalid OPENROUTER_BASE_URL (must be an http(s) URL with no query string or fragment, e.g. https://api.example.com/v1 — leave blank for openrouter.ai)";
+    if (typeof value !== "string") return invalid;
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return null;
+
+    try {
+      const url = new URL(trimmed);
+      if (url.protocol !== "https:" && url.protocol !== "http:") return invalid;
+      if (url.search || url.hash) return invalid;
+    } catch {
+      return invalid;
+    }
+    return null;
+  },
   HARNESS_PROVIDER: (value) => {
     const parsed = ProviderNameSchema.safeParse(value);
     if (parsed.success) return null;
     return `Invalid HARNESS_PROVIDER value (must be one of: ${ProviderNameSchema.options.join(", ")})`;
   },
+  ...enumValidator("CLAUDE_TRANSPORT", ["cli", "sdk"]),
+  // fail: worker fails a task fast when every key has exhausted the task
+  // model's weekly window (Fable/Opus/Sonnet). fallback: legacy random pick.
+  ...enumValidator("MODEL_WINDOW_EXHAUSTED_POLICY", ["fail", "fallback"]),
   // Codex credits-exhausted cooldown (ms). Permissive on range here (positive
   // integer) — the worker clamps to [5m, 7d] via resolveCodexCreditsExhaustedCooldownMs.
   CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS: (value) => {
@@ -144,7 +256,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   },
   // AWS credential mode for the Bedrock path on the pi harness.
   //   sdk    — AWS SDK default credential chain (env, ~/.aws/*, SSO, IMDS, …)
-  //   bearer — explicit bearer token via AWS_BEARER_TOKEN_BEDROCK (future/Mantle)
+  //   bearer — explicit Bedrock API key via AWS_BEARER_TOKEN_BEDROCK (required in this mode)
   // When absent the worker infers the mode from MODEL_OVERRIDE (sdk semantics).
   BEDROCK_AUTH_MODE: (value) => {
     if (value === "sdk" || value === "bearer") return null;
@@ -170,8 +282,10 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "HEARTBEAT_PIN_CRASH_RESUME",
     "POOL_AFFINITY_ENFORCEMENT",
     "SCRIPTS_ONLY_MCP",
+    "TASK_TOOL_PRELOAD_ENABLED",
     "SLACK_DISABLE",
     "SLACK_RENDER_V2",
+    "SLACK_RENDER_V2_DELEGATION",
     "GITHUB_DISABLE",
     "GITLAB_DISABLE",
     "LINEAR_DISABLE",
@@ -180,6 +294,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "ADDITIVE_SLACK",
     "SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION",
     "RBAC_ENABLED",
+    "SEED_AUTOMATIONS_ENABLED",
     "RBAC_AUDIT_DISABLED",
     "BUDGET_ADMISSION_DISABLED",
     "MCP_OAUTH_ALLOW_PRIVATE_HOSTS",
@@ -189,8 +304,17 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "DB_QUERY_BOUNDED_ENABLED",
     "DB_RETENTION_DRY_RUN",
   ]),
-  ...enumValidator("SLACK_THREAD_STEERING", ["lead", "all"]),
+  ...enumValidator("SLACK_MODE", ["socket", "http"]),
+  ...enumValidator("SLACK_THREAD_STEERING", ["off", "lead", "all"]),
   ...enumValidator("SLACK_THREAD_STEERING_MODE", ["steer", "queue"]),
+  ...shortcodeValidators([
+    "SLACK_REACTION_ACCEPTED",
+    "SLACK_REACTION_BUFFERED",
+    "SLACK_REACTION_NOW",
+    "SLACK_REACTION_STEERED",
+    "SLACK_REACTION_COMPLETED",
+    "SLACK_REACTION_FAILED",
+  ]),
   // Counts, minutes, and intervals: positive integers. Deliberately permissive
   // on the upper bound — an operator raising a sweep cap is legitimate.
   ...integerValidators(
@@ -205,6 +329,8 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       "WORKFLOW_MAX_ITERATIONS",
       "WORKFLOW_MAX_STEPS_PER_RUN",
       "SCHEDULER_INTERVAL_MS",
+      "EXTENSION_HANDLER_TIMEOUT_MS",
+      "EXTENSION_MAX_CONSECUTIVE_FAILURES",
       "RUNTIME_STALE_THRESHOLD_MIN",
       "SCRIPT_RUN_CONCURRENCY_CAP",
       "WORKER_API_READY_TIMEOUT_SECONDS",
@@ -213,9 +339,18 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       "DB_QUERY_MCP_BUDGET_MS",
       "DB_QUERY_MCP_MAX_ROWS",
       "AGENT_FS_REQUEST_TIMEOUT_MS",
+      "SLACK_CONCLUSION_SETTLE_SEC",
+      "SLACK_CONCLUSION_TIMEOUT_MIN",
+      "SLACK_TREE_STALL_MIN",
     ],
     1,
   ),
+  // The retention tick's knobs are NOT merely positive. The sweep clamps each
+  // to a distinct range and silently substitutes its default outside it, so a
+  // permissive "integer >= 1" here accepted settings that never took effect:
+  // an operator could save a 500ms tick budget, see it accepted, and have the
+  // sweep keep running for the default 30000ms.
+  ...boundedIntegerValidatorsFor(DB_RETENTION_TUNING_BOUNDS),
   ...boundedIntegerValidators(
     ["SESSION_LOG_RETENTION_DAYS", "AGENT_LOG_RETENTION_DAYS", "EVENTS_RETENTION_DAYS"],
     1,
@@ -223,6 +358,10 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   ),
   // 0 is meaningful here: "auto-assign nothing this sweep".
   ...integerValidators(["HEARTBEAT_MAX_AUTO_ASSIGN"], 0),
+  // Below ~100 tokens the preamble can't fit a useful summary; above 20000
+  // (~80k chars) it risks the SIGTERM-143 context-saturation failure mode
+  // the cap exists to prevent (see context-preamble.ts).
+  ...boundedIntegerValidators(["CONTEXT_PREAMBLE_MAX_TOKENS"], 100, 20000),
   MEMORY_MIN_SIMILARITY: (value) =>
     validateFloatRange("MEMORY_MIN_SIMILARITY", value, 0, 1, "between 0 and 1 inclusive"),
   MEMORY_ACCESS_BOOST_MAX: (value) =>

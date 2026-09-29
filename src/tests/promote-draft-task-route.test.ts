@@ -10,7 +10,14 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { closeDb, createAgent, createTaskExtended, createUser, initDb } from "../be/db";
+import {
+  closeDb,
+  createAgent,
+  createTaskExtended,
+  createUser,
+  initDb,
+  updateAgentProfile,
+} from "../be/db";
 import { findUserById } from "../be/users";
 import { handleTasks } from "../http/tasks";
 import { getPathSegments, parseQueryParams } from "../http/utils";
@@ -83,9 +90,40 @@ afterAll(async () => {
 });
 
 describe("POST /api/tasks draft:true + /promote-draft (#1240)", () => {
+  test("a UI follow-up lands on the Lead without being stamped Lead-only", async () => {
+    const worker = await createAgent({
+      name: "session-parent-worker",
+      isLead: false,
+      status: "idle",
+    });
+    await updateAgentProfile(worker.id, { role: "coder" });
+    const parent = await createTaskExtended("worker-owned session", {
+      agentId: worker.id,
+      routingAffinity: { role: "coder" },
+    });
+
+    const created = await api("POST", "/api/tasks", {
+      task: "continue this session",
+      parentTaskId: parent.id,
+      source: "ui",
+    });
+
+    expect(created.status).toBe(201);
+    expect(created.body.agentId).toBe(leadAgentId);
+    expect(created.body.parentTaskId).toBe(parent.id);
+    // The parent's worker-specific affinity is inherited PROVENANCE (where
+    // the continuation came from), not an authorization requirement — it
+    // must not block the Lead from being direct-assigned here, and it must
+    // not be replaced with an authorization flag that ratchets forever
+    // (see #1316 / #1276 interaction; `leadOnly` is reserved for a genuine
+    // caller-declared or ratcheted requirement).
+    expect(created.body.routingAffinity?.leadOnly).not.toBe(true);
+  });
+
   test("draft:true creates a task in draft status, invisible to the assigned agent's dispatch queue", async () => {
     const created = await api("POST", "/api/tasks", {
       task: "session with attachments uploading",
+      routingReason: "human_pinned",
       agentId: leadAgentId,
       source: "ui",
       draft: true,
@@ -101,6 +139,7 @@ describe("POST /api/tasks draft:true + /promote-draft (#1240)", () => {
   test("promote-draft transitions draft -> pending for an owned task", async () => {
     const created = await api("POST", "/api/tasks", {
       task: "another draft session",
+      routingReason: "human_pinned",
       agentId: leadAgentId,
       source: "ui",
       draft: true,
@@ -116,6 +155,7 @@ describe("POST /api/tasks draft:true + /promote-draft (#1240)", () => {
   test("promote-draft is idempotent — a second call returns the already-promoted task", async () => {
     const created = await api("POST", "/api/tasks", {
       task: "idempotency check",
+      routingReason: "human_pinned",
       agentId: leadAgentId,
       source: "ui",
       draft: true,
@@ -151,6 +191,7 @@ describe("POST /api/tasks draft:true + /promote-draft (#1240)", () => {
       "/api/tasks",
       {
         task: "owned draft session",
+        routingReason: "human_pinned",
         agentId: leadAgentId,
         source: "ui",
         draft: true,

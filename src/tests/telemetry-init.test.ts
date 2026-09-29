@@ -11,7 +11,11 @@ import {
   _resolveCloudMode,
   _resolveInstallMethod,
   _resolveInstallPreset,
+  _resolveIntegrationProvider,
+  _resolveIntegrationType,
+  emitIntegrationConnected,
   initTelemetry,
+  telemetry,
   track,
 } from "../telemetry";
 
@@ -201,6 +205,14 @@ describe("initTelemetry", () => {
       const metadata = (captured as { metadata: Record<string, unknown> }).metadata;
       expect(metadata.organization_id).toBeUndefined();
       expect(metadata.organization_name).toBeUndefined();
+
+      // Dashboard config reloads update the env after telemetry initialized.
+      process.env.SWARM_ORG_NAME = "  Acme Engineering  ";
+      track({ event: "test.event", properties: {} });
+      await new Promise((r) => setTimeout(r, 0));
+      expect((captured as { metadata: Record<string, unknown> }).metadata.organization_name).toBe(
+        "Acme Engineering",
+      );
     });
 
     test("includes organization_id + organization_name when SWARM_ORG_* set", async () => {
@@ -221,6 +233,39 @@ describe("initTelemetry", () => {
       const metadata = (captured as { metadata: Record<string, unknown> }).metadata;
       expect(metadata.organization_id).toBe("org_acme_123");
       expect(metadata.organization_name).toBe("Acme Engineering");
+    });
+
+    test("onboarding events include the install-relative duration when known", async () => {
+      await initTelemetry(
+        "api-server",
+        async (key) => {
+          if (key === "telemetry_installation_id") return "install_onboarding";
+          if (key === "telemetry_installed_at") return "2026-01-01T00:00:00.000Z";
+          return undefined;
+        },
+        async () => {},
+      );
+
+      telemetry.onboarding("step_completed", {
+        step: "connect",
+        method: "api_key",
+        derived: true,
+        seconds_since_start: 2,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const event = captured as {
+        event: string;
+        properties: Record<string, unknown>;
+      };
+      expect(event.event).toBe("onboarding.step_completed");
+      expect(event.properties).toMatchObject({
+        step: "connect",
+        method: "api_key",
+        derived: true,
+        seconds_since_start: 2,
+      });
+      expect(event.properties.seconds_since_install).toBeInteger();
     });
 
     test("metadata.is_cloud === false when SWARM_CLOUD unset", async () => {
@@ -730,13 +775,34 @@ describe("initTelemetry", () => {
     });
   });
 
+  describe("_resolveIntegrationType", () => {
+    test("maps allowlisted providers and hosts into the five closed categories", () => {
+      expect(_resolveIntegrationType("github")).toBe("code_repo");
+      expect(_resolveIntegrationType("https://gitlab.com/desplega/agent-swarm")).toBe("code_repo");
+      expect(_resolveIntegrationProvider("git@github.com:desplega/agent-swarm.git")).toBe("github");
+      expect(_resolveIntegrationType("slack")).toBe("comms");
+      expect(_resolveIntegrationType("api.telegram.org")).toBe("comms");
+      expect(_resolveIntegrationType("linear")).toBe("task_manager");
+      expect(_resolveIntegrationType("https://app.asana.com/api/1.0")).toBe("task_manager");
+      expect(_resolveIntegrationType("google_drive")).toBe("information_management");
+      expect(_resolveIntegrationType("https://api.notion.com/v1")).toBe("information_management");
+      expect(_resolveIntegrationType("some-new-provider")).toBe("other");
+    });
+
+    test("never returns a free-form provider value", () => {
+      expect(_resolveIntegrationType("someone@example.com")).toBe("other");
+      expect(_resolveIntegrationProvider("someone@example.com")).toBeUndefined();
+      expect(_resolveIntegrationProvider("https://customer.example.com/api")).toBeUndefined();
+    });
+  });
+
   describe("_hasEmbeddingKey", () => {
     test("true when EMBEDDING_API_KEY is set", () => {
-      expect(_hasEmbeddingKey({ EMBEDDING_API_KEY: "sk-embed" })).toBe(true);
+      expect(_hasEmbeddingKey({ EMBEDDING_API_KEY: "example-sk-embed" })).toBe(true);
     });
 
     test("true when OPENAI_API_KEY is set", () => {
-      expect(_hasEmbeddingKey({ OPENAI_API_KEY: "sk-openai" })).toBe(true);
+      expect(_hasEmbeddingKey({ OPENAI_API_KEY: "example-sk-openai" })).toBe(true);
     });
 
     test("false when neither is set (onboard wizard only writes ANTHROPIC_API_KEY)", () => {
@@ -758,6 +824,24 @@ describe("initTelemetry", () => {
           SLACK_BOT_TOKEN: "xoxb-1",
           SLACK_APP_TOKEN: "xapp-1",
           SLACK_DISABLE: "true",
+        }),
+      ).toBe(false);
+    });
+
+    test("Slack HTTP mode uses the signing secret instead of an app token", () => {
+      expect(
+        _hasSlackChannel({
+          SLACK_MODE: "http",
+          SLACK_BOT_TOKEN: "xoxb-1",
+          SLACK_SIGNING_SECRET: "synthetic-signing-secret",
+        }),
+      ).toBe(true);
+      expect(_hasSlackChannel({ SLACK_MODE: "http", SLACK_BOT_TOKEN: "xoxb-1" })).toBe(false);
+      expect(
+        _hasSlackChannel({
+          SLACK_MODE: "invalid",
+          SLACK_BOT_TOKEN: "xoxb-1",
+          SLACK_APP_TOKEN: "xapp-1",
         }),
       ).toBe(false);
     });
@@ -828,6 +912,43 @@ describe("initTelemetry", () => {
       expect(typeof metadata.install_created_at).toBe("string");
     });
 
+    test("integration.connected emits only allowlisted provider values", async () => {
+      await initTelemetry(
+        "api-server",
+        async () => "install_integration_test",
+        async () => {},
+      );
+
+      emitIntegrationConnected("code_repo", "https://github.com/desplega/agent-swarm", true);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(captured).toMatchObject({
+        event: "integration.connected",
+        properties: {
+          type: "code_repo",
+          provider: "github",
+          first_of_type: true,
+        },
+      });
+    });
+
+    test("integration.connected omits a free-form PII-looking provider", async () => {
+      await initTelemetry(
+        "api-server",
+        async () => "install_integration_test",
+        async () => {},
+      );
+
+      emitIntegrationConnected("other", "someone@example.com", false);
+      await new Promise((r) => setTimeout(r, 0));
+
+      const event = captured as { event: string; properties: Record<string, unknown> };
+      expect(event.event).toBe("integration.connected");
+      expect(event.properties.type).toBe("other");
+      expect(event.properties.provider).toBeUndefined();
+      expect(event.properties.first_of_type).toBe(false);
+    });
+
     test("pre-existing installationId with no stored anchor → install_created_at is absent from the payload, not back-filled with now()", async () => {
       await initTelemetry(
         "api-server",
@@ -880,7 +1001,7 @@ describe("initTelemetry", () => {
     });
 
     test("channels + embedding key all present", async () => {
-      process.env.EMBEDDING_API_KEY = "sk-embed";
+      process.env.EMBEDDING_API_KEY = "example-sk-embed";
       process.env.SLACK_BOT_TOKEN = "xoxb-1";
       process.env.SLACK_APP_TOKEN = "xapp-1";
       process.env.AGENTMAIL_WEBHOOK_SECRET = "whsec_1";

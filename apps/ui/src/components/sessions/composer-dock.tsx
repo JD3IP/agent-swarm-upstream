@@ -2,17 +2,28 @@
  * Sessions surface — shared floating composer dock.
  *
  * A rounded card-shaped input area inset from the panel edges with a slim
- * action row at the bottom: routing hint on the left, ⌘↵ hint + circular
+ * action row at the bottom: routing hint on the left, keyboard hints + circular
  * primary send button on the right. Used by both the new-session view and
  * the in-session composer so the bottom of the right pane is identical
  * regardless of state.
+ * Enter sends, Shift+Enter inserts a new line, and Cmd/Ctrl+Enter also sends.
+ * On a touch device with a soft keyboard (no hardware Enter key), plain
+ * Enter inserts a newline instead — the send button submits there.
  */
 
 import { ArrowUp, FileText, Paperclip, X } from "lucide-react";
-import { type ChangeEvent, useEffect, useRef } from "react";
+import {
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { isCoarsePointerInput, shouldSubmitOnEnterKeyDown } from "@/lib/enter-submit";
 import { cn } from "@/lib/utils";
 
 function formatFileSize(bytes: number): string {
@@ -20,6 +31,55 @@ function formatFileSize(bytes: number): string {
   const kb = bytes / 1024;
   if (kb < 1024) return `${kb.toFixed(1)} KB`;
   return `${(kb / 1024).toFixed(1)} MB`;
+}
+
+// Matches MAX_UPLOAD_BYTES in src/http/fs.ts — reject client-side before a
+// doomed upload round trip instead of after a 413.
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+
+const ALLOWED_ATTACHMENT_EXTENSIONS = [
+  ".pdf",
+  ".txt",
+  ".md",
+  ".csv",
+  ".json",
+  ".doc",
+  ".docx",
+  ".xls",
+  ".xlsx",
+  ".ppt",
+  ".pptx",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".zip",
+] as const;
+
+function fileExtension(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot === -1 ? "" : name.slice(dot).toLowerCase();
+}
+
+/** Splits a dropped/selected/pasted file batch into what's safe to attach and a
+ * human-readable reason for anything rejected. Returns at most one message —
+ * multiple bad files still name only the first, to keep the row short. */
+function partitionAttachmentFiles(files: File[]): { valid: File[]; error: string | null } {
+  const valid: File[] = [];
+  let error: string | null = null;
+  for (const file of files) {
+    if (!ALLOWED_ATTACHMENT_EXTENSIONS.includes(fileExtension(file.name) as never)) {
+      error ??= `"${file.name}" isn't an allowed file type (${ALLOWED_ATTACHMENT_EXTENSIONS.join(", ")}).`;
+      continue;
+    }
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      error ??= `"${file.name}" exceeds the 50 MB attachment limit.`;
+      continue;
+    }
+    valid.push(file);
+  }
+  return { valid, error };
 }
 
 export interface ComposerDockProps {
@@ -52,9 +112,16 @@ export interface ComposerDockProps {
   /**
    * Let the card span the full available width instead of the chat-style
    * centered `max-w-3xl` column. Used by the task-detail steering dock, where
-   * the composer sits under a full-width log viewer.
+   * the composer sits under a full-width log viewer, and by the `/setup`
+   * first task, which spans the setup column.
    */
   fullWidth?: boolean;
+  /**
+   * Optional layer inside the rounded card, drawn above its border (for
+   * example a `BorderBeam`). Must be absolutely positioned and ignore pointer
+   * events. The sessions surfaces pass nothing.
+   */
+  decoration?: React.ReactNode;
   className?: string;
 }
 
@@ -76,35 +143,91 @@ export function ComposerDock({
   attachmentErrorMessage,
   autoFocus,
   fullWidth,
+  decoration,
   className,
 }: ComposerDockProps) {
   const ref = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dragCounterRef = useRef(0);
+  const [isDragActive, setIsDragActive] = useState(false);
+  const [dropErrorMessage, setDropErrorMessage] = useState<string | null>(null);
   useEffect(() => {
     if (autoFocus) ref.current?.focus();
   }, [autoFocus]);
+  // Clears a stale rejection message once the parent resets attachments
+  // (e.g. after a successful send) rather than leaving it stuck on screen.
+  useEffect(() => {
+    if (attachments.length === 0) setDropErrorMessage(null);
+  }, [attachments.length]);
 
   const canSubmit = !disabled && !isPending && value.trim().length > 0;
   const canAttach = !disabled && !isPending && !!onAttachmentsChange;
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      if (canSubmit) onSubmit();
-    }
+    const submit = shouldSubmitOnEnterKeyDown(
+      {
+        key: e.key,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        isComposing: e.nativeEvent.isComposing,
+        keyCode: e.nativeEvent.keyCode,
+      },
+      isCoarsePointerInput(),
+    );
+    if (!submit) return;
+    e.preventDefault();
+    if (canSubmit) onSubmit();
+  };
+
+  const handleIncomingFiles = (incoming: File[]) => {
+    if (incoming.length === 0 || !onAttachmentsChange) return;
+    const { valid, error } = partitionAttachmentFiles(incoming);
+    setDropErrorMessage(error);
+    if (valid.length > 0) onAttachmentsChange([...attachments, ...valid]);
   };
 
   const onFilesSelected = (event: ChangeEvent<HTMLInputElement>) => {
-    const selected = Array.from(event.target.files ?? []);
-    if (selected.length > 0 && onAttachmentsChange) {
-      onAttachmentsChange([...attachments, ...selected]);
-    }
+    handleIncomingFiles(Array.from(event.target.files ?? []));
     event.target.value = "";
+  };
+
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!canAttach || e.clipboardData.files.length === 0) return;
+    e.preventDefault();
+    handleIncomingFiles(Array.from(e.clipboardData.files));
   };
 
   const removeAttachment = (index: number) => {
     if (!onAttachmentsChange) return;
     onAttachmentsChange(attachments.filter((_, i) => i !== index));
+  };
+
+  const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
+    if (!canAttach) return;
+    e.preventDefault();
+    dragCounterRef.current += 1;
+    if (e.dataTransfer.types.includes("Files")) setIsDragActive(true);
+  };
+
+  const onDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (!canAttach) return;
+    e.preventDefault();
+  };
+
+  const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
+    if (!canAttach) return;
+    e.preventDefault();
+    dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+    if (dragCounterRef.current === 0) setIsDragActive(false);
+  };
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    if (!canAttach) return;
+    e.preventDefault();
+    dragCounterRef.current = 0;
+    setIsDragActive(false);
+    handleIncomingFiles(Array.from(e.dataTransfer.files ?? []));
   };
 
   return (
@@ -117,17 +240,34 @@ export function ComposerDock({
     >
       <div
         className={cn(
+          "relative",
           !fullWidth && "max-w-3xl mx-auto",
           "rounded-2xl border border-border bg-card shadow-sm transition",
           "focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/15",
           disabled && "opacity-60",
         )}
+        onDragEnter={onDragEnter}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
       >
+        {decoration}
+        {isDragActive ? (
+          <div
+            className={cn(
+              "pointer-events-none absolute inset-0 z-10 flex items-center justify-center",
+              "rounded-2xl border-2 border-dashed border-primary/60 bg-primary/5",
+            )}
+          >
+            <span className="text-xs font-medium text-primary">Drop files to attach</span>
+          </div>
+        ) : null}
         <Textarea
           ref={ref}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
           placeholder={placeholder}
           disabled={disabled || isPending}
           rows={1}
@@ -143,6 +283,7 @@ export function ComposerDock({
             ref={fileInputRef}
             type="file"
             multiple
+            accept={ALLOWED_ATTACHMENT_EXTENSIONS.join(",")}
             className="sr-only"
             onChange={onFilesSelected}
             disabled={!canAttach}
@@ -220,7 +361,7 @@ export function ComposerDock({
               </Tooltip>
             ) : null}
             <span className="text-[10px] font-mono text-muted-foreground tracking-wider hidden sm:inline">
-              ⌘↵
+              ↵ send · ⇧↵ newline
             </span>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -241,6 +382,9 @@ export function ComposerDock({
       </div>
       {isError && errorMessage ? (
         <p className="mt-2 text-xs text-status-error-strong px-1">{errorMessage}</p>
+      ) : null}
+      {dropErrorMessage ? (
+        <p className="mt-2 text-xs text-status-error-strong px-1">{dropErrorMessage}</p>
       ) : null}
       {attachmentErrorMessage ? (
         <p className="mt-2 text-xs text-status-error-strong px-1">{attachmentErrorMessage}</p>

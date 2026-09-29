@@ -46,17 +46,18 @@ import { getApiKey } from "../utils/api-key.ts";
 import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
-import { type CredentialSelection, resolveCredentialPools } from "../utils/credentials.ts";
 import {
-  isCodexCreditsExhaustedMessage,
-  isRateLimitMessage,
-  MAX_RATE_LIMIT_RESET_MS,
-  parseRateLimitResetTime,
+  type CredentialSelection,
+  ModelWindowExhaustedError,
+  resolveCredentialPools,
+} from "../utils/credentials.ts";
+import {
   type RateLimitWindowTelemetry,
   resolveCodexCreditsExhaustedCooldownMs,
 } from "../utils/error-tracker.ts";
 import { resolveHarnessProvider } from "../utils/harness-provider.ts";
 import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
+import { terminateRegisteredProcessGroups } from "../utils/process-group.ts";
 import { resolveScriptsOnlyMode } from "../utils/scripts-only-mode.ts";
 import { scrubSecrets } from "../utils/secret-scrubber.ts";
 import { refreshSkillsIfChanged } from "../utils/skills-refresh.ts";
@@ -64,13 +65,20 @@ import { isSteeringEnabled } from "../utils/steering-enabled.ts";
 import { interpolate } from "../utils/template.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
 import { validateJsonSchema } from "../workflows/json-schema-validator.ts";
-import { buildContextPreamble, buildResumeContextPreamble } from "./context-preamble.ts";
+import { buildAttachmentsSection } from "./attachments-section.ts";
+import {
+  buildContextPreamble,
+  buildResumeContextPreamble,
+  prependContextPreamble,
+} from "./context-preamble.ts";
+import { type CredentialRefreshState, refreshCredentialStatus } from "./credential-refresh.ts";
 import {
   awaitCredentials,
   BootMaxWaitExceededError,
   EX_CONFIG,
   retryBootStep,
 } from "./credential-wait.ts";
+import { refreshIdentityIfChanged } from "./identity-refresh.ts";
 import {
   contentSha256,
   prependProfileSyncRejectionBanner,
@@ -82,12 +90,12 @@ import {
 import {
   buildCredStatusReport,
   buildLatestModelReport,
-  isBedrockSdkMode,
   isCredCheckDisabled,
-  reportCredStatus,
+  reportAcpStatus,
   reportLatestModel,
   sendCredStatusReport,
 } from "./provider-credentials.ts";
+import { buildFinalRateLimitWindows, classifyRateLimitOutcome } from "./rate-limit-outcome.ts";
 import {
   type ResumeSessionCandidate,
   type ResumeSessionResolution,
@@ -95,6 +103,8 @@ import {
 } from "./resume-session.ts";
 // Side-effect import: registers runner trigger/resumption templates
 import "./templates.ts";
+
+export { buildAttachmentsSection } from "./attachments-section.ts";
 
 /** Throttle interval for progress updates (3 seconds). */
 const PROGRESS_THROTTLE_MS = 3000;
@@ -146,11 +156,13 @@ async function savePm2State(role: string): Promise<void> {
 }
 
 /** Fetch repo config for a task's vcsRepo (e.g., "desplega-ai/agent-swarm") */
-async function fetchRepoConfig(
+export async function fetchRepoConfig(
   apiUrl: string,
   apiKey: string,
   vcsRepo: string,
+  requireExactMatch = false,
 ): Promise<{
+  id: string;
   url: string;
   name: string;
   clonePath: string;
@@ -159,13 +171,18 @@ async function fetchRepoConfig(
   guidelines?: RepoGuidelines | null;
 } | null> {
   try {
-    const repoName = vcsRepo.split("/").pop() || vcsRepo;
+    const requested = vcsRepo
+      .trim()
+      .replace(/\/+$/, "")
+      .replace(/\.git$/, "");
+    const repoName = requested.split("/").pop() || requested;
     const resp = await fetch(`${apiUrl}/api/repos?name=${encodeURIComponent(repoName)}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
     if (!resp.ok) return null;
     const data = (await resp.json()) as {
       repos: Array<{
+        id: string;
         url: string;
         name: string;
         clonePath: string;
@@ -174,6 +191,20 @@ async function fetchRepoConfig(
         guidelines?: RepoGuidelines | null;
       }>;
     };
+    if (requireExactMatch) {
+      return (
+        data.repos.find((r) => {
+          const normalized = r.url
+            .trim()
+            .replace(/\/+$/, "")
+            .replace(/\.git$/, "");
+          if (normalized === requested) return true;
+          // Qualified URLs must retain their host. Only shorthand references use suffix matching.
+          if (requested.includes(":")) return false;
+          return normalized.endsWith(`/${requested}`) || normalized.endsWith(`:${requested}`);
+        }) ?? null
+      );
+    }
     return data.repos.find((r) => r.url.includes(vcsRepo)) ?? data.repos[0] ?? null;
   } catch {
     return null;
@@ -225,6 +256,9 @@ async function listSwarmAutostashes(clonePath: string, role: string): Promise<Sw
  *    src/tasks/worker-follow-up.ts after a task completes/fails or needs
  *    re-delegation; they inherit the parent's vcsRepo/branch context via
  *    createTaskExtended's parentTaskId inheritance (src/be/db.ts).
+ *  - "deferred": the wake-up task a `defer-task` schedule creates
+ *    (src/tools/defer-task.ts) — it carries the deferred task as its
+ *    `parentTaskId` and resumes that work on the same clone.
  *  - "agentmail-reply": AgentMail follow-up on an EXISTING thread
  *    (src/agentmail/handlers.ts) — always carries `parentTaskId` pointing at
  *    the task it's continuing (as opposed to "agentmail-message", which fires
@@ -236,6 +270,10 @@ async function listSwarmAutostashes(clonePath: string, role: string): Promise<Sw
  */
 const CONTINUATION_TASK_TYPES = new Set([
   "resume",
+  // "deferred": a `defer-task` wake-up continues the parent's work on the same
+  // clone. The parent is already `completed`, so the parent-status check alone
+  // would read this as a first kickoff and hard-reset the clone.
+  "deferred",
   "follow-up",
   "reroute-decision",
   "agentmail-reply",
@@ -500,12 +538,16 @@ export interface ApiConfig {
 export interface SteeringDispatchState {
   dispatchedIds: Set<string>;
   outcomes: Map<string, SteerDeliveryResult>;
+  pollingTaskIds: Set<string>;
+  inFlightMessageIds: Set<string>;
 }
 
 export function createSteeringDispatchState(): SteeringDispatchState {
   return {
     dispatchedIds: new Set(),
     outcomes: new Map(),
+    pollingTaskIds: new Set(),
+    inFlightMessageIds: new Set(),
   };
 }
 
@@ -521,13 +563,30 @@ export async function pollAndDispatchSteering(
   state: SteeringDispatchState,
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
-  if (!isSteeringEnabled()) return;
+  const dispatches = await pollAndStartSteeringDispatches(
+    config,
+    taskId,
+    session,
+    state,
+    fetchImpl,
+  );
+  await Promise.all(dispatches);
+}
+
+async function pollAndStartSteeringDispatches(
+  config: ApiConfig,
+  taskId: string,
+  session: ProviderSession,
+  state: SteeringDispatchState,
+  fetchImpl: typeof fetch,
+): Promise<Array<Promise<void>>> {
+  if (!isSteeringEnabled()) return [];
   // Harness-side delivery (codex hooks): the hook polls pending rows and
   // injects them itself. Dispatching here would race it into a false
   // "Provider session does not support live steering" undeliverable →
   // premature promotion. Leave the rows pending; the terminal sweep still
   // promotes anything the hook never delivered.
-  if (session.steeringDeliveredExternally) return;
+  if (session.steeringDeliveredExternally) return [];
 
   const headers = {
     Authorization: `Bearer ${config.apiKey}`,
@@ -542,57 +601,107 @@ export async function pollAndDispatchSteering(
   }
 
   const data = (await response.json()) as { messages?: SteeringMessage[] };
-  for (const message of data.messages ?? []) {
-    if (message.status !== "pending") continue;
-
-    let outcome = state.dispatchedIds.has(message.id) ? state.outcomes.get(message.id) : undefined;
-    if (!outcome) {
-      try {
-        outcome = session.deliverSteering
-          ? await session.deliverSteering({
-              mode: message.mode,
-              // Wrap the body so it carries its own ID — the agent needs it to
-              // call `accept-steer`, which is the only path to `handled`.
-              text: await renderSteeringDelivery(message.id, message.body),
-            })
-          : {
-              delivered: false,
-              reason: "Provider session does not support live steering",
-            };
-      } catch (error) {
-        outcome = {
-          delivered: false,
-          reason: scrubSecrets(`Provider steering failed: ${(error as Error).message}`),
-        };
-      }
-      if (!outcome.delivered) {
-        outcome = {
-          delivered: false,
-          reason:
-            scrubSecrets(outcome.reason).trim() || "Provider rejected steering without a reason",
-        };
-      }
-      state.dispatchedIds.add(message.id);
-      state.outcomes.set(message.id, outcome);
+  const prepared: Array<{ message: SteeringMessage; text?: string }> = [];
+  try {
+    for (const message of data.messages ?? []) {
+      if (message.status !== "pending") continue;
+      if (state.inFlightMessageIds.has(message.id)) continue;
+      state.inFlightMessageIds.add(message.id);
+      const item: { message: SteeringMessage; text?: string } = { message };
+      prepared.push(item);
+      item.text =
+        session.deliverSteering && !state.outcomes.has(message.id)
+          ? await renderSteeringDelivery(
+              message.id,
+              message.body,
+              message.senderLabel ?? message.createdByKind,
+            )
+          : undefined;
     }
-
-    const endpoint = outcome.delivered ? "delivered" : "undeliverable";
-    const body = outcome.delivered ? { mode: outcome.mode } : { reason: outcome.reason };
-    const reportResponse = await fetchImpl(
-      `${config.apiUrl}/api/steering-messages/${encodeURIComponent(message.id)}/${endpoint}`,
-      {
-        method: "POST",
-        headers: {
-          ...headers,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      },
-    );
-    if (!reportResponse.ok) {
-      throw new Error(`Steering ${endpoint} report failed (HTTP ${reportResponse.status})`);
-    }
+  } catch (error) {
+    for (const { message } of prepared) state.inFlightMessageIds.delete(message.id);
+    throw error;
   }
+  return prepared.map(({ message, text }) =>
+    dispatchSteeringMessage(config, message, text, session, state, fetchImpl).finally(() =>
+      state.inFlightMessageIds.delete(message.id),
+    ),
+  );
+}
+
+async function dispatchSteeringMessage(
+  config: ApiConfig,
+  message: SteeringMessage,
+  text: string | undefined,
+  session: ProviderSession,
+  state: SteeringDispatchState,
+  fetchImpl: typeof fetch,
+): Promise<void> {
+  let outcome = state.dispatchedIds.has(message.id) ? state.outcomes.get(message.id) : undefined;
+  if (!outcome) {
+    state.dispatchedIds.add(message.id);
+    try {
+      outcome = session.deliverSteering
+        ? await session.deliverSteering({
+            mode: message.mode,
+            text: text ?? message.body,
+          })
+        : {
+            delivered: false,
+            reason: "Provider session does not support live steering",
+          };
+    } catch (error) {
+      outcome = {
+        delivered: false,
+        reason: scrubSecrets(`Provider steering failed: ${(error as Error).message}`),
+      };
+    }
+    if (!outcome.delivered) {
+      outcome = {
+        delivered: false,
+        reason:
+          scrubSecrets(outcome.reason).trim() || "Provider rejected steering without a reason",
+      };
+    }
+    state.outcomes.set(message.id, outcome);
+  }
+
+  const endpoint = outcome.delivered ? "delivered" : "undeliverable";
+  const body = outcome.delivered ? { mode: outcome.mode } : { reason: outcome.reason };
+  const reportResponse = await fetchImpl(
+    `${config.apiUrl}/api/steering-messages/${encodeURIComponent(message.id)}/${endpoint}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        "X-Agent-ID": config.agentId,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!reportResponse.ok) {
+    throw new Error(`Steering ${endpoint} report failed (HTTP ${reportResponse.status})`);
+  }
+}
+
+export function scheduleSteeringDispatch(
+  config: ApiConfig,
+  taskId: string,
+  session: ProviderSession,
+  state: SteeringDispatchState,
+  onError: (error: unknown) => void,
+  fetchImpl: typeof fetch = fetch,
+): boolean {
+  if (state.pollingTaskIds.has(taskId)) return false;
+  state.pollingTaskIds.add(taskId);
+  void pollAndStartSteeringDispatches(config, taskId, session, state, fetchImpl)
+    .then((dispatches) => {
+      for (const dispatch of dispatches) void dispatch.catch(onError);
+    })
+    .catch(onError)
+    .finally(() => state.pollingTaskIds.delete(taskId));
+  return true;
 }
 
 /** Ping the server to indicate activity and update status */
@@ -661,14 +770,37 @@ export interface ResolvedEnvResult {
   resolvedProvider: ProviderName;
 }
 
+// Preserve the deployment value before config reloads mutate process.env.
+const deploymentMemoryRaters = process.env.MEMORY_RATERS;
+
 export async function fetchResolvedEnv(
   apiUrl: string,
   apiKey: string,
   agentId: string,
   baseEnv: Record<string, string | undefined> = process.env,
   taskModel?: string,
+  sessionContext?: {
+    repoId?: string;
+    provider?: ProviderName;
+    modelTier?: string;
+    /**
+     * In-process guard (`RunnerState.modelWindowBlocks`) against re-drawing a
+     * key whose model-scoped window was just reported exhausted, before the
+     * server's write is visible to this worker's next poll. Forwarded to
+     * `resolveCredentialPools`.
+     */
+    localBlocks?: Map<string, number>;
+    /**
+     * Task admission only (`spawnProviderProcess`): fail fast with
+     * `ModelWindowExhaustedError` when the task's model has no capacity.
+     * Taskless calls (boot, credential recovery, reconciliation) leave it
+     * unset so an exhausted default model never blocks configuration loading.
+     */
+    enforceModelCapacity?: boolean;
+  },
 ): Promise<ResolvedEnvResult> {
   const env: Record<string, string | undefined> = { ...baseEnv };
+  const repoId = sessionContext?.repoId;
   let scriptsOnlyConfigValue: string | undefined;
 
   if (apiUrl && agentId) {
@@ -676,7 +808,7 @@ export async function fetchResolvedEnv(
       const headers: Record<string, string> = { "X-Agent-ID": agentId };
       if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-      const url = `${apiUrl}/api/config/resolved?agentId=${encodeURIComponent(agentId)}&includeSecrets=true`;
+      const url = `${apiUrl}/api/config/resolved?agentId=${encodeURIComponent(agentId)}&includeSecrets=true${repoId ? `&repoId=${encodeURIComponent(repoId)}` : ""}`;
       const response = await fetch(url, { headers });
 
       if (!response.ok) {
@@ -685,6 +817,12 @@ export async function fetchResolvedEnv(
         const data = (await response.json()) as {
           configs: Array<{ key: string; value: string }>;
         };
+
+        // A deleted row restores the deployment value (including unset), while
+        // an explicit empty row below remains the disable-all-raters override.
+        // Only reset after a successful fetch so outages retain the current value.
+        env.MEMORY_RATERS =
+          baseEnv === process.env ? deploymentMemoryRaters : baseEnv.MEMORY_RATERS;
 
         if (data.configs?.length) {
           scriptsOnlyConfigValue = data.configs.find(
@@ -727,13 +865,27 @@ export async function fetchResolvedEnv(
     }
   }
 
-  const resolvedProvider = resolveHarnessProvider(env, baseEnv);
+  // A task already has an adapter. Repository configuration must not select
+  // credentials or configure hooks for a different harness.
+  const resolvedProvider = sessionContext?.provider ?? resolveHarnessProvider(env, baseEnv);
+  if (sessionContext?.provider) env.HARNESS_PROVIDER = sessionContext.provider;
 
-  // Effective model: per-task model takes priority over the agent-level
-  // MODEL_OVERRIDE from swarm_config. Passed to resolveCredentialPools so
-  // the harness × model matrix can exclude incompatible credential vars
-  // (e.g. OPENAI_API_KEY when an OpenRouter model is selected on opencode).
-  const effectiveModel = taskModel || (env.MODEL_OVERRIDE as string | undefined) || "";
+  // Effective model: per-task model takes priority over modelTier, which
+  // takes priority over the agent-level MODEL_OVERRIDE from swarm_config.
+  // Resolved the same way spawnProviderProcess resolves the model it
+  // actually runs with (same inputs: model, modelTier, resolvedProvider,
+  // env) so the model used to pick a key never drifts from the model the
+  // CLI ends up using. Passed to resolveCredentialPools so both the
+  // harness × model matrix (exclude incompatible credential vars) and the
+  // model-scoped window filter (GET /api/keys/available?model=<family>)
+  // see the right model.
+  const modelSelection = resolveTaskModelSelection({
+    model: taskModel,
+    modelTier: sessionContext?.modelTier,
+    harnessProvider: resolvedProvider,
+    env,
+  });
+  const effectiveModel = modelSelection.model || (env.MODEL_OVERRIDE as string | undefined) || "";
 
   const credentialSelections = await resolveCredentialPools(env, {
     apiUrl,
@@ -747,17 +899,38 @@ export async function fetchResolvedEnv(
     // the worker's harness from the dashboard without restarting the container.
     provider: resolvedProvider,
     model: effectiveModel,
+    localBlocks: sessionContext?.localBlocks,
+    enforceModelCapacity: sessionContext?.enforceModelCapacity,
   });
 
   return { env, credentialSelections, resolvedProvider, scriptsOnlyConfigValue };
 }
 
-async function ensureAgentFsCredentials(
+/**
+ * Ask the API to provision this agent's agent-fs credentials.
+ *
+ * Returns true when the API reached a verdict: the agent-scoped
+ * `AGENT_FS_API_KEY` row (plus the global `AGENT_FS_DEFAULT_*` rows) now
+ * exist, or agent-fs is not configured for this deployment
+ * (`enabled: false`). Both outcomes are terminal, so a retry cannot help.
+ *
+ * Returns false when the attempt reached no verdict (HTTP error, network
+ * failure, or no agent identity yet). The common case is a brand-new
+ * `AGENT_ID` against a fresh API database: this call runs before
+ * `registerAgent` (the boot `fetchResolvedEnv` right after it resolves the
+ * provider that registration needs), so the agent row does not exist yet and
+ * the route answers `500 Agent not found`. Nothing gets written, and every
+ * later `agent-fs` call in that container fails with "Not logged in".
+ * {@link provisionAgentFsAfterRegistration} retries once after registration.
+ *
+ * Never throws: provisioning is best-effort and must not wedge boot.
+ */
+export async function ensureAgentFsCredentials(
   apiUrl: string,
   apiKey: string,
   agentId: string,
-): Promise<void> {
-  if (!apiUrl || !apiKey || !agentId || agentId === "unknown") return;
+): Promise<boolean> {
+  if (!apiUrl || !apiKey || !agentId || agentId === "unknown") return false;
 
   try {
     const response = await fetch(`${apiUrl}/api/fs/agent-credentials`, {
@@ -777,7 +950,7 @@ async function ensureAgentFsCredentials(
           `[agent-fs] credential provisioning skipped: HTTP ${response.status}${text ? ` ${text}` : ""}`,
         ),
       );
-      return;
+      return false;
     }
     const result = (await response.json().catch(() => ({}))) as {
       enabled?: boolean;
@@ -788,9 +961,54 @@ async function ensureAgentFsCredentials(
         `[agent-fs] ${result.created ? "created" : "confirmed"} agent-scoped credentials`,
       );
     }
+    return true;
   } catch (error) {
     console.warn(scrubSecrets(`[agent-fs] credential provisioning skipped: ${error}`));
+    return false;
   }
+}
+
+/**
+ * Second and final agent-fs provisioning attempt, run right after the boot
+ * registration succeeds.
+ *
+ * `alreadyProvisioned` carries the result of the pre-registration attempt.
+ * When it is true this is a no-op. When it is false the agent row exists by
+ * now, so the same request that failed with `500 Agent not found` can
+ * succeed. One retry, no polling loop: registration is the only precondition
+ * the first attempt was missing.
+ *
+ * On success the resolved env is fetched again and re-applied, because the
+ * boot snapshot was taken before provisioning wrote its rows. Only the
+ * live-apply allowlist (`RELOADABLE_ENV_KEYS`, which carries
+ * `AGENT_FS_SHARED_ORG_ID`) is mutated. The harness does not depend on this
+ * refresh: every task spawn re-resolves the env, so the first task already
+ * receives `AGENT_FS_API_KEY`, `AGENT_FS_DEFAULT_ORG_ID`, and
+ * `AGENT_FS_DEFAULT_DRIVE_ID` once the rows exist.
+ *
+ * Never throws. Returns whether credentials are settled.
+ */
+export async function provisionAgentFsAfterRegistration(opts: {
+  apiUrl: string;
+  apiKey: string;
+  agentId: string;
+  alreadyProvisioned: boolean;
+}): Promise<boolean> {
+  if (opts.alreadyProvisioned) return true;
+
+  const provisioned = await ensureAgentFsCredentials(opts.apiUrl, opts.apiKey, opts.agentId);
+  if (!provisioned) return false;
+
+  try {
+    const refreshed = await fetchResolvedEnv(opts.apiUrl, opts.apiKey, opts.agentId);
+    const changed = applyResolvedEnvToProcessEnv(refreshed.env);
+    if (changed.length > 0) {
+      console.log(`[agent-fs] Applied resolved swarm config after retry: ${changed.join(", ")}`);
+    }
+  } catch (error) {
+    console.warn(scrubSecrets(`[agent-fs] post-provisioning env refresh skipped: ${error}`));
+  }
+  return true;
 }
 
 /**
@@ -833,6 +1051,8 @@ async function ensureAgentFsCredentials(
  * - SLACK_DISABLE — read by the prompt builder to gate the Slack tool section.
  * - SWARM_ORG_NAME — read per telemetry event for org identity.
  *
+ * CLAUDE_TRANSPORT stays in the per-session environment. Caching a scoped
+ * value here would prevent deletion from restoring the configured default.
  * NOTE: SCRIPTS_ONLY_MCP and HARNESS_PROVIDER stay excluded on purpose — they
  * have paired adapter/prompt state and their own reconcile path above.
  */
@@ -885,7 +1105,10 @@ export function applyResolvedEnvToProcessEnv(
   const changed: string[] = [];
   for (const key of RELOADABLE_ENV_KEYS) {
     const next = freshEnv[key];
-    if (next !== undefined && next !== process.env[key]) {
+    if (key === "MEMORY_RATERS" && next === undefined && process.env[key] !== undefined) {
+      delete process.env[key];
+      changed.push(key);
+    } else if (next !== undefined && next !== process.env[key]) {
       const previous = process.env[key];
       process.env[key] = next;
       changed.push(key);
@@ -1509,6 +1732,7 @@ async function reportKeyUsage(
         keySuffix: selection.keySuffix,
         keyIndex: selection.index,
         taskId,
+        ...(selection.plan ? { plan: selection.plan } : {}),
       }),
     });
   } catch {
@@ -1670,32 +1894,52 @@ async function reportKeyRateLimit(
   }
 }
 
-async function reportKeyRateLimitWindows(
+/**
+ * Reports rate-limit window telemetry for a key. Returns the underlying
+ * fetch promise (does not swallow errors) so a caller that needs the post to
+ * complete before the task finishes (a model-scoped block) can await it and
+ * decide how to handle a failure; a caller that wants the legacy
+ * fire-and-forget behavior appends `.catch(() => {})`.
+ *
+ * Throws on a non-2xx response so a failed persistence surfaces to the
+ * caller instead of logging success while only the in-process guard took
+ * effect — otherwise other workers redraw the same exhausted key at once.
+ *
+ * `logKeySuffix` defaults to true for the legacy full-telemetry call site;
+ * the model-scoped call site passes false since it already logs the model
+ * family and key index itself (see the `[credential] model window ...`
+ * log above the call).
+ */
+export async function reportKeyRateLimitWindows(
   apiUrl: string,
   apiKey: string,
   keyType: string,
   keySuffix: string,
   keyIndex: number,
   windows: RateLimitWindowTelemetry,
+  logKeySuffix = true,
 ): Promise<void> {
   if (Object.keys(windows).length === 0) return;
-  try {
-    await fetch(`${apiUrl}/api/keys/report-rate-limit-windows`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        keyType,
-        keySuffix,
-        keyIndex,
-        windows,
-      }),
-    });
+  const response = await fetch(`${apiUrl}/api/keys/report-rate-limit-windows`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      keyType,
+      keySuffix,
+      keyIndex,
+      windows,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Failed to report rate-limit windows for key #${keyIndex}: HTTP ${response.status}`,
+    );
+  }
+  if (logKeySuffix) {
     console.log(`[credentials] Reported rate-limit windows for key ...${keySuffix}`);
-  } catch {
-    // Non-blocking
   }
 }
 
@@ -1842,11 +2086,13 @@ async function pauseTaskViaAPI(config: ApiConfig, role: string, taskId: string):
 }
 
 /** Fetch paused tasks from API for this agent */
-async function getPausedTasksFromAPI(config: ApiConfig): Promise<
+export async function getPausedTasksFromAPI(config: ApiConfig): Promise<
   Array<{
     id: string;
     task: string;
     progress?: string;
+    attachments?: unknown[];
+    outputSchema?: Record<string, unknown>;
     claudeSessionId?: string;
     provider?: ProviderName;
     providerMeta?: Record<string, unknown>;
@@ -1882,6 +2128,8 @@ async function getPausedTasksFromAPI(config: ApiConfig): Promise<
         id: string;
         task: string;
         progress?: string;
+        attachments?: unknown[];
+        outputSchema?: Record<string, unknown>;
         claudeSessionId?: string;
         provider?: ProviderName;
         providerMeta?: Record<string, unknown>;
@@ -1923,20 +2171,26 @@ async function resumeTaskViaAPI(config: ApiConfig, taskId: string): Promise<bool
 }
 
 /** Build prompt for a resumed task */
-async function buildResumePrompt(
-  task: { id: string; task: string; progress?: string },
+export async function buildResumePrompt(
+  task: {
+    id: string;
+    task: string;
+    progress?: string;
+    attachments?: unknown[];
+    outputSchema?: Record<string, unknown>;
+  },
   fmt: (cmd: string) => string = (cmd) => `/${cmd}`,
   options?: { hasMcp?: boolean },
 ): Promise<string> {
   const hasMcp = options?.hasMcp !== false;
-  const completionInstructions = hasMcp
-    ? '\n\nWhen done, use `store-progress` with status: "completed" and include your output.'
-    : "";
+  const completionInstructions = await buildTaskOutputInstructions(task.outputSchema, hasMcp);
+  const attachmentsSection = buildAttachmentsSection(task.id, task.attachments);
   if (task.progress) {
     const result = await resolveTemplateAsync("task.resumption.with_progress", {
       work_on_task_cmd: hasMcp ? fmt("work-on-task") : "",
       task_id: hasMcp ? task.id : "",
       task_description: task.task,
+      attachments_section: attachmentsSection,
       progress: task.progress,
       completion_instructions: completionInstructions,
     });
@@ -1947,6 +2201,7 @@ async function buildResumePrompt(
     work_on_task_cmd: hasMcp ? fmt("work-on-task") : "",
     task_id: hasMcp ? task.id : "",
     task_description: task.task,
+    attachments_section: attachmentsSection,
     completion_instructions: completionInstructions,
   });
   return result.text;
@@ -1958,7 +2213,10 @@ function setupShutdownHandlers(
   apiConfig?: ApiConfig,
   getRunnerState?: () => RunnerState | undefined,
 ): void {
-  const shutdown = async (signal: string) => {
+  let shutdownInProgress = false;
+  const shutdown = async (signal: string, exitCode = 0) => {
+    if (shutdownInProgress) return;
+    shutdownInProgress = true;
     console.log(`\n[${role}] Received ${signal}, shutting down...`);
 
     // Wait for active tasks with timeout
@@ -2022,6 +2280,8 @@ function setupShutdownHandlers(
       }
     }
 
+    await terminateRegisteredProcessGroups();
+
     if (apiConfig) {
       telemetry.session("ended", {
         agentId: apiConfig.agentId,
@@ -2031,11 +2291,32 @@ function setupShutdownHandlers(
       await closeAgent(apiConfig, role);
     }
     await savePm2State(role);
-    process.exit(0);
+    process.exit(exitCode);
   };
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  const beginShutdown = (signal: string, exitCode = 0) => {
+    void shutdown(signal, exitCode).catch(async (error) => {
+      console.error(`[${role}] Shutdown failed after ${signal}:`, error);
+      await terminateRegisteredProcessGroups();
+      process.exit(1);
+    });
+  };
+
+  process.on("SIGINT", () => beginShutdown("SIGINT"));
+  process.on("SIGTERM", () => beginShutdown("SIGTERM"));
+  let fatalShutdownInProgress = false;
+  const fatalShutdown = (kind: string, error: unknown) => {
+    if (fatalShutdownInProgress) return;
+    fatalShutdownInProgress = true;
+    console.error(`[${role}] ${kind}:`, error);
+    void terminateRegisteredProcessGroups().finally(() => process.exit(1));
+  };
+  process.on("uncaughtException", (error) => {
+    fatalShutdown("Uncaught exception", error);
+  });
+  process.on("unhandledRejection", (reason) => {
+    fatalShutdown("Unhandled rejection", reason);
+  });
 }
 
 /** Configuration for a runner role (worker or lead) */
@@ -2130,6 +2411,14 @@ interface RunnerState {
    * application site so a fresh value applies to the next credits-exhausted failure.
    */
   codexCreditsExhaustedCooldownMs: number;
+  /**
+   * In-process guard against re-drawing a key whose model-scoped window
+   * (Fable/Opus/Sonnet) was just reported as exhausted, before the server's
+   * `report-rate-limit-windows` write is visible to this worker's next
+   * `GET /api/keys/available` poll. Keyed by `${keyType}:${keyIndex}:${window}`,
+   * value is the reset time in ms. Read by `selectCredential` (T5).
+   */
+  modelWindowBlocks: Map<string, number>;
 }
 
 /** Buffer for session logs */
@@ -2588,6 +2877,8 @@ interface Trigger {
   }>;
   cursorUpdates?: Array<{ channelId: string; ts: string }>; // Deferred cursor commits for channel_activity
   requestedBy?: {
+    /** `users.id`; absent for the UNKNOWN-identity sentinel (Slack-only requester). */
+    id?: string;
     name: string;
     email?: string;
     role?: string;
@@ -2648,8 +2939,8 @@ export async function buildRequesterProfilePrompt(
   return result.skipped ? "" : result.text.trim();
 }
 
-/** Register agent via HTTP API */
-async function registerAgent(opts: {
+/** Register agent via HTTP API. Exported so tests can exercise the real boot ordering. */
+export async function registerAgent(opts: {
   apiUrl: string;
   apiKey: string;
   agentId: string;
@@ -2787,41 +3078,19 @@ async function pollForTriggerOnce(opts: PollOptions): Promise<Trigger | null> {
   return null; // Timeout reached, no trigger found
 }
 
-/**
- * Build a ready-to-run fetch recipe for each task attachment, so the agent
- * can download the bytes in one call via the provider-agnostic
- * `/api/fs/tasks/{taskId}/files/{attachmentId}/raw` route — instead of having
- * to discover the file's storage provider/org/drive itself (e.g. guessing at
- * the `agent-fs` CLI with no org context). MCP_BASE_URL/API_KEY/AGENT_ID are
- * already present in every worker container's env.
- */
-export function buildAttachmentsSection(
-  taskId: string | undefined,
-  attachmentsRaw: unknown,
-): string {
-  if (!taskId || !Array.isArray(attachmentsRaw) || attachmentsRaw.length === 0) return "";
-
-  const lines = attachmentsRaw
-    .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
-    .map((a) => {
-      const id = typeof a.id === "string" ? a.id : undefined;
-      const name = typeof a.name === "string" ? a.name : id;
-      if (!id || !name) return null;
-      const details = [
-        typeof a.mimeType === "string" ? a.mimeType : null,
-        typeof a.sizeBytes === "number" ? `${a.sizeBytes} bytes` : null,
-      ]
-        .filter(Boolean)
-        .join(", ");
-      const url = `$MCP_BASE_URL/api/fs/tasks/${taskId}/files/${id}/raw`;
-      const cmd = `curl -s -H "Authorization: Bearer \${AGENT_SWARM_API_KEY:-$API_KEY}" -H "X-Agent-ID: $AGENT_ID" "${url}" -o /tmp/${name}`;
-      return `- ${name}${details ? ` (${details})` : ""}: \`${cmd}\``;
-    })
-    .filter((line): line is string => line !== null);
-
-  if (lines.length === 0) return "";
-
-  return `\n\n📎 Attachment(s) — fetch directly, no need to discover the storage path yourself:\n${lines.join("\n")}`;
+/** Share the output contract between initial dispatch and deployment resume. */
+async function buildTaskOutputInstructions(
+  outputSchema: unknown,
+  hasMcp: boolean,
+): Promise<string> {
+  if (!hasMcp) return "";
+  const result =
+    outputSchema && typeof outputSchema === "object"
+      ? await resolveTemplateAsync("task.output.schema", {
+          schema: JSON.stringify(outputSchema, null, 2),
+        })
+      : await resolveTemplateAsync("task.output.generic", {});
+  return result.text;
 }
 
 /** Build prompt based on trigger type */
@@ -2844,20 +3113,16 @@ async function buildPromptForTrigger(
       // Build output instructions — use outputSchema if present, otherwise generic.
       // Skip store-progress references for providers without MCP (e.g. Devin).
       const taskObj = trigger.task as Record<string, unknown> | undefined;
-      let outputInstructions: string;
-      if (!hasMcp) {
-        outputInstructions = "";
-      } else if (taskObj?.outputSchema && typeof taskObj.outputSchema === "object") {
-        outputInstructions = `\n\n**Required Output Format**: When completing this task, you MUST call store-progress with output that is valid JSON conforming to this schema:\n\`\`\`json\n${JSON.stringify(taskObj.outputSchema, null, 2)}\n\`\`\`\nCall store-progress with status "completed" and your JSON output. If your output doesn't match the schema, the tool call will fail and you should fix and retry.`;
-      } else {
-        outputInstructions =
-          '\n\nWhen done, use `store-progress` with status: "completed" and include your output.';
-      }
+      const outputInstructions = await buildTaskOutputInstructions(taskObj?.outputSchema, hasMcp);
 
       // Include requesting user info if available from the poll trigger
       const requestedBy = trigger.requestedBy;
+      const requesterDetails = [
+        requestedBy?.email,
+        requestedBy?.id ? `user ${requestedBy.id}` : undefined,
+      ].filter(Boolean);
       const requestedBySection = requestedBy
-        ? `\n\nRequested by: ${requestedBy.name}${requestedBy.email ? ` (${requestedBy.email})` : ""}`
+        ? `\n\nRequested by: ${requestedBy.name}${requesterDetails.length > 0 ? ` (${requesterDetails.join(", ")})` : ""}`
         : "";
 
       const attachmentsSection = buildAttachmentsSection(trigger.taskId, taskObj?.attachments);
@@ -2977,6 +3242,7 @@ async function fetchRelevantMemories(
     // Plan: thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-2.md §2
     if (taskId) headers["X-Source-Task-ID"] = taskId;
     if (contextKey) headers["X-Context-Key"] = contextKey;
+    headers["X-Memory-Consumption"] = "prompt";
 
     const response = await fetch(`${apiUrl}/api/memory/search`, {
       method: "POST",
@@ -3177,6 +3443,7 @@ function providerEventAttributes(event: ProviderEvent): Attributes {
 
 function normalizeSessionErrorCategory(category: string | undefined): string {
   switch (category) {
+    case "cancelled":
     case "rate_limit":
     case "api_error":
     case "context_overflow":
@@ -3186,6 +3453,14 @@ function normalizeSessionErrorCategory(category: string | undefined): string {
     default:
       return "unknown";
   }
+}
+
+export function resolveSessionTelemetryEvent(
+  result: Pick<ProviderResult, "exitCode" | "isError" | "errorCategory">,
+): "cancelled" | "failure" | undefined {
+  if (result.errorCategory === "cancelled") return "cancelled";
+  if (result.exitCode !== 0 || result.isError) return "failure";
+  return undefined;
 }
 
 /**
@@ -3251,6 +3526,8 @@ async function spawnProviderProcess(
     cwd?: string;
     vcsRepo?: string;
     contextKey?: string;
+    /** Forwarded to fetchResolvedEnv → resolveCredentialPools — see RunnerState.modelWindowBlocks. */
+    localBlocks?: Map<string, number>;
   },
   logDir: string,
   isYolo: boolean,
@@ -3260,21 +3537,59 @@ async function spawnProviderProcess(
   // Correlation ID for logs/display — always defined
   const effectiveTaskId = realTaskId || crypto.randomUUID();
 
+  const sessionRepo = opts.vcsRepo
+    ? await fetchRepoConfig(opts.apiUrl, opts.apiKey, opts.vcsRepo, true)
+    : null;
+
   // Resolve env first so we can use MODEL_OVERRIDE from config.
-  // Pass opts.model (per-task model) so the credential picker can apply
-  // the harness × model matrix (e.g. exclude OPENAI_API_KEY for OpenRouter models).
-  const { env: freshEnv, credentialSelections } = await fetchResolvedEnv(
-    opts.apiUrl,
-    opts.apiKey,
-    opts.agentId,
-    process.env,
-    opts.model,
-  );
+  // Pass opts.model/opts.modelTier so the credential picker resolves the
+  // same effective model spawnProviderProcess resolves below (see
+  // fetchResolvedEnv's own resolveTaskModelSelection call) and can apply
+  // both the harness × model matrix (e.g. exclude OPENAI_API_KEY for
+  // OpenRouter models) and the model-scoped window filter.
+  let freshEnv: Record<string, string | undefined>;
+  let credentialSelections: CredentialSelection[];
+  try {
+    ({ env: freshEnv, credentialSelections } = await fetchResolvedEnv(
+      opts.apiUrl,
+      opts.apiKey,
+      opts.agentId,
+      process.env,
+      opts.model,
+      {
+        repoId: sessionRepo?.id,
+        provider: adapter.name as ProviderName,
+        modelTier: opts.modelTier,
+        localBlocks: opts.localBlocks,
+        enforceModelCapacity: true,
+      },
+    ));
+  } catch (err) {
+    if (err instanceof ModelWindowExhaustedError && realTaskId) {
+      const modelLabel = err.model.charAt(0).toUpperCase() + err.model.slice(1);
+      const reason = `No ${err.keyType} key has ${modelLabel} capacity until ${err.earliestResetAt ?? "unknown"}. Re-dispatch with another model or modelTier.`;
+      console.warn(`[${opts.role}] ${reason}`);
+      await ensureTaskFinished(
+        { apiUrl: opts.apiUrl, apiKey: opts.apiKey, agentId: opts.agentId },
+        opts.role,
+        realTaskId,
+        1,
+        reason,
+        undefined,
+        opts.harnessProvider,
+      );
+    }
+    throw err;
+  }
 
   // Report which key was selected for this task (fire-and-forget)
   if (credentialSelections.length > 0 && realTaskId) {
     for (const sel of credentialSelections) {
-      reportKeyUsage(opts.apiUrl, opts.apiKey, sel.keyType, sel, realTaskId).catch(() => {});
+      // Claude selections follow credential precedence. Secondary reports must
+      // not overwrite the task's primary credential when both types exist.
+      const taskId =
+        adapter.name === "claude" && sel !== credentialSelections[0] ? undefined : realTaskId;
+      reportKeyUsage(opts.apiUrl, opts.apiKey, sel.keyType, sel, taskId).catch(() => {});
     }
   }
 
@@ -3316,7 +3631,20 @@ async function spawnProviderProcess(
     const oauthInfo = await resolveCodexOAuthCredentialInfo(opts.apiUrl, opts.apiKey);
     oauthSelection = oauthInfo?.selection;
     oauthIsPoolBacked = oauthInfo?.isPoolBacked ?? false;
+    // A resolved config-store pool slot always wins over OPENAI_API_KEY at
+    // runtime — `resolveCodexAuthMode` in codex-adapter.ts revalidates and
+    // writes chatgpt-mode auth.json whenever `codexSlot` is set, and OPENAI_API_KEY
+    // is only forwarded to the spawned CLI when auth.json is NOT in chatgpt
+    // mode. Gating this on `credentialSelections[0]`'s rate-limit status
+    // (the old behavior) reported OPENAI_API_KEY as the credential used on
+    // every task as long as OPENAI_API_KEY itself wasn't rate-limited — even
+    // when a healthy CODEX_OAUTH pool slot was the credential actually
+    // authenticating the session (issue: credentialKeyType mislabeled
+    // OPENAI_API_KEY, and CODEX_OAUTH usage never reported to
+    // /api/keys/report-usage so no api_key_status row was ever created for
+    // the pool slot).
     const oauthIsPrimary =
+      oauthIsPoolBacked ||
       credentialSelections.length === 0 ||
       (credentialSelections[0]?.isRateLimitFallback &&
         oauthSelection &&
@@ -3474,6 +3802,7 @@ async function spawnProviderProcess(
   let providerSessionId = session.sessionId;
   let pendingHarnessVariant: string | undefined;
   let pendingHarnessVariantMeta: Record<string, unknown> | undefined;
+  let acpStatusReport: Promise<void> | undefined;
   let runningTaskForSessionInit: RunningTask | undefined;
   const activeToolSpans = new Map<
     string,
@@ -3539,6 +3868,18 @@ async function spawnProviderProcess(
             "agentswarm.provider.name": event.provider,
             "agentswarm.provider.meta_preview": telemetryPreview(event.providerMeta),
           });
+          if (
+            event.provider === "acp" &&
+            (event.providerMeta?.target === "opencode" ||
+              event.providerMeta?.target === "custom") &&
+            Array.isArray(event.providerMeta.configOptions)
+          ) {
+            acpStatusReport = reportAcpStatus(opts.apiUrl, opts.apiKey, opts.agentId, {
+              target: event.providerMeta.target,
+              configOptions: event.providerMeta.configOptions,
+              reportedAt: Date.now(),
+            }).catch((err) => console.warn(`[runner] Failed to report ACP options: ${err}`));
+          }
           if (realTaskId) {
             saveProviderSessionId(
               opts.apiUrl,
@@ -3862,6 +4203,9 @@ async function spawnProviderProcess(
         // Stop event flush timer and do a final flush
         clearInterval(eventFlushTimer);
         await flushEvents();
+        // Keep the agent-level ACP option snapshot ordered before the poll
+        // loop can publish a post-task credential snapshot for a harness swap.
+        await acpStatusReport;
 
         // Final log flush
         if (shouldStream && logBuffer.lines.length > 0) {
@@ -4011,11 +4355,17 @@ async function spawnProviderProcess(
     );
 
   // Build credential info for rate limit tracking.
-  // For codex: when OPENAI_API_KEY is rate-limited but CODEX_OAUTH has
-  // available slots (or vice versa), prefer the healthy credential.
+  // For codex: a resolved CODEX_OAUTH pool slot (oauthIsPoolBacked) is always
+  // the credential actually used at runtime (see resolveCodexAuthMode in
+  // codex-adapter.ts — config store beats OPENAI_API_KEY whenever both
+  // exist), so it must win here too, independent of OPENAI_API_KEY's
+  // rate-limit status. Otherwise fall back to the OPENAI_API_KEY-rate-limited
+  // cross-keyType failover this block already handled.
   let primarySelection: CredentialSelection | undefined;
   const firstCred = credentialSelections[0];
-  if (firstCred && oauthSelection) {
+  if (oauthSelection && oauthIsPoolBacked) {
+    primarySelection = oauthSelection;
+  } else if (firstCred && oauthSelection) {
     if (firstCred.isRateLimitFallback && !oauthSelection.isRateLimitFallback) {
       primarySelection = oauthSelection;
       console.log(
@@ -4165,71 +4515,72 @@ async function checkCompletedProcesses(
       // `[usage-limit]` (see codex-adapter.formatTerminalError); Claude
       // surfaces "rate limit" / "hit your limit" via SessionErrorTracker.
       //
-      // The gate must also fire on a bare structured rate_limit_event: a
-      // `status: "rejected"` event sets result.rateLimitResetAt but does NOT
-      // set hasErrors(), so failureReason can be empty even though the key is
-      // exhausted. Gating on rateLimitResetAt != null ensures the structured
-      // event alone still triggers the cooldown.
-      if (
-        credentialInfo &&
-        (result.rateLimitResetAt != null ||
-          (failureReason != null && isRateLimitMessage(failureReason)))
-      ) {
-        // Three-tier reset-time resolver (most to least precise):
-        // Tier 1: structured rate_limit_event from Claude CLI (resetsAt epoch sec)
-        // Tier 2: regex on the error message (e.g. "resets 3pm (UTC)")
-        // Tier 3: 5-min hard fallback — only when both structured and regex fail
-        // Tiers 1 & 2 are clamped to [now+60s, now+7d] (weekly limits reset ~2 days out).
-        const clampResetTime = (isoString: string): string => {
-          const nowMs = Date.now();
-          const minMs = nowMs + 60_000;
-          const maxMs = nowMs + MAX_RATE_LIMIT_RESET_MS;
-          const candidateMs = new Date(isoString).getTime();
-          return new Date(Math.min(Math.max(candidateMs, minMs), maxMs)).toISOString();
-        };
-
-        let rateLimitedUntil: string;
-        if (result.rateLimitResetAt) {
-          rateLimitedUntil = clampResetTime(result.rateLimitResetAt);
-          console.log(`[credentials] Rate limit reset from rate_limit_event: ${rateLimitedUntil}`);
-        } else if (failureReason != null) {
-          const parsedResetTime = parseRateLimitResetTime(failureReason);
-          if (parsedResetTime) {
-            rateLimitedUntil = clampResetTime(parsedResetTime);
-            console.log(
-              `[credentials] Parsed rate limit reset time from error: ${rateLimitedUntil}`,
-            );
-          } else if (isCodexCreditsExhaustedMessage(failureReason)) {
-            const cooldownMs = state.codexCreditsExhaustedCooldownMs;
-            rateLimitedUntil = new Date(Date.now() + cooldownMs).toISOString();
-            console.log(
-              `[credentials] Codex credits exhausted — applying cooldown (${cooldownMs}ms): ${rateLimitedUntil}`,
-            );
-          } else {
-            rateLimitedUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-          }
-        } else {
-          rateLimitedUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      // classifyRateLimitOutcome tests model-scoped windows (Fable/Opus/
+      // Sonnet weekly limits) before the legacy key-wide gate, so a
+      // model-scoped rejection blocks only that model family on this key —
+      // never the whole key — via report-rate-limit-windows instead of
+      // report-rate-limit. A key-wide rejection seen in the same session is
+      // still reported alongside it (windows are independent). The session's
+      // window telemetry and the classified model rejection go out as ONE
+      // payload, so an older `allowed` snapshot never overwrites the terminal
+      // rejection. The post is awaited so it completes before the task
+      // finishes.
+      if (credentialInfo) {
+        const outcome = classifyRateLimitOutcome(
+          result,
+          failureReason,
+          Date.now(),
+          state.codexCreditsExhaustedCooldownMs,
+        );
+        const keyRateLimitedUntil =
+          outcome.kind === "key"
+            ? outcome.rateLimitedUntil
+            : outcome.kind === "model"
+              ? outcome.keyRateLimitedUntil
+              : undefined;
+        if (keyRateLimitedUntil) {
+          console.log(`[credentials] Rate limit reset: ${keyRateLimitedUntil}`);
+          reportKeyRateLimit(
+            apiConfig.apiUrl,
+            apiConfig.apiKey,
+            credentialInfo.keyType,
+            credentialInfo.keySuffix,
+            credentialInfo.keyIndex,
+            keyRateLimitedUntil,
+          ).catch(() => {});
         }
-        reportKeyRateLimit(
-          apiConfig.apiUrl,
-          apiConfig.apiKey,
-          credentialInfo.keyType,
-          credentialInfo.keySuffix,
-          credentialInfo.keyIndex,
-          rateLimitedUntil,
-        ).catch(() => {});
-      }
+        if (outcome.kind === "model") {
+          const resetsAtIso = new Date(outcome.resetsAtSec * 1000).toISOString();
+          const blockKey = `${credentialInfo.keyType}:${credentialInfo.keyIndex}:${outcome.window}`;
+          state.modelWindowBlocks.set(blockKey, outcome.resetsAtSec * 1000);
+          console.log(
+            `[credential] ${outcome.model} weekly window exhausted (${outcome.window}) on key #${credentialInfo.keyIndex} until ${resetsAtIso}`,
+          );
+        }
 
-      if (credentialInfo && result.rateLimitWindows) {
-        reportKeyRateLimitWindows(
-          apiConfig.apiUrl,
-          apiConfig.apiKey,
-          credentialInfo.keyType,
-          credentialInfo.keySuffix,
-          credentialInfo.keyIndex,
+        const finalWindows = buildFinalRateLimitWindows(
           result.rateLimitWindows,
-        ).catch(() => {});
+          outcome,
+          new Date().toISOString(),
+        );
+        if (finalWindows) {
+          const report = reportKeyRateLimitWindows(
+            apiConfig.apiUrl,
+            apiConfig.apiKey,
+            credentialInfo.keyType,
+            credentialInfo.keySuffix,
+            credentialInfo.keyIndex,
+            finalWindows,
+            outcome.kind !== "model",
+          ).catch((err) => {
+            console.warn(
+              `[credential] Failed to report rate-limit windows: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+          // A model rejection gates admission on other workers: land it before
+          // the task finishes. Plain telemetry stays fire-and-forget.
+          if (outcome.kind === "model") await report;
+        }
       }
       let bridgeDiagnostics: Awaited<ReturnType<typeof getBridgeFailureDiagnostics>> | undefined;
       if (result.exitCode !== 0 && harnessProvider === "claude" && workingDir) {
@@ -4275,8 +4626,9 @@ async function checkCompletedProcesses(
         isError: result.exitCode !== 0,
         durationMs,
       });
-      if (result.exitCode !== 0 || result.isError) {
-        telemetry.session("failure", {
+      const sessionTelemetryEvent = resolveSessionTelemetryEvent(result);
+      if (sessionTelemetryEvent) {
+        telemetry.session(sessionTelemetryEvent, {
           agentId: apiConfig.agentId,
           errorCategory: normalizeSessionErrorCategory(result.errorCategory),
           provider: result.cost?.provider ?? harnessProvider,
@@ -4473,8 +4825,13 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   // boot-fetch failure it stays at the default. Reconciled live thereafter by
   // `applySwarmConfigDrift`.
   let bootCooldownMs = resolveCodexCreditsExhaustedCooldownMs(undefined);
+  // Tracks whether agent-fs credentials are settled. A brand-new AGENT_ID has
+  // no agent row yet at this point, so this first attempt gets
+  // `500 Agent not found` and returns false. The retry runs right after
+  // registration below.
+  let agentFsProvisioned = false;
   try {
-    await ensureAgentFsCredentials(apiUrl, apiKey, agentId);
+    agentFsProvisioned = await ensureAgentFsCredentials(apiUrl, apiKey, agentId);
     const bootEnv = await fetchResolvedEnv(apiUrl, apiKey, agentId);
     bootProvider = bootEnv.resolvedProvider;
     resolvedScriptsOnly = resolveScriptsOnlyMode({
@@ -4717,19 +5074,20 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     tasksProcessed: 0,
     harnessProvider: bootProvider,
     codexCreditsExhaustedCooldownMs: bootCooldownMs,
+    modelWindowBlocks: new Map(),
   };
 
   // Track tasks already signaled for cancellation to avoid repeated SIGTERM
   const cancelledSignaled = new Set<string>();
   const steeringDispatchState = isSteeringEnabled() ? createSteeringDispatchState() : null;
 
-  // Migration 055 — cache the harness_provider value used when we last
-  // built a `cred_status` snapshot. Re-runs the post-task check only when
-  // the resolved provider changes. Section 4 of the swarm_config-overrides-
-  // HARNESS_PROVIDER work makes this dynamic: state.harnessProvider is
-  // reconciled below from `swarm_config`, so an operator's change reaches
-  // here without a worker restart.
-  let cachedCredHarnessProvider: string | null = null;
+  // Readiness acknowledged by the API, shared by boot and steady-state checks.
+  const credentialRefreshState: CredentialRefreshState = {
+    harnessProvider: null,
+    ready: null,
+    lastRefreshAt: 0,
+    inFlight: false,
+  };
 
   // Throttle for live HARNESS_PROVIDER reconciliation. Each reconciliation
   // calls `fetchResolvedEnv` which also re-resolves credential pools — we
@@ -4744,16 +5102,6 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   // changed. Any reregisterAgent() call resets the clock.
   let lastServerCapsRefreshAt = 0;
   const SERVER_CAPS_REFRESH_INTERVAL_MS = 300_000;
-
-  // Throttle for the periodic Bedrock model-enumeration refresh. The credential
-  // report below only re-runs on a harness_provider change (boot + provider
-  // swap), so enabling Bedrock access after boot would otherwise never reach the
-  // picker. This timer re-runs the enumeration on a fixed interval, decoupled
-  // from the harness-change gate, so the UI stays accurate. 5 minutes keeps it
-  // cheap (one bounded AWS enumeration per tick) while still surfacing newly
-  // granted access within a few minutes.
-  let lastBedrockRefreshAt = 0;
-  const BEDROCK_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
   // Fresh per boot and shared by registration, ping, and close: a restarted
   // process is a new runtime, but one process presents one identity.
@@ -4806,7 +5154,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           ? `${basePrompt}\n\n${additionalSystemPrompt}`
           : basePrompt;
         promptRebuiltForProvider = true;
-        cachedCredHarnessProvider = null;
+        credentialRefreshState.harnessProvider = null;
         agentVisibleChanged = true;
         console.log(
           `[${role}] [harness] Swapped to ${resolvedProvider} (basePrompt rebuilt: ${basePrompt.length} chars)`,
@@ -4939,6 +5287,16 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     process.exit(1);
   }
 
+  // The agent row exists now, so a first attempt that failed with
+  // `500 Agent not found` can succeed. Still best-effort: a failure here only
+  // means agent-fs stays unavailable, it must not stop the worker.
+  await provisionAgentFsAfterRegistration({
+    apiUrl,
+    apiKey,
+    agentId,
+    alreadyProvisioned: agentFsProvisioned,
+  });
+
   // Block until harness credentials are present in env. This loop replaces
   // the old bash-level fail-fast in `docker-entrypoint.sh` — the worker is
   // already registered (visible to the dashboard) and self-heals once
@@ -4947,7 +5305,6 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   // CRED_CHECK_DISABLE=1 opts out entirely: the worker trusts the operator
   // and starts polling immediately, with a NULL `cred_status` row that the
   // dashboard surfaces as "unreported."
-  cachedCredHarnessProvider = state.harnessProvider;
   if (isCredCheckDisabled(process.env)) {
     console.log(`[${role}] CRED_CHECK_DISABLE=1, skipping credential checks`);
   } else {
@@ -5072,6 +5429,9 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           log: (line) => console.warn(`[${role}] ${line}`),
         },
       );
+      credentialRefreshState.harnessProvider = state.harnessProvider;
+      credentialRefreshState.ready = bootCredSnapshot?.ready ?? true;
+      credentialRefreshState.lastRefreshAt = Date.now();
     } catch (error) {
       console.error(`[${role}] Failed to report credential readiness after recovery: ${error}`);
       process.exit(1);
@@ -5413,7 +5773,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         if (task.parentTaskId && apiUrl) {
           const contextPreamble = await buildContextPreamble(apiUrl, apiKey, task.parentTaskId);
           if (contextPreamble) {
-            resumePrompt = contextPreamble + resumePrompt;
+            resumePrompt = prependContextPreamble(resumePrompt, contextPreamble);
             console.log(
               `[${role}] Injected context preamble into resumed follow-up task prompt (parent: ${task.parentTaskId.slice(0, 8)})`,
             );
@@ -5512,6 +5872,16 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         // Per-task runner session ID so session logs are scoped to this task
         const resumeRunnerSessionId = crypto.randomUUID();
 
+        // Register the active session BEFORE the provider spawn so the API's
+        // sweeps never see this in_progress task without a session row (see
+        // the main task path for the full rationale).
+        await registerActiveSession(apiConfig, {
+          taskId: task.id,
+          triggerType: "task_resumed",
+          taskDescription: task.task?.slice(0, 200),
+          runnerSessionId: resumeRunnerSessionId,
+        });
+
         let runningTask: RunningTask;
         try {
           runningTask = await spawnProviderProcess(
@@ -5539,6 +5909,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               cwd: resumeCwd,
               vcsRepo: task.vcsRepo,
               contextKey: (task as { contextKey?: string }).contextKey,
+              localBlocks: state.modelWindowBlocks,
             },
             logDir,
             isYolo,
@@ -5557,21 +5928,11 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             undefined,
             state.harnessProvider,
           );
+          await removeActiveSession(apiConfig, task.id);
           continue;
         }
 
         state.activeTasks.set(task.id, runningTask);
-        registerActiveSession(apiConfig, {
-          taskId: task.id,
-          triggerType: "task_resumed",
-          taskDescription: task.task?.slice(0, 200),
-          runnerSessionId: resumeRunnerSessionId,
-        }).catch((err) =>
-          console.error(
-            "[runner] active-session registration failed:",
-            scrubSecrets(err instanceof Error ? err.message : String(err)),
-          ),
-        );
         console.log(
           `[${role}] Resumed task ${task.id.slice(0, 8)} (${state.activeTasks.size}/${state.maxConcurrent} active)`,
         );
@@ -5656,37 +6017,17 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       }
     }
 
-    // Migration 055 — post-task credential refresh, cache-keyed on the
-    // *resolved* harness_provider. Re-runs the snapshot when the provider
-    // changes (boot, or after a live swap above) so the dashboard shows
-    // up-to-date credential status for the active adapter.
-    if (!isCredCheckDisabled(process.env)) {
-      const currentHarness = state.harnessProvider;
-      if (currentHarness !== cachedCredHarnessProvider) {
-        cachedCredHarnessProvider = currentHarness;
-        buildCredStatusReport(currentHarness, process.env, {}, "post_task")
-          .then((snap) => reportCredStatus(apiUrl, apiKey, agentId, runtimeInstanceId, snap))
-          .catch((err) =>
-            console.warn(`[${role}] cred_status post_task report failed (non-fatal): ${err}`),
-          );
-      } else if (
-        currentHarness === "pi" &&
-        isBedrockSdkMode(process.env) &&
-        Date.now() - lastBedrockRefreshAt > BEDROCK_REFRESH_INTERVAL_MS
-      ) {
-        // Bedrock enumeration drifts independently of the harness_provider:
-        // access granted (or revoked) in the AWS console after boot won't flip
-        // the provider, so the harness-change gate above never fires. Re-run the
-        // enumeration on the throttled interval so the picker reflects the live
-        // account state. One bounded AWS round-trip per tick.
-        lastBedrockRefreshAt = Date.now();
-        buildCredStatusReport(currentHarness, process.env, {}, "post_task")
-          .then((snap) => reportCredStatus(apiUrl, apiKey, agentId, runtimeInstanceId, snap))
-          .catch((err) =>
-            console.warn(`[${role}] bedrock enumeration refresh failed (non-fatal): ${err}`),
-          );
-      }
-    }
+    // Recheck provider changes, blocked credentials, and Bedrock enumeration.
+    // The helper honors CRED_CHECK_DISABLE, throttles retries, and prevents
+    // overlapping reports while keeping polling responsive.
+    refreshCredentialStatus(
+      apiConfig,
+      credentialRefreshState,
+      state.harnessProvider,
+      process.env,
+    ).catch((err) =>
+      console.warn(`[${role}] cred_status post_task refresh failed (non-fatal): ${err}`),
+    );
 
     // Periodic VCS detection for running tasks (fire-and-forget, throttled per task)
     const now = Date.now();
@@ -5707,7 +6048,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
     // Check for cancelled tasks and signal their subprocesses. Deliberately
     // NOT gated on steeringDispatchState — cancellation abort must keep
-    // working when steering dispatch is off (STEERING_ENABLED unset).
+    // working when steering dispatch is off (STEERING_ENABLED=false).
     if (state.activeTasks.size > 0) {
       for (const [taskId, task] of state.activeTasks) {
         if (cancelledSignaled.has(taskId)) continue; // Already sent SIGTERM
@@ -5743,15 +6084,13 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     if (steeringDispatchState && state.activeTasks.size > 0) {
       const dispatchState = steeringDispatchState;
       for (const [taskId, task] of state.activeTasks) {
-        try {
-          await pollAndDispatchSteering(apiConfig, taskId, task.session, dispatchState);
-        } catch (error) {
+        scheduleSteeringDispatch(apiConfig, taskId, task.session, dispatchState, (error) => {
           console.warn(
             `[${role}] Steering dispatch failed for task ${taskId.slice(0, 8)} (non-fatal): ${scrubSecrets(
               (error as Error).message,
             )}`,
           );
-        }
+        });
       }
     }
 
@@ -5879,7 +6218,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             ? await buildResumeContextPreamble(apiUrl, apiKey, taskObj.parentTaskId)
             : await buildContextPreamble(apiUrl, apiKey, taskObj.parentTaskId);
           if (contextPreamble) {
-            triggerPrompt = contextPreamble + triggerPrompt;
+            triggerPrompt = prependContextPreamble(triggerPrompt, contextPreamble);
             console.log(
               `[${role}] Injected ${isResumeTask ? "resume" : "context"} preamble for ${
                 isResumeTask ? "resume" : "follow-up"
@@ -6026,6 +6365,33 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           }
         }
 
+        // Refresh prompt inputs per task without rewriting files shared with
+        // active sessions. A failed or bounded-out /me read keeps the cache.
+        const identityResult = await refreshIdentityIfChanged(
+          { apiUrl, apiKey, agentId, role },
+          {
+            soulMd: agentSoulMd,
+            identityMd: agentIdentityMd,
+            toolsMd: agentToolsMd,
+            claudeMd: agentClaudeMd,
+            heartbeatMd: agentHeartbeatMd,
+            name: agentProfileName,
+            description: agentDescription,
+          },
+        );
+        if (identityResult.changed) {
+          agentSoulMd = identityResult.fields.soulMd;
+          agentIdentityMd = identityResult.fields.identityMd;
+          agentToolsMd = identityResult.fields.toolsMd;
+          agentClaudeMd = identityResult.fields.claudeMd;
+          agentHeartbeatMd = identityResult.fields.heartbeatMd;
+          agentProfileName = identityResult.fields.name;
+          agentDescription = identityResult.fields.description;
+          console.log(
+            `[${role}] Identity changed — refreshing system prompt (${identityResult.changedFields.join(", ")})`,
+          );
+        }
+
         // Rebuild system prompt with per-task repo context
         const taskBasePrompt = await buildSystemPrompt();
         const requesterProfilePrompt = await buildRequesterProfilePrompt(trigger.requestedBy);
@@ -6060,6 +6426,25 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         // Per-task runner session ID so session logs are scoped to this task
         const taskRunnerSessionId = crypto.randomUUID();
 
+        // Register the active session BEFORE the provider spawn. The API's
+        // reboot sweep and stalled-task sweeps treat an in_progress task with
+        // no session row as orphaned, and a cold opencode spawn can take
+        // longer than the 5s post-boot sweep delay. The provider session id is
+        // filled in on `session_init` (saveProviderSessionId). Pool triggers
+        // with no task id get their synthetic session after the spawn below.
+        const taskDesc =
+          trigger.task && typeof trigger.task === "object" && "task" in trigger.task
+            ? String((trigger.task as { task: string }).task).slice(0, 200)
+            : undefined;
+        if (trigger.taskId) {
+          await registerActiveSession(apiConfig, {
+            taskId: trigger.taskId,
+            triggerType: trigger.type,
+            taskDescription: taskDesc,
+            runnerSessionId: taskRunnerSessionId,
+          });
+        }
+
         // Spawn without blocking (await to set up session, but process runs async)
         let runningTask: RunningTask;
         try {
@@ -6085,6 +6470,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               cwd: effectiveCwd,
               vcsRepo: taskVcsRepo,
               contextKey: taskContextKey,
+              localBlocks: state.modelWindowBlocks,
             },
             logDir,
             isYolo,
@@ -6104,6 +6490,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               undefined,
               state.harnessProvider,
             );
+            await removeActiveSession(apiConfig, trigger.taskId);
           }
           continue;
         }
@@ -6138,22 +6525,21 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
         state.activeTasks.set(runningTask.taskId, runningTask);
 
-        // Register active session for concurrency awareness
-        const taskDesc =
-          trigger.task && typeof trigger.task === "object" && "task" in trigger.task
-            ? String((trigger.task as { task: string }).task).slice(0, 200)
-            : undefined;
-        registerActiveSession(apiConfig, {
-          taskId: runningTask.taskId,
-          triggerType: trigger.type,
-          taskDescription: taskDesc,
-          runnerSessionId: taskRunnerSessionId,
-        }).catch((err) =>
-          console.error(
-            "[runner] active-session registration failed:",
-            scrubSecrets(err instanceof Error ? err.message : String(err)),
-          ),
-        );
+        // Pool triggers have no task id before the spawn; their session is
+        // keyed on the synthetic id `spawnProviderProcess` minted.
+        if (!trigger.taskId) {
+          registerActiveSession(apiConfig, {
+            taskId: runningTask.taskId,
+            triggerType: trigger.type,
+            taskDescription: taskDesc,
+            runnerSessionId: taskRunnerSessionId,
+          }).catch((err) =>
+            console.error(
+              "[runner] active-session registration failed:",
+              scrubSecrets(err instanceof Error ? err.message : String(err)),
+            ),
+          );
+        }
 
         console.log(
           `[${role}] Started task ${runningTask.taskId.slice(0, 8)} (${state.activeTasks.size}/${state.maxConcurrent} active, trigger: ${trigger.type})`,

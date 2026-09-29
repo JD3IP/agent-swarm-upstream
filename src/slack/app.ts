@@ -1,5 +1,6 @@
 import { App, LogLevel } from "@slack/bolt";
-import { ensureSlackRenderV2Activation } from "../be/db";
+import { emitBuiltInIntegrationConnectedOnce, ensureSlackRenderV2Activation } from "../be/db";
+import { getSlackConfiguration } from "./config";
 import { getSlackSocketModeBlockReason, SLACK_DEV_SOCKET_MODE_OPT_IN } from "./socket-mode-guard";
 import { startTaskWatcher, stopTaskWatcher } from "./watcher";
 
@@ -16,22 +17,37 @@ export async function initSlackApp(): Promise<App | null> {
     console.log("[Slack] Already initialized, skipping");
     return app;
   }
-  initialized = true;
-
-  // Check if Slack is explicitly disabled
-  const slackDisable = process.env.SLACK_DISABLE;
-  if (slackDisable === "true" || slackDisable === "1") {
+  const config = getSlackConfiguration();
+  if (config.disabled) {
     console.log("[Slack] Disabled via SLACK_DISABLE");
     return null;
   }
 
-  const botToken = process.env.SLACK_BOT_TOKEN;
-  const appToken = process.env.SLACK_APP_TOKEN;
-
-  if (!botToken || !appToken) {
-    console.log("[Slack] Missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN, Slack integration disabled");
+  if (!config.mode) {
+    console.error(
+      "[Slack] Invalid SLACK_MODE; expected socket or http. Slack integration disabled",
+    );
     return null;
   }
+
+  if (config.missingCredentials.length > 0) {
+    console.log(
+      `[Slack] Missing ${config.missingCredentials.join(" or ")} for ${config.mode} mode, Slack integration disabled`,
+    );
+    return null;
+  }
+
+  // Phase 1 establishes the transport contract only. Never fall back to a
+  // socket when HTTP was explicitly selected; the receiver lands in Phase 3.
+  if (config.mode === "http") {
+    console.error(
+      "[Slack] HTTP mode is configured but unavailable until the HTTP receiver is installed",
+    );
+    return null;
+  }
+
+  const botToken = process.env.SLACK_BOT_TOKEN as string;
+  const appToken = process.env.SLACK_APP_TOKEN as string;
 
   const socketModeBlockReason = getSlackSocketModeBlockReason(process.env);
   if (socketModeBlockReason) {
@@ -41,21 +57,29 @@ export async function initSlackApp(): Promise<App | null> {
     return null;
   }
 
+  // SLACK_API_URL points Bolt (Web API and apps.connections.open) at a mock Slack server for e2e tests.
+  const slackApiUrl = process.env.SLACK_API_URL;
   app = new App({
     token: botToken,
     appToken: appToken,
     socketMode: true,
     logLevel: process.env.NODE_ENV === "development" ? LogLevel.DEBUG : LogLevel.INFO,
+    ...(slackApiUrl ? { clientOptions: { slackApiUrl } } : {}),
   });
+
+  // Failed validation must remain retryable without requiring stopSlackApp().
+  initialized = true;
 
   // Register handlers
   const { registerMessageHandler } = await import("./handlers");
   const { registerCommandHandler } = await import("./commands");
   const { registerActionHandlers } = await import("./actions");
+  const { registerWorkObjectHandlers } = await import("./work-objects");
 
   registerMessageHandler(app);
   registerCommandHandler(app);
   registerActionHandlers(app);
+  registerWorkObjectHandlers(app);
 
   // Register assistant thread handler (safe even if "Agents & AI Apps" isn't enabled)
   const { createAssistant } = await import("./assistant");
@@ -64,7 +88,7 @@ export async function initSlackApp(): Promise<App | null> {
   return app;
 }
 
-export async function startSlackApp(): Promise<void> {
+export async function startSlackApp(): Promise<boolean> {
   if (!app) {
     await initSlackApp();
   }
@@ -75,10 +99,14 @@ export async function startSlackApp(): Promise<void> {
     if (isSlackRenderV2Enabled()) await ensureSlackRenderV2Activation();
     await app.start();
     console.log("[Slack] Bot connected via Socket Mode");
+    await emitBuiltInIntegrationConnectedOnce("slack");
 
     // Start watching for task completions
     await startTaskWatcher();
+    return true;
   }
+
+  return false;
 }
 
 export async function stopSlackApp(): Promise<void> {

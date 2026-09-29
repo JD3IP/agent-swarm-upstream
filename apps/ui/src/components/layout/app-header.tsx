@@ -5,12 +5,15 @@ import type { StatusHealth } from "@/api/types";
 import { useStatusContext } from "@/app/status-context";
 import { MoonIcon } from "@/components/icons/moon";
 import { SunIcon } from "@/components/icons/sun";
+import { NotificationBell } from "@/components/notifications/notification-bell";
+import { SetupPill } from "@/components/onboarding/setup-pill";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useConfig } from "@/hooks/use-config";
 import { useTheme } from "@/hooks/use-theme";
+import { isDemoMode } from "@/lib/deployment-config";
 import { cn } from "@/lib/utils";
 import { Breadcrumbs } from "./breadcrumbs";
 
@@ -45,6 +48,11 @@ export function AppHeader() {
     <header className="flex h-14 items-center gap-2 px-4">
       <SidebarTrigger className="md:hidden" />
       <Separator orientation="vertical" className="mr-2 h-4 md:hidden" />
+      {isDemoMode ? (
+        <span className="rounded-sm bg-status-info px-1.5 py-0.5 text-[10px] font-medium text-status-info-foreground md:hidden">
+          Demo
+        </span>
+      ) : null}
 
       {/* The trail owns the header's free space (no fixed spacer) so long
           entity names only truncate when the width is actually exhausted. */}
@@ -62,21 +70,18 @@ export function AppHeader() {
                 onClick={() => navigate("/#setup")}
                 aria-label={`Swarm health: ${HEALTH_LABEL[aggregateHealth]}`}
                 className={cn(
-                  "flex items-center gap-2 rounded-md px-2 py-1 text-xs",
+                  "hit-area flex items-center gap-2 rounded-md px-2 py-1 text-xs",
                   "hover:bg-accent transition-colors",
                   "text-muted-foreground",
                 )}
               >
                 <span className={cn("size-2 rounded-full", HEALTH_DOT_CLASS[aggregateHealth])} />
-                {activeConnection ? (
-                  <span className="hidden sm:inline font-medium">{activeConnection.name}</span>
-                ) : null}
-                {health?.version ? (
-                  <span className="hidden sm:inline">v{health.version}</span>
-                ) : null}
+                {/* The connection name and version live in the sidebar swarm
+                    switcher; the header only carries health. */}
+                <span className="hidden sm:inline">{HEALTH_LABEL[aggregateHealth]}</span>
               </button>
             </TooltipTrigger>
-            <TooltipContent side="bottom">{HEALTH_LABEL[aggregateHealth]}</TooltipContent>
+            <TooltipContent side="bottom">Open setup</TooltipContent>
           </Tooltip>
         ) : (
           // Fallback for older API servers that don't expose /status — keep
@@ -93,12 +98,7 @@ export function AppHeader() {
                     isHealthy ? "bg-status-success" : "bg-status-error",
                   )}
                 />
-                {activeConnection && (
-                  <span className="hidden sm:inline font-medium">{activeConnection.name}</span>
-                )}
-                {activeConnection && <span className="hidden sm:inline">&mdash;</span>}
                 <span className="hidden sm:inline">{isHealthy ? "Connected" : "Disconnected"}</span>
-                {health?.version && <span>v{health.version}</span>}
               </div>
             </TooltipTrigger>
             <TooltipContent side="bottom" className="max-w-xs text-balance">
@@ -110,6 +110,9 @@ export function AppHeader() {
             </TooltipContent>
           </Tooltip>
         )}
+
+        <SetupPill />
+        <NotificationBell />
 
         {/* GitHub repo link */}
         <Tooltip>

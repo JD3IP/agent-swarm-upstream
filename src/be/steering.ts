@@ -75,6 +75,8 @@ export async function promoteSteeringToTask(
 ): Promise<AgentTask> {
   return await createTaskExtended(message.body, {
     agentId: task.agentId,
+    routingReason: task.agentId ? "continuity" : undefined,
+    routingSource: task.agentId ? "engine_default" : undefined,
     creatorAgentId: message.createdByAgentId,
     source: message.source === "script" ? "api" : message.source,
     taskType: "follow-up",

@@ -10,8 +10,9 @@ import {
   resolveApprovalRequest,
   updateWorkflowRun,
 } from "../be/db";
+import { loadCompletedStepRouting } from "./completed-step-routing";
 import { FAILED_TASK_OUTPUT_PREFIX } from "./constants";
-import { findReadyNodes, walkGraph } from "./engine";
+import { findReadyNodes, isWorkflowRunActive, walkGraph } from "./engine";
 import type { ExecutorRegistry } from "./executors/registry";
 import { getSecretInputKeys } from "./input";
 import { finalizeOrWait, resumeWaitState } from "./resume";
@@ -22,10 +23,10 @@ import {
 } from "./task-step-routing";
 
 /**
- * Recover incomplete workflow runs on server startup.
+ * Recover incomplete workflow runs on startup and during heartbeat sweeps.
  *
  * Two cases:
- * 1. `running` runs — were mid-execution when server died.
+ * 1. `running` runs without a live graph walk — interrupted execution.
  *    Find completed steps, compute ready nodes, continue walking.
  * 2. `waiting` runs — were waiting for a task that may have finished while we were down.
  *    Check if the linked task is done and resume/fail accordingly.
@@ -46,7 +47,7 @@ export async function recoverIncompleteRuns(registry: ExecutorRegistry): Promise
   recovered += await recoverWaitStates(registry);
 
   if (recovered > 0) {
-    console.log(`[workflows] Recovered ${recovered} incomplete run(s) on startup`);
+    console.log(`[workflows] Recovered ${recovered} incomplete run(s)`);
   }
 
   return recovered;
@@ -64,6 +65,7 @@ async function recoverRunningRuns(registry: ExecutorRegistry): Promise<number> {
 
   for (const runId of runningRunIds) {
     try {
+      if (isWorkflowRunActive(runId)) continue;
       const run = await getWorkflowRun(runId);
       if (!run || run.status !== "running") continue;
 
@@ -73,8 +75,16 @@ async function recoverRunningRuns(registry: ExecutorRegistry): Promise<number> {
       const completedNodeIds = new Set(await getCompletedStepNodeIds(runId));
       const ctx = (run.context ?? {}) as Record<string, unknown>;
 
-      // Find the next nodes that are ready to execute
-      const readyNodes = findReadyNodes(workflow.definition, completedNodeIds);
+      // Rebuild the same selected-port edges as the live walker. Structural
+      // successors include untaken branches and can replay completed joins.
+      const { activeEdges } = await loadCompletedStepRouting(
+        workflow.definition,
+        runId,
+        completedNodeIds,
+      );
+      const readyNodes = findReadyNodes(workflow.definition, completedNodeIds, activeEdges);
+      // DB reads above yield; a trigger/resume may have acquired the run meanwhile.
+      if (isWorkflowRunActive(runId)) continue;
       if (readyNodes.length === 0) {
         // All nodes completed or nothing is ready — mark as completed
         await updateWorkflowRun(runId, {

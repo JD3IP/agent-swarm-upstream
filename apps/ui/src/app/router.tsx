@@ -1,6 +1,7 @@
-import { lazy } from "react";
+import { lazy, Suspense } from "react";
 import { createBrowserRouter, Navigate, type RouteObject } from "react-router-dom";
 import { RootLayout } from "@/components/layout/root-layout";
+import { HiveLoadingScreen } from "@/components/shared/hive-loading-screen";
 import { SettingsLayout } from "@/pages/settings/settings-layout";
 import { UsageLayout } from "@/pages/usage/usage-layout";
 import { RouteRedirect } from "./route-redirect";
@@ -24,6 +25,9 @@ const ConnectionsPage = lazy(() => import("@/pages/settings/connections-page"));
 const AppearancePage = lazy(() => import("@/pages/settings/appearance-page"));
 const SecretsPage = lazy(() => import("@/pages/settings/secrets-page"));
 const ConfigurationPage = lazy(() => import("@/pages/settings/configuration-page"));
+const ExtensionsPage = lazy(() => import("@/pages/settings/extensions-page"));
+const ExtensionDetailPage = lazy(() => import("@/pages/settings/extension-detail-page"));
+const ExtensionCatalogPage = lazy(() => import("@/pages/settings/extension-catalog-page"));
 const IntegrationsPage = lazy(() => import("@/pages/integrations/page"));
 const IntegrationDetailPage = lazy(() => import("@/pages/integrations/[id]/page"));
 const ReposPage = lazy(() => import("@/pages/repos/page"));
@@ -59,6 +63,7 @@ const PagesListingPage = lazy(() => import("@/pages/pages/page"));
 const AppsListingPage = lazy(() => import("@/pages/apps/page"));
 const AppDetailPage = lazy(() => import("@/pages/apps/[id]/page"));
 const NotFoundPage = lazy(() => import("@/pages/not-found/page"));
+const SetupPage = lazy(() => import("@/pages/setup/page"));
 
 /**
  * Dev-only routes. `/dev/embed-test` mounts an `<AppSurface>` outside the
@@ -109,6 +114,15 @@ const redirectRoutes: RouteObject[] = [
 ];
 
 export const router = createBrowserRouter([
+  // First-run onboarding: full page, outside the app shell (no sidebar/header).
+  {
+    path: "/setup",
+    element: (
+      <Suspense fallback={<HiveLoadingScreen />}>
+        <SetupPage />
+      </Suspense>
+    ),
+  },
   {
     path: "/",
     element: <RootLayout />,
@@ -161,6 +175,9 @@ export const router = createBrowserRouter([
           { path: "integrations", element: <IntegrationsPage /> },
           { path: "integrations/:id", element: <IntegrationDetailPage /> },
           { path: "configuration", element: <ConfigurationPage /> },
+          { path: "extensions", element: <ExtensionsPage /> },
+          { path: "extensions/new", element: <ExtensionCatalogPage /> },
+          { path: "extensions/:id", element: <ExtensionDetailPage /> },
           { path: "repos", element: <ReposPage /> },
           { path: "debug", element: <DebugPage /> },
         ],

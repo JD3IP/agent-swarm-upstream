@@ -10,6 +10,9 @@
  * Compile-time exhaustiveness: `LEGACY_POLICY` must cover every
  * `PermissionVerb` (enforced via `satisfies`).
  */
+
+import { isEnvFlagEnabled } from "../utils/env-flag";
+import { hasLeadEquivalence } from "./elevated-agents";
 import type { PermissionVerb } from "./permissions";
 import type { RbacPrincipal, RbacResource } from "./types";
 
@@ -24,10 +27,58 @@ export type LegacyRule = {
 
 // ── Named rules (research §3 Rule column) ────────────────────────────────────
 
+/** Lead agents, plus extension system agents registered as lead-equivalent. */
+function actsAsLead(principal: RbacPrincipal): boolean {
+  return principal.kind === "agent" && (principal.isLead || hasLeadEquivalence(principal.agentId));
+}
+
 const leadOnly: LegacyRule = {
   name: "lead-only",
   denyReason: "requires lead agent",
-  evaluate: (principal) => principal.kind === "agent" && principal.isLead,
+  evaluate: (principal) => actsAsLead(principal),
+};
+
+/**
+ * Human principals: the shared API key (operator) and dashboard session users.
+ * Dashboard users carry no admin flag today, so they are treated like the
+ * operator, matching the config routes (`src/http/config.ts`).
+ */
+const operatorOrUser: LegacyRule = {
+  name: "operator-or-user",
+  denyReason: "requires operator or user authentication",
+  evaluate: (principal) => principal.kind === "operator" || principal.kind === "user",
+};
+
+const leadOrOperatorOrUser: LegacyRule = {
+  name: "lead-or-operator-or-user",
+  denyReason: "requires lead agent, operator, or user authentication",
+  evaluate: (principal) =>
+    principal.kind === "operator" || principal.kind === "user" || actsAsLead(principal),
+};
+
+const extensionWrite: LegacyRule = {
+  name: "extension-owner-or-elevated",
+  denyReason: "requires extension owner, lead agent, operator, or user authentication",
+  evaluate: (principal, resource) => {
+    if (leadOrOperatorOrUser.evaluate(principal, resource)) return true;
+    return (
+      principal.kind === "agent" &&
+      principal.agentId !== "" &&
+      resource?.kind === "extension" &&
+      (resource.extensionId === undefined || resource.createdByAgentId === principal.agentId)
+    );
+  },
+};
+
+// Deployment-only: agents cannot reset this through swarm_config.
+const extensionActivation: LegacyRule = {
+  name: "extension-activation",
+  denyReason:
+    "requires operator/user authentication, or a lead with EXTENSION_ALLOW_LEAD_ACTIVATION enabled",
+  evaluate: (principal) =>
+    principal.kind === "operator" ||
+    principal.kind === "user" ||
+    (actsAsLead(principal) && isEnvFlagEnabled("EXTENSION_ALLOW_LEAD_ACTIVATION", true)),
 };
 
 const leadOrTaskCreator: LegacyRule = {
@@ -35,7 +86,7 @@ const leadOrTaskCreator: LegacyRule = {
   denyReason: "requires lead agent or task creator",
   evaluate: (principal, resource) => {
     if (principal.kind !== "agent") return false;
-    if (principal.isLead) return true;
+    if (actsAsLead(principal)) return true;
     return (
       resource?.kind === "task" &&
       resource.creatorAgentId != null &&
@@ -49,7 +100,7 @@ const leadOrResourceOwner: LegacyRule = {
   denyReason: "requires lead agent or resource owner",
   evaluate: (principal, resource) => {
     if (principal.kind !== "agent") return false;
-    if (principal.isLead) return true;
+    if (actsAsLead(principal)) return true;
     return (
       resource?.kind === "owned" &&
       resource.ownerAgentId != null &&
@@ -63,7 +114,7 @@ const leadOrOwnNamespace: LegacyRule = {
   denyReason: "requires lead agent or your own task:agent: namespace",
   evaluate: (principal, resource) => {
     if (principal.kind !== "agent") return false;
-    if (principal.isLead) return true;
+    if (actsAsLead(principal)) return true;
     // A blank agent id can never own a namespace — the pre-migration guards
     // used truthiness (`if (info.agentId && ...)`), so `X-Agent-ID: ""` plus
     // the literal namespace `task:agent:` must stay denied.
@@ -105,7 +156,7 @@ const memoryOwnerOrLeadSwarm: LegacyRule = {
   evaluate: (principal, resource) => {
     if (principal.kind !== "agent" || resource?.kind !== "owned") return false;
     if (resource.ownerAgentId != null && resource.ownerAgentId === principal.agentId) return true;
-    return principal.isLead && resource.scope === "swarm";
+    return actsAsLead(principal) && resource.scope === "swarm";
   },
 };
 
@@ -121,7 +172,7 @@ const taskFsMutate: LegacyRule = {
   denyReason: "requires operator, user, lead agent, task assignee, or task creator",
   evaluate: (principal, resource) => {
     if (principal.kind === "operator" || principal.kind === "user") return true;
-    if (principal.isLead) return true;
+    if (actsAsLead(principal)) return true;
     if (resource?.kind !== "task") return false;
     return (
       (resource.agentId != null && resource.agentId === principal.agentId) ||
@@ -132,6 +183,8 @@ const taskFsMutate: LegacyRule = {
 
 /** All named (non-composite) rule kinds, keyed by identifier. */
 export const LEGACY_RULES = {
+  "operator-or-user": operatorOrUser,
+  "lead-or-operator-or-user": leadOrOperatorOrUser,
   "lead-only": leadOnly,
   "lead-or-task-creator": leadOrTaskCreator,
   "lead-or-resource-owner": leadOrResourceOwner,
@@ -156,6 +209,7 @@ export const LEGACY_POLICY = {
   "task.fs.mutate": taskFsMutate,
   "favorite.write.own": anyAuthenticated,
   "memory.learning.inject": leadOnly,
+  "memory.edit.any": leadOrResourceOwner,
   "memory.delete.any": memoryOwnerOrLeadSwarm,
   "channel.delete": leadOnly,
   "integration.kapso.manage": leadOnly,
@@ -202,4 +256,6 @@ export const LEGACY_POLICY = {
   "script.api.update": leadOnly,
   "script.api.rotate": leadOnly,
   "script.api.delete": leadOnly,
+  "extension.write": extensionWrite,
+  "extension.activate": extensionActivation,
 } as const satisfies Record<PermissionVerb, LegacyRule>;

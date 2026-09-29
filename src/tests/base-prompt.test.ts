@@ -25,6 +25,8 @@ const ENV_KEYS = [
   "SLACK_DISABLE",
   "SLACK_BOT_TOKEN",
   "SLACK_APP_TOKEN",
+  "SLACK_MODE",
+  "SLACK_SIGNING_SECRET",
   "STEERING_ENABLED",
   "AGENT_FS_API_URL",
   "SCRIPTS_ONLY_MCP",
@@ -247,6 +249,13 @@ describe("getBasePrompt: composite selection", () => {
     const result = await getBasePrompt({ ...minimalArgs, traits: remoteTraits });
     expect(result).not.toContain("## Workspace");
     expect(result).not.toContain("## Secrets");
+  });
+
+  test("citation guidance reaches local agents only", async () => {
+    const local = await getBasePrompt({ ...minimalArgs, traits: localTraits });
+    const remote = await getBasePrompt({ ...minimalArgs, traits: remoteTraits });
+    expect(local).toContain("Skip citations on delegation, routing, acks, and status replies.");
+    expect(remote).not.toContain("citation");
   });
 
   test("a lead without MCP still gets the remote worker composite", async () => {
@@ -561,6 +570,29 @@ describe("getBasePrompt: slack section", () => {
     expect(result).toContain(SLACK_HEADER);
   });
 
+  test("a tool capability alone does not bypass the default socket credential gate", async () => {
+    const result = await getBasePrompt({
+      ...minimalArgs,
+      serverCapabilities: ["core", "slack"],
+    });
+    expect(result).not.toContain(SLACK_HEADER);
+  });
+
+  test("supports the HTTP prompt contract without distributing Slack secrets to the worker", async () => {
+    process.env.SLACK_MODE = "http";
+    const result = await getBasePrompt({
+      ...minimalArgs,
+      serverCapabilities: ["core", "slack"],
+    });
+    expect(result).toContain(SLACK_HEADER);
+
+    const withoutCapability = await getBasePrompt({
+      ...minimalArgs,
+      serverCapabilities: ["core"],
+    });
+    expect(withoutCapability).not.toContain(SLACK_HEADER);
+  });
+
   test("a scripts-only worker with a Slack task gets the scripts-only variant only", async () => {
     enableSlack();
     const result = await getBasePrompt({
@@ -636,6 +668,7 @@ describe("getBasePrompt: steering section", () => {
   });
 
   test("excluded when steering is not enabled", async () => {
+    process.env.STEERING_ENABLED = "false";
     const result = await getBasePrompt({ ...minimalArgs, traits: steerableTraits });
     expect(result).not.toContain(STEERING_HEADER);
   });
@@ -960,21 +993,21 @@ describe("truncateRepoClaudeMd", () => {
 // ---------------------------------------------------------------------------
 
 describe("getBasePrompt: size budget", () => {
-  // The v2 rewrite cut the static prompt from ~25k characters to ~4.2k. These
-  // ceilings are generous, so they only fire on a regression back to v1 size.
-  test("a fresh claude worker stays under 5,000 characters", async () => {
+  // Include task-output budget, exceptions, and the two citation-scoping lines (when to cite, when not to).
+  // Keep tight role-specific ceilings to catch unrelated prompt growth.
+  test("a fresh claude worker stays under 5,750 characters", async () => {
     const result = await getBasePrompt({ ...minimalArgs, name: "Ada", traits: localTraits });
-    expect(result.length).toBeLessThan(5_000);
+    expect(result.length).toBeLessThan(5_750);
   });
 
-  test("a fresh claude lead stays under 5,200 characters", async () => {
+  test("a fresh claude lead stays under 5,900 characters", async () => {
     const result = await getBasePrompt({
       ...minimalArgs,
       role: "lead",
       name: "Cora",
       traits: localTraits,
     });
-    expect(result.length).toBeLessThan(5_200);
+    expect(result.length).toBeLessThan(5_900);
   });
 
   test("Picateclas spawn-OOM hardening: the kitchen sink stays below MAX_ARG_STRLEN", async () => {

@@ -32,6 +32,11 @@ import {
 import { AnimatePresence, motion } from "motion/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import {
+  renderTaskCitationSources,
+  renderTaskCitations,
+  type TaskCitation,
+} from "../../../../../../src/utils/task-citations";
 import "streamdown/styles.css";
 import { useAgents } from "@/api/hooks/use-agents";
 import { useSessionCosts } from "@/api/hooks/use-costs";
@@ -49,6 +54,7 @@ import {
 import { useUsers } from "@/api/hooks/use-users";
 import type {
   AgentLog,
+  ClaudeProviderMeta,
   DevinProviderMeta,
   ProviderName,
   SessionCost,
@@ -63,8 +69,10 @@ import { SessionId } from "@/components/shared/session-id";
 import { SessionLogViewer } from "@/components/shared/session-log-viewer";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { TaskAttachmentsSection } from "@/components/shared/task-attachments-section";
+import { TaskCitationsSection } from "@/components/shared/task-citations-section";
 import { CollapsibleComposerDock } from "@/components/steering/collapsible-composer-dock";
 import { SteerComposer } from "@/components/steering/steer-composer";
+import { TaskFailureHelpDialog } from "@/components/support/task-failure-help-dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -79,6 +87,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DetailPageSection } from "@/components/ui/detail-page-layout";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -86,6 +95,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useLocalToggle } from "@/hooks/use-local-toggle";
 import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
+import { findLatestUsableContextSnapshot } from "@/lib/context-display";
 import { formatCost } from "@/lib/cost-format";
 import { formatDurationMs } from "@/lib/format-duration-ms";
 import { formatTokens } from "@/lib/format-tokens";
@@ -96,6 +106,7 @@ import { taskIsRunning } from "@/lib/task-activity";
 import { cn, formatRelativeTime, formatSmartTime } from "@/lib/utils";
 
 const TASK_DETAIL_TABS = new Set(["details", "outcome", "logs"]);
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled", "superseded"]);
 
 function coerceTaskDetailTab(value: string): string {
   return TASK_DETAIL_TABS.has(value) ? value : "details";
@@ -231,12 +242,20 @@ function parseStructuredOutput(raw: string): { output?: string; summary?: string
   return null;
 }
 
-function StructuredOutputContent({ raw, maxH }: { raw: string; maxH: string }) {
+function StructuredOutputContent({
+  raw,
+  maxH,
+  citations = [],
+}: {
+  raw: string;
+  maxH: string;
+  citations?: TaskCitation[];
+}) {
   const structured = parseStructuredOutput(raw);
   if (!structured) {
     return (
       <div className={`text-sm leading-relaxed overflow-auto text-foreground/80 ${maxH}`}>
-        <MarkdownView text={raw} />
+        <MarkdownView text={renderTaskCitations(raw, citations, "markdown")} />
       </div>
     );
   }
@@ -248,7 +267,9 @@ function StructuredOutputContent({ raw, maxH }: { raw: string; maxH: string }) {
             Summary
           </span>
           <div className="mt-1 text-sm leading-relaxed text-foreground/80">
-            <MarkdownView text={structured.summary} />
+            <MarkdownView
+              text={renderTaskCitations(structured.summary, citations, "markdown", false)}
+            />
           </div>
         </div>
       )}
@@ -258,9 +279,14 @@ function StructuredOutputContent({ raw, maxH }: { raw: string; maxH: string }) {
             Output
           </span>
           <div className="mt-1 text-sm leading-relaxed text-foreground/80">
-            <MarkdownView text={structured.output} />
+            <MarkdownView
+              text={renderTaskCitations(structured.output, citations, "markdown", false)}
+            />
           </div>
         </div>
+      )}
+      {citations.length > 0 && (
+        <MarkdownView text={renderTaskCitationSources(raw, citations, "markdown")} />
       )}
     </div>
   );
@@ -279,7 +305,7 @@ function TaskCostSection({
   costs: SessionCost[] | undefined;
   isLoading: boolean;
   provider?: ProviderName;
-  providerMeta?: DevinProviderMeta | Record<string, never>;
+  providerMeta?: DevinProviderMeta | ClaudeProviderMeta | Record<string, never>;
 }) {
   const isDevin = provider === "devin";
   const devinMeta = isDevin ? (providerMeta as DevinProviderMeta | undefined) : undefined;
@@ -404,7 +430,7 @@ function TaskContextSection({
   context: TaskContextResponse | undefined;
   isLoading: boolean;
   provider?: ProviderName;
-  providerMeta?: DevinProviderMeta | Record<string, never>;
+  providerMeta?: DevinProviderMeta | ClaudeProviderMeta | Record<string, never>;
   costs?: SessionCost[];
 }) {
   const isDevin = provider === "devin";
@@ -464,10 +490,7 @@ function TaskContextSection({
   if (!context || context.summary.snapshotCount === 0) return null;
 
   const { summary } = context;
-  const latestSnapshot = context.snapshots[context.snapshots.length - 1];
-  const currentPercent = latestSnapshot?.contextPercent ?? summary.peakContextPercent ?? 0;
-  const usedTokens = latestSnapshot?.contextUsedTokens ?? summary.peakContextTokens ?? 0;
-  const totalTokens = latestSnapshot?.contextTotalTokens ?? summary.contextWindowSize ?? 0;
+  const latestUsageSnapshot = findLatestUsableContextSnapshot(context.snapshots);
 
   return (
     <>
@@ -476,32 +499,42 @@ function TaskContextSection({
         <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
           Context Usage
         </span>
-        <div className="flex items-center gap-2 py-1">
-          <Progress
-            value={currentPercent}
-            className={cn("h-1.5 flex-1", progressBarTone(currentPercent))}
-          />
-          <span className="text-[10px] font-mono text-muted-foreground shrink-0">
-            {currentPercent.toFixed(0)}%
-          </span>
-        </div>
-        <MetaRow icon={Cpu} label="Used">
-          <span className="flex flex-col items-start gap-1 font-mono text-xs">
-            <span className="whitespace-nowrap">
-              {formatTokens(usedTokens)} / {formatTokens(totalTokens)}
-            </span>
-            {latestSnapshot?.contextFormula && latestSnapshot.contextFormula !== "unknown" && (
-              <Badge
-                variant="outline"
-                size="tag"
-                className="text-muted-foreground"
-                title={`Computed via formula: ${latestSnapshot.contextFormula}`}
-              >
-                {latestSnapshot.contextFormula}
-              </Badge>
-            )}
-          </span>
-        </MetaRow>
+        {latestUsageSnapshot ? (
+          <>
+            <div className="flex items-center gap-2 py-1">
+              <Progress
+                value={latestUsageSnapshot.contextPercent}
+                className={cn("h-1.5 flex-1", progressBarTone(latestUsageSnapshot.contextPercent))}
+              />
+              <span className="text-[10px] font-mono text-muted-foreground shrink-0">
+                {latestUsageSnapshot.contextPercent.toFixed(0)}%
+              </span>
+            </div>
+            <MetaRow icon={Cpu} label="Used">
+              <span className="flex flex-col items-start gap-1 font-mono text-xs">
+                <span className="whitespace-nowrap">
+                  {formatTokens(latestUsageSnapshot.contextUsedTokens)} /{" "}
+                  {formatTokens(latestUsageSnapshot.contextTotalTokens)}
+                </span>
+                {latestUsageSnapshot.contextFormula &&
+                  latestUsageSnapshot.contextFormula !== "unknown" && (
+                    <Badge
+                      variant="outline"
+                      size="tag"
+                      className="text-muted-foreground"
+                      title={`Computed via formula: ${latestUsageSnapshot.contextFormula}`}
+                    >
+                      {latestUsageSnapshot.contextFormula}
+                    </Badge>
+                  )}
+              </span>
+            </MetaRow>
+          </>
+        ) : (
+          <MetaRow icon={Cpu} label="Current">
+            <span className="text-xs text-muted-foreground">Unavailable</span>
+          </MetaRow>
+        )}
         {summary.peakContextPercent != null && (
           <MetaRow icon={Activity} label="Peak">
             <span className="text-xs font-mono">{summary.peakContextPercent.toFixed(0)}%</span>
@@ -549,13 +582,16 @@ export default function TaskDetailPage() {
   const pauseTask = usePauseTask();
   const resumeTask = useResumeTask();
   const { searchParams, setParam } = useUrlSearchState();
-  const activeTab = coerceTaskDetailTab(readStringParam(searchParams, "tab", "details"));
+  // A finished task is opened for its result, so its mobile default tab is
+  // Outcome; a live one opens on Details.
+  const defaultTab = task && TERMINAL_TASK_STATUSES.has(task.status) ? "outcome" : "details";
+  const activeTab = coerceTaskDetailTab(readStringParam(searchParams, "tab", defaultTab));
   const railParam = readStringParam(searchParams, "rail");
   const railCollapsed =
     railParam === "expanded" ? false : railParam === "collapsed" ? true : readStoredRailCollapsed();
   const setActiveTab = useCallback(
-    (tab: string) => setParam("tab", coerceTaskDetailTab(tab), { defaultValue: "details" }),
-    [setParam],
+    (tab: string) => setParam("tab", coerceTaskDetailTab(tab), { defaultValue: defaultTab }),
+    [setParam, defaultTab],
   );
   const setRailCollapsed = useCallback(
     (collapsed: boolean) => setParam("rail", collapsed ? "collapsed" : "expanded"),
@@ -598,8 +634,8 @@ export default function TaskDetailPage() {
     return <p className="text-muted-foreground">Task not found.</p>;
   }
 
-  const terminalStatuses = ["completed", "failed", "cancelled", "superseded"];
-  const canCancel = !terminalStatuses.includes(task.status) && task.status !== "paused";
+  const isTerminal = TERMINAL_TASK_STATUSES.has(task.status);
+  const canCancel = !isTerminal && task.status !== "paused";
   const canPause = task.status === "in_progress";
   const canResume = task.status === "paused";
 
@@ -795,7 +831,9 @@ export default function TaskDetailPage() {
         </>
       )}
 
-      {task.progress && (
+      {/* The last progress line ("Running script") is stale once the task
+          ends; the outcome carries the result. */}
+      {task.progress && !isTerminal && (
         <>
           <Separator className="my-2" />
           <div className="space-y-1">
@@ -896,11 +934,16 @@ export default function TaskDetailPage() {
           bgColor={isCompleted ? "bg-status-success/5" : "bg-muted/20"}
           defaultOpen
         >
-          <StructuredOutputContent raw={task.output ?? ""} maxH="max-h-[60vh]" />
+          <StructuredOutputContent
+            citations={task.citations}
+            raw={task.output ?? ""}
+            maxH="max-h-[60vh]"
+          />
         </CollapsibleSection>
       )}
 
       <TaskAttachmentsSection taskId={task.id} attachments={task.attachments} />
+      <TaskCitationsSection output={task.output ?? ""} citations={task.citations ?? []} />
 
       {!isFailed && !hasOutput && !hasAttachments && (
         <div className="flex items-center justify-center py-8 text-muted-foreground">
@@ -970,6 +1013,43 @@ export default function TaskDetailPage() {
   // collapsible description + action buttons. Rendered inside the center column
   // on desktop (lg+) and above the Tabs on mobile/tablet (<lg). Same JSX in both
   // places — single-use; not extractable per the "appears in 2+ places" rule.
+  const secondaryChips = [
+    task.taskType ? (
+      <Badge key="type" variant="outline" size="tag">
+        {task.taskType}
+      </Badge>
+    ) : null,
+    task.priority !== undefined ? (
+      <Badge
+        key="priority"
+        variant="outline"
+        className="text-[9px] px-1.5 py-0 h-5 font-mono leading-none items-center"
+      >
+        P{task.priority}
+      </Badge>
+    ) : null,
+    ...(task.tags ?? []).map((tag) => (
+      <Badge key={`tag-${tag}`} variant="outline" size="tag">
+        {tag}
+      </Badge>
+    )),
+    task.source ? (
+      <Badge key="source" variant="outline" size="tag">
+        {task.source}
+      </Badge>
+    ) : null,
+    task.effort ? (
+      <Badge
+        key="effort"
+        variant="outline"
+        className="text-[9px] px-1.5 py-0 h-5 font-mono leading-none items-center gap-1"
+      >
+        <Zap className="h-2.5 w-2.5" />
+        effort: {task.effort}
+      </Badge>
+    ) : null,
+  ].filter((chip) => chip !== null);
+
   const heroBlock = (
     // Phase 17 — generous padding around the badges/description/actions block
     // ("the task details part on top of the logs"). Brand kit's
@@ -979,29 +1059,6 @@ export default function TaskDetailPage() {
     <div className="space-y-3 px-4 pt-4 pb-5 shrink-0">
       <div className="flex items-center gap-2 flex-wrap">
         <StatusBadge status={task.status} size="md" />
-        {task.taskType && (
-          <Badge variant="outline" size="tag">
-            {task.taskType}
-          </Badge>
-        )}
-        {task.priority !== undefined && (
-          <Badge
-            variant="outline"
-            className="text-[9px] px-1.5 py-0 h-5 font-mono leading-none items-center"
-          >
-            P{task.priority}
-          </Badge>
-        )}
-        {task.tags?.map((tag) => (
-          <Badge key={tag} variant="outline" size="tag">
-            {tag}
-          </Badge>
-        ))}
-        {task.source && (
-          <Badge variant="outline" size="tag">
-            {task.source}
-          </Badge>
-        )}
         {task.provider && (
           <Badge
             variant="outline"
@@ -1019,6 +1076,14 @@ export default function TaskDetailPage() {
               <span className="opacity-60">
                 {" · "}
                 {task.harnessVariantMeta.version}
+              </span>
+            ) : null}
+            {task.providerMeta &&
+            "transport" in task.providerMeta &&
+            task.providerMeta.transport === "sdk" ? (
+              <span className="opacity-60" title="Ran through the Claude Agent SDK transport">
+                {" · "}
+                sdk
               </span>
             ) : null}
           </Badge>
@@ -1049,17 +1114,29 @@ export default function TaskDetailPage() {
             </Badge>
           ) : null;
         })()}
-        {task.effort ? (
-          <Badge
-            variant="outline"
-            className="text-[9px] px-1.5 py-0 h-5 font-mono leading-none items-center gap-1"
-          >
-            <Zap className="h-2.5 w-2.5" />
-            effort: {task.effort}
-          </Badge>
+        {/* Routing metadata (type, priority, tags, source, effort) sits
+            behind one "+N" chip: eight equal-weight chips pushed the task
+            text to the fourth row on a phone. */}
+        {secondaryChips.length > 0 ? (
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                aria-label={`Show ${secondaryChips.length} more task labels`}
+              >
+                <Badge variant="outline" size="tag" className="hover:bg-accent">
+                  +{secondaryChips.length}
+                </Badge>
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-auto max-w-xs p-2">
+              <div className="flex flex-wrap gap-1.5">{secondaryChips}</div>
+            </PopoverContent>
+          </Popover>
         ) : null}
       </div>
-      <CollapsibleDescription text={task.task} />
+      <CollapsibleDescription text={task.task} collapsedClassName="line-clamp-3 lg:line-clamp-1" />
       <div className="flex items-center gap-2">
         {(canCancel || canPause || canResume) && (
           <div className="flex items-center gap-1.5 shrink-0">
@@ -1122,6 +1199,7 @@ export default function TaskDetailPage() {
 
   return (
     <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
+      <TaskFailureHelpDialog task={task} />
       {/* Breadcrumb — fixed at top across all breakpoints */}
       <div className="px-1 pb-2 shrink-0">
         <button
@@ -1219,11 +1297,16 @@ export default function TaskDetailPage() {
                 borderColor={isCompleted ? "border-status-success/30" : "border-border"}
                 bgColor={isCompleted ? "bg-status-success/5" : "bg-muted/20"}
               >
-                <StructuredOutputContent raw={task.output ?? ""} maxH="max-h-48" />
+                <StructuredOutputContent
+                  citations={task.citations}
+                  raw={task.output ?? ""}
+                  maxH="max-h-48"
+                />
               </CollapsibleSection>
             )}
 
             <TaskAttachmentsSection taskId={task.id} attachments={task.attachments} />
+            <TaskCitationsSection output={task.output ?? ""} citations={task.citations ?? []} />
 
             {sessionLogsContent}
 

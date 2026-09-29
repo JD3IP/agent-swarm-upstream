@@ -7,7 +7,9 @@ import { seedPricingFromModelsDev } from "./be/seed-pricing";
 import { isSteeringEnabled } from "./be/steering";
 import { registerGithubTaskReactions } from "./github/task-reactions";
 import { loadGlobalConfigsIntoEnv } from "./http/core";
+import { resolveTemplate } from "./prompts/resolver";
 import { isRbacEnabled } from "./rbac";
+import { getSlackConfiguration } from "./slack/config";
 import { registerAcceptSteerTool } from "./tools/accept-steer";
 import { registerAppDiffTool } from "./tools/app-diff";
 import { registerAppGetTool } from "./tools/app-get";
@@ -26,8 +28,16 @@ import { registerCreateMetricTool } from "./tools/create-metric";
 import { registerCreatePageTool } from "./tools/create-page";
 import { registerCredentialBindingsTool } from "./tools/credential-bindings";
 import { registerDbQueryTool } from "./tools/db-query";
+import { registerDeferTaskTool } from "./tools/defer-task";
 import { registerDeleteChannelTool } from "./tools/delete-channel";
 import { registerDeletePageTool } from "./tools/delete-page";
+import { registerExtensionActivateVersionTool } from "./tools/extension-activate-version";
+import { registerExtensionCatalogTool } from "./tools/extension-catalog";
+import { registerExtensionDeleteTool } from "./tools/extension-delete";
+import { registerExtensionDisableTool } from "./tools/extension-disable";
+import { registerExtensionEnableTool } from "./tools/extension-enable";
+import { registerExtensionInstallTool } from "./tools/extension-install";
+import { registerExtensionListTool } from "./tools/extension-list";
 import { registerGetMetricsTool } from "./tools/get-metrics";
 import { registerGetSwarmTool } from "./tools/get-swarm";
 import { registerGetTaskDetailsTool } from "./tools/get-task-details";
@@ -87,6 +97,12 @@ import { registerRegisterServiceTool } from "./tools/register-service";
 import { registerGetReposTool, registerUpdateRepoTool } from "./tools/repos";
 import { registerRequestHumanInputTool } from "./tools/request-human-input";
 import { registerResolveUserTool } from "./tools/resolve-user";
+import {
+  registerRoomChangeTool,
+  registerRoomDecodeTool,
+  registerRoomGetTool,
+  registerRoomResetTool,
+} from "./tools/rooms";
 // Scheduling capability
 import {
   registerCreateScheduleTool,
@@ -156,6 +172,7 @@ import { registerUnregisterServiceTool } from "./tools/unregister-service";
 // Profiles capability
 import { registerUpdateProfileTool } from "./tools/update-profile";
 import { registerUpdateServiceStatusTool } from "./tools/update-service-status";
+import { setPreloadedTools } from "./tools/utils";
 import {
   registerReplyWhatsappMessageTool,
   registerSendWhatsappMessageTool,
@@ -253,7 +270,12 @@ export function hasCapability(cap: CAPABILITIES_T): boolean {
 }
 
 export function getEnabledCapabilities(): CAPABILITIES_T[] {
-  return Array.from(getCapabilities());
+  const capabilities = Array.from(getCapabilities());
+  // Phase 1 has no HTTP receiver. Do not advertise usable Slack tools to
+  // workers when HTTP (or an invalid transport) was selected.
+  return getSlackConfiguration().mode === "socket"
+    ? capabilities
+    : capabilities.filter((capability) => capability !== "slack");
 }
 
 /**
@@ -267,7 +289,9 @@ export function isScriptsOnlyMcp(): boolean {
   return resolveScriptsOnlyMode({ env: process.env.SCRIPTS_ONLY_MCP });
 }
 
-export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: boolean } = {}) {
+export async function createServer(
+  opts: { scriptsOnly?: boolean; fullSurface?: boolean; preloadedTools?: readonly string[] } = {},
+) {
   // Reload env
   await loadGlobalConfigsIntoEnv(true);
 
@@ -309,11 +333,16 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
       description: pkg.description,
     },
     {
+      ...(opts.preloadedTools?.length
+        ? { instructions: resolveTemplate("system.agent.tool_preload", {}).text }
+        : {}),
       capabilities: {
         logging: {},
       },
     },
   );
+
+  if (opts.preloadedTools?.length) setPreloadedTools(server, opts.preloadedTools);
 
   // Scripts-only surface (experimental code-mode): register just the script
   // catalog tools and stop. script-connections / script-apis stay out — they
@@ -322,6 +351,13 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
     registerScriptSearchTool(server);
     registerScriptRunTool(server);
     registerScriptUpsertTool(server);
+    registerExtensionDeleteTool(server);
+    registerExtensionEnableTool(server);
+    registerExtensionDisableTool(server);
+    registerExtensionActivateVersionTool(server);
+    registerExtensionCatalogTool(server);
+    registerExtensionInstallTool(server);
+    registerExtensionListTool(server);
     registerScriptDeleteTool(server);
     registerScriptQueryTypesTool(server);
     registerScriptRunsTools(server);
@@ -382,6 +418,13 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
     registerScriptApisTool(server);
     registerScriptRunTool(server);
     registerScriptUpsertTool(server);
+    registerExtensionDeleteTool(server);
+    registerExtensionEnableTool(server);
+    registerExtensionDisableTool(server);
+    registerExtensionActivateVersionTool(server);
+    registerExtensionCatalogTool(server);
+    registerExtensionInstallTool(server);
+    registerExtensionListTool(server);
     registerScriptDeleteTool(server);
     registerScriptQueryTypesTool(server);
     registerScriptRunsTools(server);
@@ -415,6 +458,7 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
   if (hasCapability("scheduling")) {
     registerListSchedulesTool(server);
     registerCreateScheduleTool(server);
+    registerDeferTaskTool(server);
     registerUpdateScheduleTool(server);
     registerPatchScheduleTool(server);
     registerDeleteScheduleTool(server);
@@ -501,6 +545,10 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
     registerKvDeleteTool(server);
     registerKvIncrTool(server);
     registerKvListTool(server);
+    registerRoomGetTool(server);
+    registerRoomChangeTool(server);
+    registerRoomResetTool(server);
+    registerRoomDecodeTool(server);
   }
 
   // Slack capability - Slack integration tools (no-op if Slack is not configured)

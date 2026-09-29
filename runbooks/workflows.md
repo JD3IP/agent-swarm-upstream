@@ -68,6 +68,8 @@ Do not include patch bodies, diff hunks, raw `git log --stat` output, downloaded
 - `template` (required)
 - `outputSchema`
 - `agentId`
+- `routingReason` (optional; a configured `agentId` defaults to `human_pinned`: `skill`, `continuity`, `overflow`, `human_pinned`, or `reroute_fault`)
+- `routingNote` (optional, maximum 200 characters)
 - `tags`
 - `priority` (0–100, default 50)
 - `offerMode`
@@ -124,6 +126,47 @@ The workflow-level `onNodeFailure` policy applies to foreach children. The defau
 run on the first failed/cancelled child. With `onNodeFailure: "continue"`, the child contributes a
 `failed` result whose output contains the existing `[FAILED: <reason>]` marker; the remaining
 children finish and the parent closes the join.
+
+## Human-in-the-loop nodes
+
+A `human-in-the-loop` node creates one approval card, pauses the run, and routes on the `approved`,
+`rejected`, or `timeout` port. Question types: `approval`, `text`, `single-select`, `multi-select`,
+`boolean`. The run is `rejected` only when an `approval` question is answered with a rejection.
+
+`config.questions` is either a static array or one exact interpolation token that resolves to an
+array built upstream, for example one question per item:
+
+```yaml
+- id: plan-card
+  type: human-in-the-loop
+  inputs: { t: "triage.taskOutput" }
+  config:
+    title: "Plan for {{t.count}} items"
+    questions: "{{t.questions}}"
+    approvers: { policy: any }
+  next: { approved: execute, rejected: skip, timeout: skip }
+```
+
+- The exact token injects the raw array. A token with surrounding text is rejected at authoring
+  time, because string interpolation would JSON-stringify the array.
+- Resolved questions are validated at execute time with the same schema as static ones. The node
+  fails, and no card is created, when the value is missing, not an array, empty, over 100
+  questions, has a malformed item (the error names the index and field), repeats an `id`, or has a
+  select question with no options. Unknown fields are stripped.
+- Resolved questions are display data. They are stored as-is and never re-interpolated, so a
+  `{{token}}` inside upstream text stays literal.
+- Downstream nodes read answers by question id: `inputs: { decision: "plan-card" }`, then
+  `{{decision.responses.<questionId>}}`. An optional question the human skipped is absent from
+  `responses`, so give the consumer a default (for example the proposed action).
+
+Rendering limits:
+
+- The dashboard approval page lists every question as its own card. No cap beyond the 100-question
+  node limit.
+- The Slack notification lists question labels in one section block, capped by Block Kit at 3000
+  characters. When the labels do not fit, the tail becomes `…and N more` and the reviewer answers
+  on the dashboard via the card's button. Labels are escaped, so upstream text cannot add mentions
+  or links.
 
 ## Script node types
 
@@ -248,6 +291,16 @@ The echoed `triggerSchema` lets agents self-correct without a follow-up `get-wor
 - HTTP 400 helper: `src/http/utils.ts` (`triggerSchemaErrorResponse`)
 - MCP error formatting: `src/tools/workflows/trigger-workflow.ts` (`TriggerSchemaError` branch)
 
+## Event triggers
+
+An enabled workflow can subscribe to an event that starts a new run:
+
+```json
+{ "type": "event", "eventName": "slack.message" }
+```
+
+The event payload becomes the run's `triggerData` and passes through the workflow's optional `triggerSchema` validation. `slack.message` is currently wired as a start trigger during workflow initialization; the generic dispatcher can support more named bus events as their listeners are added.
+
 ## Wait nodes
 
 A `wait` node pauses a workflow until either a duration elapses or a named event satisfies a filter. It is async — the run transitions to `waiting` and resumes via the `wait-poller` (time mode + event-mode timeout) or the `workflowEventBus` listener (event mode).
@@ -322,6 +375,7 @@ The following events are already emitted on `workflowEventBus` today and are usa
 | `task.created` / `task.progress` / `task.budget_refused` | `src/be/db.ts` | task-id keyed lifecycle payloads |
 | `approval.resolved` | `src/http/approval-requests.ts:183` | `{ requestId, status, responses, workflowRunId, workflowRunStepId }` |
 | `agentmail.message.received` | `src/agentmail/handlers.ts:168` | inbox/message keyed payload |
+| `slack.message` | `src/slack/handlers.ts` | `{ channel, text, user, ts, threadTs }` |
 | `github.pull_request.<action>` | `src/http/webhooks.ts:177` | full GitHub PR payload |
 | `github.issue.<action>` | `src/http/webhooks.ts:192` | GitHub issue payload |
 | `github.issue_comment.created` | `src/http/webhooks.ts:202` | comment payload |
@@ -337,7 +391,6 @@ For `task.completed` specifically, the canonical payload shape lives in `src/be/
 
 The following sources do **not** currently emit on `workflowEventBus`. Hooking each one in is a one-line `workflowEventBus.emit(name, payload)` follow-up in the relevant handler — tracked as separate plans:
 
-- Slack messages (`src/slack/`)
 - Linear webhooks (`src/linear/`, `src/http/trackers/linear.ts`)
 - Jira webhooks (`src/jira/`, `src/http/trackers/jira.ts`)
 - Sentry alerts

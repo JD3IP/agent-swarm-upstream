@@ -1,4 +1,4 @@
-import type { ForwardRefExoticComponent, RefAttributes } from "react";
+import type { ForwardRefExoticComponent, ReactNode, RefAttributes } from "react";
 import { useRef, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useDashboardCosts } from "@/api/hooks/use-costs";
@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/sidebar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatCost } from "@/lib/cost-format";
+import { isDemoMode } from "@/lib/deployment-config";
 import { cn, formatCompactNumber } from "@/lib/utils";
 import { SwarmSwitcher } from "./swarm-switcher";
 
@@ -116,6 +117,12 @@ const navGroups: NavGroup[] = [
         gate: { minVersion: "1.76.0" },
       },
       {
+        title: "Pages",
+        path: "/pages",
+        icon: GlobeIcon,
+        gate: { minVersion: "1.79.0" },
+      },
+      {
         title: "Apps",
         path: "/apps",
         icon: LayoutGridIcon,
@@ -143,12 +150,6 @@ const navGroups: NavGroup[] = [
       { title: "MCP Servers", path: "/mcp-servers", icon: CableIcon },
       { title: "Connections", path: "/connections", icon: Link2Icon },
       { title: "Memory", path: "/memory", icon: BrainIcon },
-      {
-        title: "Pages",
-        path: "/pages",
-        icon: GlobeIcon,
-        gate: { minVersion: "1.79.0" },
-      },
       { title: "Templates", path: "/templates", icon: FileTextIcon },
     ],
   },
@@ -173,6 +174,7 @@ const footerNav: FooterItem[] = [
       { title: "API Keys", path: "/settings/api-keys" },
       { title: "Integrations", path: "/settings/integrations" },
       { title: "Configuration", path: "/settings/configuration" },
+      { title: "Extensions", path: "/settings/extensions" },
       { title: "Repos", path: "/settings/repos" },
       { title: "Debug", path: "/settings/debug" },
     ],
@@ -260,7 +262,7 @@ interface FooterNavItemProps {
    * when the live-counts feature (API ≥1.82) is enabled and the value is
    * resolved; `undefined` means render no badge.
    */
-  badge?: string;
+  badge?: ReactNode;
 }
 
 /**
@@ -375,7 +377,7 @@ export function AppSidebar() {
 
   // Map of `nav path -> resolved badge string`. An entry is present only when
   // the value is loaded and worth showing; absence means "no badge".
-  const badges: Record<string, string> = {};
+  const badges: Record<string, ReactNode> = {};
   if (countsEnabled) {
     const runningTasks = metrics?.tasks?.by_status?.in_progress;
     // Show running tasks only when there's at least one — skip a "0" chip.
@@ -387,7 +389,14 @@ export function AppSidebar() {
     }
     const costToday = dashboardCosts?.costToday;
     if (typeof costToday === "number") {
-      badges["/usage"] = formatCost(costToday, { precision: "compact" });
+      // Today's spend, labelled: next to a 30-day page total, a bare "$448"
+      // read as the same number.
+      badges["/usage"] = (
+        <>
+          {formatCost(costToday, { precision: "compact" })}
+          <span className="ml-1 font-normal text-muted-foreground">today</span>
+        </>
+      );
     }
   }
 
@@ -400,7 +409,10 @@ export function AppSidebar() {
       <SidebarHeader className="border-b border-sidebar-border">
         <NavLink
           to="/"
-          className="flex h-10 items-center gap-2 group-data-[collapsible=icon]:justify-center"
+          className={cn(
+            "flex h-10 items-center gap-2 group-data-[collapsible=icon]:justify-center",
+            isDemoMode && "pl-20 group-data-[collapsible=icon]:pl-0",
+          )}
         >
           <img
             src={identityLogo}

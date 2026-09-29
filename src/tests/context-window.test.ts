@@ -9,6 +9,8 @@ import {
 
 describe("getContextWindowSize", () => {
   test("returns 1M for fable and mythos models", () => {
+    expect(getContextWindowSize("claude-fable-5-1")).toBe(1_000_000);
+    expect(getContextWindowSize("claude-mythos-5-1")).toBe(1_000_000);
     expect(getContextWindowSize("claude-fable-5")).toBe(1_000_000);
     expect(getContextWindowSize("claude-mythos-5")).toBe(1_000_000);
     expect(getContextWindowSize("fable")).toBe(1_000_000);
@@ -16,6 +18,7 @@ describe("getContextWindowSize", () => {
   });
 
   test("returns 1M for opus models", () => {
+    expect(getContextWindowSize("claude-opus-5-5")).toBe(1_000_000);
     expect(getContextWindowSize("claude-opus-5")).toBe(1_000_000);
     expect(getContextWindowSize("claude-opus-4-8")).toBe(1_000_000);
     expect(getContextWindowSize("claude-opus-4-7")).toBe(1_000_000);

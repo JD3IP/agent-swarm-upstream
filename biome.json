@@ -9,10 +9,15 @@
     "ignoreUnknown": false,
     "includes": [
       "**",
+      "!!docs-site/.next",
       "!src/be/seed-scripts/catalog",
       "!src/be/modelsdev-cache.json",
+      "!src/extensions/catalog.generated.json",
+      "!templates/extensions/manifest.schema.json",
       "!src/providers/modelsdev-reasoning.json",
+      "!packages/ui-e2e/reporter/ui-e2e-ingest.v1.schema.json",
       "!mockups",
+      "!talks",
       "!!docs-site/public/openapi.d.ts"
     ]
   },

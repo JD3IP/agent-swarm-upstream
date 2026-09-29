@@ -16,6 +16,8 @@ import {
 } from "../be/multi-runtime";
 import { getUserGrant } from "../be/rbac-roles";
 import {
+  internalConfigKeyError,
+  isInternalConfigKey,
   isReservedConfigKey,
   reservedKeyError,
   validateConfigValue,
@@ -37,10 +39,12 @@ const SECRETS_FORCE_MASK_NOTE =
 // bootstrap admin key would let a compromised worker administer the shared org.
 // The API materializes these into its own process.env at boot via
 // getInjectableGlobalConfigs, so no HTTP consumer legitimately needs them.
-const API_ONLY_CONFIG_KEYS = new Set(["API_AGENT_FS_API_KEY"]);
+const API_ONLY_CONFIG_KEYS = new Set(["API_AGENT_FS_API_KEY", "SLACK_SIGNING_SECRET"]);
 
 function stripApiOnlyKeys<T extends { key: string }>(configs: T[]): T[] {
-  return configs.filter((config) => !API_ONLY_CONFIG_KEYS.has(config.key));
+  return configs.filter(
+    (config) => !API_ONLY_CONFIG_KEYS.has(config.key) && !isInternalConfigKey(config.key),
+  );
 }
 
 function singleHeader(req: IncomingMessage, name: string): string | undefined {
@@ -48,11 +52,19 @@ function singleHeader(req: IncomingMessage, name: string): string | undefined {
   return Array.isArray(raw) ? raw[0] : raw;
 }
 
-async function userMayReadSecrets(req: IncomingMessage): Promise<boolean> {
+async function requestMayReadSecrets(req: IncomingMessage): Promise<boolean> {
   const auth = getRequestAuth(req);
   if (auth?.kind === "operator") return true;
-  // Agent/no-user HTTP reads keep their pre-RBAC behavior; MCP get-config has
-  // the per-agent config.read.secrets gate.
+  if (auth?.kind === "agent") {
+    const agent = await getAgentById(auth.agentId);
+    return can({
+      principal: { kind: "agent", agentId: auth.agentId, isLead: agent?.isLead ?? false },
+      verb: "config.read.secrets",
+      resource: { kind: "none" },
+      source: "http",
+    }).allow;
+  }
+  // Preserve legacy reads without a user or session-token principal.
   if (auth?.kind !== "user") return true;
   if (!isRbacEnabled()) return true;
 
@@ -61,7 +73,7 @@ async function userMayReadSecrets(req: IncomingMessage): Promise<boolean> {
 }
 
 async function resolveSecretsRead(req: IncomingMessage, includeSecrets: boolean) {
-  if (!includeSecrets || (await userMayReadSecrets(req))) {
+  if (!includeSecrets || (await requestMayReadSecrets(req))) {
     return { effectiveIncludeSecrets: includeSecrets, secretsNote: "" };
   }
   return { effectiveIncludeSecrets: false, secretsNote: SECRETS_FORCE_MASK_NOTE };
@@ -75,21 +87,22 @@ async function resolveSecretsRead(req: IncomingMessage, includeSecrets: boolean)
  * operator/user-before-agent ordering used by fs.ts (Appendix A row 36). This
  * preserves every existing HTTP caller (dashboard, codex-oauth token refresh,
  * devin playbook cache — all operate as operator). Only an agent-context
- * principal (X-Agent-ID without operator/user request auth) is gated to lead;
+ * principal is gated to lead, using the authenticated session identity ahead
+ * of the legacy X-Agent-ID fallback;
  * the real per-agent enforcement lives on the MCP set-config/delete-config
  * tools, where the principal is always an agent.
  *
  * Returns true when the request may proceed; on denial it writes a 403 and
  * returns false.
  */
-async function ensureConfigAdmin(
+export async function ensureConfigAdmin(
   req: IncomingMessage,
   res: ServerResponse,
   verb: Extract<PermissionVerb, "config.write.any" | "config.delete.any">,
 ): Promise<boolean> {
   const auth = getRequestAuth(req);
   if (auth?.kind === "operator" || auth?.kind === "user") return true;
-  const agentId = singleHeader(req, "x-agent-id");
+  const agentId = auth?.kind === "agent" ? auth.agentId : singleHeader(req, "x-agent-id");
   const agent = agentId ? await getAgentById(agentId) : undefined;
   const decision = can({
     principal: { kind: "agent", agentId: agentId ?? "", isLead: agent?.isLead ?? false },
@@ -301,7 +314,10 @@ export async function handleConfig(
     }
     const presence: Record<string, boolean> = {};
     for (const key of keys) {
-      presence[key] = process.env[key] !== undefined && process.env[key] !== "";
+      // Organization identity is trimmed by both /status and telemetry.
+      // Match that definition without changing presence semantics for secrets.
+      const value = key === "SWARM_ORG_NAME" ? process.env[key]?.trim() : process.env[key];
+      presence[key] = value !== undefined && value !== "";
     }
     envPresence.respond(res, 200, { presence });
     return true;
@@ -327,7 +343,7 @@ export async function handleConfig(
     if (!parsed) return true;
     const includeSecrets = parsed.query.includeSecrets === "true";
     const config = await getSwarmConfigById(parsed.params.id);
-    if (!config) {
+    if (!config || isInternalConfigKey(config.key)) {
       jsonError(res, "Config not found", 404);
       return true;
     }
@@ -390,6 +406,11 @@ export async function handleConfig(
       return true;
     }
 
+    if (isInternalConfigKey(key)) {
+      jsonError(res, internalConfigKeyError(key).message, 400);
+      return true;
+    }
+
     const validationError = validateConfigValue(key, value);
     if (validationError) {
       jsonError(res, validationError, 400);
@@ -429,6 +450,10 @@ export async function handleConfig(
     const existing = await getSwarmConfigLookupById(parsed.params.id);
     if (!existing) {
       jsonError(res, "Config not found", 404);
+      return true;
+    }
+    if (isInternalConfigKey(existing.key)) {
+      jsonError(res, internalConfigKeyError(existing.key).message, 400);
       return true;
     }
     const deleted = await deleteSwarmConfig(parsed.params.id);

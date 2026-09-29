@@ -91,6 +91,10 @@ if [ "$HARNESS_PROVIDER" = "pi" ]; then
             fi
             ;;
     esac
+elif [ "$HARNESS_PROVIDER" = "dsh" ]; then
+    if [ -z "$DEEPSEEK_API_KEY" ] && [ -z "$OPENROUTER_API_KEY" ]; then
+        echo "Warning: dsh provider has no credentials yet (DEEPSEEK_API_KEY / OPENROUTER_API_KEY). Worker will park in credential-wait until creds appear in swarm_config."
+    fi
 elif [ "$HARNESS_PROVIDER" = "opencode" ]; then
     # opencode auth: OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or auth.json must exist
     OPENCODE_AUTH_FILE="${HOME}/.local/share/opencode/auth.json"
@@ -295,6 +299,7 @@ else
     fi
 fi
 
+# BEGIN verify_provider_binary
 # ---- Verify provider binary is reachable ----
 if [ "$HARNESS_PROVIDER" = "codex" ]; then
     CODEX_BIN="${CODEX_BINARY:-codex}"
@@ -317,6 +322,64 @@ elif [ "$HARNESS_PROVIDER" = "opencode" ]; then
         exit 1
     fi
     echo "opencode CLI: $(command -v "$OPENCODE_BIN")"
+elif [ "$HARNESS_PROVIDER" = "dsh" ]; then
+    DSH_BIN="${DSH_BINARY:-dsh}"
+    if ! command -v "$DSH_BIN" >/dev/null 2>&1; then
+        echo "FATAL: dsh CLI not found: '$DSH_BIN'. Use worker-full or install @deepseek-ai/dsh@0.1.7-alpha.2 during image provisioning."
+        exit 1
+    fi
+    echo "dsh CLI: $(command -v "$DSH_BIN")"
+elif [ "$HARNESS_PROVIDER" = "acp" ]; then
+    # ACP spawns its own target, not the claude CLI, so resolve the same
+    # command ACPAdapter.createSession would spawn and check THAT binary.
+    # Mirrors resolveAcpTarget / customTargetProfile.command in
+    # src/providers/acp-targets.ts. Every fallback below is unset-only, because
+    # the resolver uses ?? : a set-but-empty value must fail here exactly the
+    # way it fails at task start, not quietly pick a different target.
+    ACP_TARGET_ID="${ACP_TARGET-custom}"
+    if [ "$ACP_TARGET_ID" = "opencode" ]; then
+        # Catalog command for the opencode target (acp-target-catalog.ts) is
+        # `opencode acp`; only "opencode" is the executable, "acp" is argv.
+        ACP_BIN="opencode"
+    elif [ "$ACP_TARGET_ID" = "custom" ]; then
+        if [ -n "${ACP_TARGET_COMMAND+set}" ]; then
+            ACP_BIN="$ACP_TARGET_COMMAND"
+        elif [ -n "${ACP_COMMAND+set}" ]; then
+            ACP_BIN="$ACP_COMMAND"
+        else
+            echo "FATAL: no ACP target configured. Set ACP_TARGET_COMMAND to an ACP-compatible executable before using HARNESS_PROVIDER=acp."
+            echo "  PATH=$PATH"
+            exit 1
+        fi
+        # Trim the ends only, the way String.trim does. Interior spacing stays.
+        ACP_BIN=$(printf '%s' "$ACP_BIN" | awk '{ sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print }')
+        if [ -z "$ACP_BIN" ]; then
+            echo "FATAL: ACP target command is empty. Set ACP_TARGET_COMMAND to an ACP-compatible executable."
+            echo "  PATH=$PATH"
+            exit 1
+        fi
+        # parseCommand keeps the whole trimmed command as argv[0] when
+        # ACP_TARGET_ARGS is set and non-blank, and only falls back to splitting
+        # on whitespace when those args are absent or blank. So a command with
+        # interior spaces stays one executable, and splitting it would check a
+        # binary the adapter never spawns.
+        #
+        # "Blank" strips all whitespace, because the guard there is
+        # args?.trim(): a whitespace-only value takes the split path.
+        if [ -z "${ACP_TARGET_ARGS:-}" ] || [ -z "${ACP_TARGET_ARGS//[[:space:]]/}" ]; then
+            ACP_BIN=$(printf '%s' "$ACP_BIN" | awk '{print $1}')
+        fi
+    else
+        echo "FATAL: unsupported ACP target '$ACP_TARGET_ID'. Supported targets: opencode, custom."
+        echo "  PATH=$PATH"
+        exit 1
+    fi
+    if ! command -v "$ACP_BIN" > /dev/null 2>&1; then
+        echo "FATAL: ACP target binary not found: '$ACP_BIN' (ACP_TARGET='$ACP_TARGET_ID')"
+        echo "  PATH=$PATH"
+        exit 1
+    fi
+    echo "ACP target: $(command -v "$ACP_BIN") (ACP_TARGET='$ACP_TARGET_ID')"
 elif [ "$HARNESS_PROVIDER" != "pi" ]; then
     CLAUDE_BIN="${CLAUDE_BINARY:-claude}"
     # CLAUDE_BINARY may be a whitespace-separated command string. Only
@@ -335,6 +398,8 @@ elif [ "$HARNESS_PROVIDER" != "pi" ]; then
     fi
     echo "Claude CLI: $(command -v "$CLAUDE_BIN_EXEC") (CLAUDE_BINARY='$CLAUDE_BIN')"
 fi
+
+# END verify_provider_binary
 
 # ---- Git safe.directory backstop ----
 # Avoid "dubious ownership" when /workspace dirs are owned by a different uid
@@ -444,17 +509,19 @@ if [ -n "$AGENT_ID" ]; then
             #   - HARNESS_PROVIDER: live-reconciled by runner.ts poll loop;
             #     baking it would also defeat the precedence invariant
             #     (swarm_config > env > "claude")
+            #   - CLAUDE_TRANSPORT: resolved for each session; clearing an
+            #     agent override must restore the deployment default.
             # Also skip keys that are not valid POSIX shell identifiers
             # (e.g. CF-Access-Client-Id). Sourcing such a key causes the shell
             # to parse "CF-Access-Client-Id=value" as a command invocation →
             # "command not found", aborting the rest of the export. These keys
             # are still available to the runner via headerConfigKeys (resolved
             # per-request), so skipping them here is safe.
-            SKIPPED_NONIDENT=$(jq -r '.configs[] | select(.key != "codex_oauth" and .key != "HARNESS_PROVIDER") | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$") | not) | .key' /tmp/swarm_config.json 2>/dev/null || true)
+            SKIPPED_NONIDENT=$(jq -r '.configs[] | select(.key != "codex_oauth" and .key != "HARNESS_PROVIDER" and .key != "CLAUDE_TRANSPORT") | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$") | not) | .key' /tmp/swarm_config.json 2>/dev/null || true)
             if [ -n "$SKIPPED_NONIDENT" ]; then
                 echo "[entrypoint] debug: skipping non-identifier config keys (not valid POSIX shell variable names, still available via headerConfigKeys): $(echo "$SKIPPED_NONIDENT" | tr '\n' ' ')"
             fi
-            jq -r '.configs[] | select(.key != "codex_oauth" and .key != "HARNESS_PROVIDER") | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) | "\(.key)=" + (.value | @sh)' /tmp/swarm_config.json > /tmp/swarm_config.env 2>/dev/null || true
+            jq -r '.configs[] | select(.key != "codex_oauth" and .key != "HARNESS_PROVIDER" and .key != "CLAUDE_TRANSPORT") | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) | "\(.key)=" + (.value | @sh)' /tmp/swarm_config.json > /tmp/swarm_config.env 2>/dev/null || true
             if [ -f /tmp/swarm_config.env ]; then
                 set -a
                 . /tmp/swarm_config.env
@@ -745,7 +812,10 @@ if [ -n "$AGENT_ID" ]; then
                     | sed '/^# === Agent-managed setup (from DB) ===$/,/^# === End agent-managed setup ===$/d' \
                     >> "$TEMP_FILE"
                 mv "$TEMP_FILE" "$EXISTING_STARTUP"
-                chmod +x "$EXISTING_STARTUP"
+                # mktemp creates a root-owned 0600 file and mv preserves its owner.
+                # The worker must be able to execute AND later edit this profile file.
+                chown worker:worker "$EXISTING_STARTUP" 2>/dev/null || true
+                chmod 700 "$EXISTING_STARTUP"
             elif [ -n "$AGENT_SCRIPT" ]; then
                 # Create new start-up.sh
                 echo "Creating /workspace/start-up.sh from agent setup script..."
@@ -753,7 +823,8 @@ if [ -n "$AGENT_ID" ]; then
                 echo "# === Agent-managed setup (from DB) ===" >> /workspace/start-up.sh
                 echo "$AGENT_SCRIPT" >> /workspace/start-up.sh
                 echo "# === End agent-managed setup ===" >> /workspace/start-up.sh
-                chmod +x /workspace/start-up.sh
+                chown worker:worker /workspace/start-up.sh 2>/dev/null || true
+                chmod 700 /workspace/start-up.sh
             fi
             echo "Setup scripts prepared (global root hook: $([ -n "$GLOBAL_SCRIPT" ] && echo "yes" || echo "no"), agent worker hook: $([ -n "$AGENT_SCRIPT" ] && echo "yes" || echo "no"))"
         else
@@ -913,6 +984,12 @@ if [ "${SWARM_DEP_REDIS_ENABLED:-false}" = "true" ]; then
 fi
 
 WORKER_BOOTSTRAP="/tmp/agent-swarm-worker-entrypoint.sh"
+# Remove a stale copy from a previous start of this container first. The file is
+# chowned to `worker` below, and /tmp is a sticky world-writable directory, so on
+# hosts with fs.protected_regular=2 (Ubuntu 24.04 default, not namespaced) even
+# root cannot O_CREAT-open it again: the restart loops on "Permission denied".
+# Unlink is allowed, so regenerate from scratch on every start.
+rm -f "$WORKER_BOOTSTRAP"
 cat > "$WORKER_BOOTSTRAP" <<'EOF'
 #!/bin/bash
 set -e

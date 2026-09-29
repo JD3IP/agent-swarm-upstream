@@ -10,7 +10,6 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
-import { useConfig } from "@/hooks/use-config";
 import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
 import {
   CONFIGURATION_GROUPS,
@@ -19,7 +18,6 @@ import {
   type ConfigCatalogGroup,
 } from "@/lib/configuration-catalog";
 import { cn } from "@/lib/utils";
-import { WelcomeCard } from "@/pages/config/components/welcome-card";
 
 interface VisibleGroup {
   group: ConfigCatalogGroup;
@@ -36,7 +34,6 @@ interface VisibleGroup {
  * "Restart required" are read once at process start.
  */
 export default function ConfigurationPage() {
-  const { isConfigured } = useConfig();
   // Rendered rows own their own reads/writes via `useSwarmConfig`; this query
   // exists so the page can show a skeleton and surface a load error once,
   // rather than 50 times. It shares react-query's cache with the rows.
@@ -62,10 +59,6 @@ export default function ConfigurationPage() {
     }
     return result;
   }, [search]);
-
-  if (!isConfigured) {
-    return <WelcomeCard />;
-  }
 
   if (isLoading) {
     return <PageSkeleton />;
@@ -162,9 +155,8 @@ export default function ConfigurationPage() {
       )}
 
       <p className="text-xs text-muted-foreground pb-2">
-        Values set as environment variables take precedence at boot; values saved here are stored in
-        the swarm config and applied on reload. Settings marked Restart required need a server
-        restart.
+        Values saved here are stored in the swarm config and take precedence over environment
+        variables, at boot and on reload. Settings marked Restart required need a server restart.
       </p>
     </div>
   );

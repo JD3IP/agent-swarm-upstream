@@ -9,13 +9,16 @@ import {
 } from "node:http";
 import {
   closeDb,
+  createApprovalRequest,
   createUser,
   createWorkflowRun,
   createWorkflowRunStep,
+  getApprovalRequestById,
   getDbClient,
   getWorkflowRun,
   getWorkflowVersions,
   initDb,
+  listWorkflowRuns,
   updateWorkflowRun,
 } from "../be/db";
 import { getPathSegments, parseQueryParams } from "../http/utils";
@@ -33,10 +36,12 @@ import type {
   WorkflowSummary,
   WorkflowVersion,
 } from "../types";
-import { initWorkflows, stopRetryPoller } from "../workflows";
+import { initWorkflows, stopRetryPoller, workflowEventBus } from "../workflows";
 import { listenOnFreePort } from "./test-net";
 
 const TEST_DB_PATH = "./test-workflow-http-v2.sqlite";
+
+const secretRef = (name: string): string => `secret.${name}`;
 
 // ─── Test Server ─────────────────────────────────────────────
 
@@ -101,6 +106,16 @@ async function createTestWorkflow(overrides?: Record<string, unknown>): Promise<
     }),
   });
   return (await res.json()) as Workflow;
+}
+
+async function waitForWorkflowRuns(workflowId: string, count: number): Promise<WorkflowRun[]> {
+  const deadline = Date.now() + 1_000;
+  do {
+    const runs = await listWorkflowRuns(workflowId);
+    if (runs.length === count) return runs;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  } while (Date.now() < deadline);
+  return listWorkflowRuns(workflowId);
 }
 
 // ─── Setup / Teardown ────────────────────────────────────────
@@ -188,10 +203,10 @@ describe("Workflow HTTP API v2", () => {
           name: "full-schema-workflow",
           description: "test",
           definition: simpleDefinition(),
-          triggers: [{ type: "webhook", hmacSecret: "secret-123" }],
+          triggers: [{ type: "webhook", hmacSecret: "example-secret-123" }],
           cooldown: { minutes: 30 },
           // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional — this is the input resolution syntax
-          input: { apiKey: "${API_KEY}", secret: "secret.MY_SECRET", literal: "hello" },
+          input: { apiKey: "${API_KEY}", secret: secretRef("MY_SECRET"), literal: "hello" },
         }),
       });
 
@@ -424,7 +439,11 @@ describe("Workflow HTTP API v2", () => {
 
   describe("PUT /api/workflows/:id (update)", () => {
     test("creates version snapshot on update", async () => {
-      const workflow = await createTestWorkflow();
+      const workflow = await createTestWorkflow({
+        params: { REPO_URL: "acme/widgets" },
+        requiredParams: ["REPO_URL"],
+        requires: ["github"],
+      });
 
       // First update
       const res1 = await fetch(`${baseUrl}/api/workflows/${workflow.id}`, {
@@ -449,18 +468,26 @@ describe("Workflow HTTP API v2", () => {
       expect(versions.find((v) => v.version === 1)?.snapshot.description).toBeUndefined();
       // Version 2 should have "updated once"
       expect(versions.find((v) => v.version === 2)?.snapshot.description).toBe("updated once");
+      expect(versions.find((v) => v.version === 1)?.snapshot.params).toEqual({
+        REPO_URL: "acme/widgets",
+      });
+      expect(versions.find((v) => v.version === 1)?.snapshot.requiredParams).toEqual(["REPO_URL"]);
+      expect(versions.find((v) => v.version === 1)?.snapshot.requires).toEqual(["github"]);
     });
 
-    test("accepts new fields (triggers, cooldown, input)", async () => {
+    test("accepts new fields (triggers, cooldown, input, automation setup)", async () => {
       const workflow = await createTestWorkflow();
 
       const res = await fetch(`${baseUrl}/api/workflows/${workflow.id}`, {
         method: "PUT",
         headers,
         body: JSON.stringify({
-          triggers: [{ type: "webhook", hmacSecret: "new-secret" }],
+          triggers: [{ type: "webhook", hmacSecret: "example-new-secret" }],
           cooldown: { seconds: 30 },
           input: { key: "value" },
+          params: { REPO_URL: "acme/widgets" },
+          requiredParams: ["REPO_URL"],
+          requires: ["github"],
         }),
       });
       expect(res.status).toBe(200);
@@ -469,6 +496,28 @@ describe("Workflow HTTP API v2", () => {
       expect(body.triggers[0]!.type).toBe("webhook");
       expect(body.cooldown).toEqual({ seconds: 30 });
       expect(body.input).toEqual({ key: "value" });
+      expect(body.params).toEqual({ REPO_URL: "acme/widgets" });
+      expect(body.requiredParams).toEqual(["REPO_URL"]);
+      expect(body.requires).toEqual(["github"]);
+    });
+
+    test("PATCH persists automation setup fields", async () => {
+      const workflow = await createTestWorkflow();
+
+      const res = await fetch(`${baseUrl}/api/workflows/${workflow.id}`, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          params: { SLACK_CHANNEL_ID: "C123" },
+          requiredParams: ["SLACK_CHANNEL_ID"],
+          requires: ["slack"],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Workflow;
+      expect(body.params).toEqual({ SLACK_CHANNEL_ID: "C123" });
+      expect(body.requiredParams).toEqual(["SLACK_CHANNEL_ID"]);
+      expect(body.requires).toEqual(["slack"]);
     });
 
     test("rejects invalid definition on update", async () => {
@@ -664,6 +713,30 @@ describe("Workflow HTTP API v2", () => {
     });
   });
 
+  describe("workflow event triggers", () => {
+    test("init registers one slack.message listener across repeated calls", async () => {
+      const workflow = await createTestWorkflow({
+        triggers: [{ type: "event", eventName: "slack.message" }],
+      });
+
+      await initWorkflows();
+      await initWorkflows();
+      workflowEventBus.emit("slack.message", {
+        channel: "C123",
+        text: "service is down",
+        ts: "123.456",
+      });
+
+      const runs = await waitForWorkflowRuns(workflow.id, 1);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.triggerData).toEqual({
+        channel: "C123",
+        text: "service is down",
+        ts: "123.456",
+      });
+    });
+  });
+
   // ─── LIST RUNS ────────────────────────────────────────────
 
   describe("GET /api/workflows/:id/runs", () => {
@@ -850,11 +923,11 @@ describe("Workflow HTTP API v2", () => {
   describe("POST /api/webhooks/:workflowId", () => {
     test("valid HMAC returns 201", async () => {
       const workflow = await createTestWorkflow({
-        triggers: [{ type: "webhook", hmacSecret: "test-secret" }],
+        triggers: [{ type: "webhook", hmacSecret: "example-test-secret" }],
       });
 
       const body = '{"event":"test"}';
-      const hmac = crypto.createHmac("sha256", "test-secret");
+      const hmac = crypto.createHmac("sha256", "example-test-secret");
       hmac.update(body);
       const sig = `sha256=${hmac.digest("hex")}`;
 
@@ -873,7 +946,7 @@ describe("Workflow HTTP API v2", () => {
 
     test("invalid HMAC returns 401", async () => {
       const workflow = await createTestWorkflow({
-        triggers: [{ type: "webhook", hmacSecret: "test-secret" }],
+        triggers: [{ type: "webhook", hmacSecret: "example-test-secret" }],
       });
 
       const res = await fetch(`${baseUrl}/api/webhooks/${workflow.id}`, {
@@ -964,11 +1037,20 @@ describe("Workflow HTTP API v2", () => {
       await createWorkflowRun({ id: runId, workflowId: workflow.id });
 
       // Create a step in 'running' state
+      const stepId = crypto.randomUUID();
       await createWorkflowRunStep({
-        id: crypto.randomUUID(),
+        id: stepId,
         runId,
         nodeId: "n1",
-        nodeType: "notify",
+        nodeType: "human-in-the-loop",
+      });
+      const approval = await createApprovalRequest({
+        id: crypto.randomUUID(),
+        title: "Approve release",
+        questions: [{ id: "approve", type: "approval", label: "Approve?" }],
+        approvers: { policy: "any" },
+        workflowRunId: runId,
+        workflowRunStepId: stepId,
       });
 
       // Cancel the run
@@ -988,6 +1070,10 @@ describe("Workflow HTTP API v2", () => {
       expect(run.status).toBe("cancelled");
       expect(run.error).toBe("Test cancellation");
       expect(run.finishedAt).toBeDefined();
+      expect(await getApprovalRequestById(approval.id)).toMatchObject({
+        status: "cancelled",
+        resolutionReason: "Test cancellation",
+      });
     });
 
     test("returns 400 for already completed run", async () => {

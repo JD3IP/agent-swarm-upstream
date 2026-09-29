@@ -232,7 +232,8 @@ export async function completeStructured<TZod extends z.ZodTypeAny>(
     // the prompt (forces JSON-only `envelope.result` when it doesn't).
     // The CLI flag alone is unreliable — claude sometimes asks "where's
     // the schema?" if the prompt doesn't reference one.
-    const jsonSchema = z.toJSONSchema(opts.zodSchema) as object;
+    // The pinned Claude executable validates schemas with Draft 7.
+    const jsonSchema = z.toJSONSchema(opts.zodSchema, { target: "draft-7" }) as object;
     const schemaStr = JSON.stringify(jsonSchema);
     const claudeUserPrompt = `${opts.userPrompt}\n\nRespond with ONLY a JSON object (no prose, no code fences) matching this schema:\n${schemaStr}`;
     let lastErr: unknown = null;
@@ -279,6 +280,14 @@ export async function completeStructured<TZod extends z.ZodTypeAny>(
     console.error(
       `internal-ai: getModel(${provider}, ${modelId}) threw (callerTag=${callerTag})`,
       err,
+    );
+    return null;
+  }
+
+  // Dynamic IDs can be absent even though the typed catalog overload is non-nullable.
+  if (!model) {
+    console.error(
+      scrubSecrets(`internal-ai: unknown model ${provider}/${modelId} (callerTag=${callerTag})`),
     );
     return null;
   }

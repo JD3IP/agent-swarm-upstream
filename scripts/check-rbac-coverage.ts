@@ -44,6 +44,7 @@ const REPO_ROOT = join(import.meta.dir, "..");
  * file importing one of these counts as gated.
  */
 const GATE_HELPER_SPECIFIERS = [
+  "realtime/auth", // Room tools enforce namespace access through the shared guard.
   "kv-write-auth", // kv-set / kv-delete / kv-incr shared write guard
   "task-tool-ctx", // assertOwnsTask → task.read.own / task.cancel.own / task.action.own
 ];
@@ -63,6 +64,19 @@ const UNGATED_TOOL_FILES: Record<string, string> = {
   "src/tools/create-metric.ts": PIN_REASON,
   "src/tools/create-page.ts": PIN_REASON,
   "src/tools/db-query.ts": PIN_REASON,
+  "src/tools/extension-delete.ts": "proxies to the extensions HTTP route enforcing extension.write",
+  "src/tools/extension-enable.ts":
+    "proxies to the extensions HTTP route enforcing extension.activate",
+  "src/tools/extension-disable.ts":
+    "proxies to the extensions HTTP route enforcing extension.activate",
+  "src/tools/extension-activate-version.ts":
+    "proxies to the extensions HTTP route enforcing extension.activate",
+  "src/tools/extension-catalog.ts":
+    "read-only proxy to GET /api/extensions/catalog, which is ungated like GET /api/extensions",
+  "src/tools/extension-install.ts":
+    "proxies to /api/extensions which enforces extension.write / GET is ungated",
+  "src/tools/extension-list.ts":
+    "proxies to /api/extensions which enforces extension.write / GET is ungated",
   "src/tools/get-metrics.ts": PIN_REASON,
   "src/tools/get-swarm.ts": PIN_REASON,
   "src/tools/join-swarm.ts": PIN_REASON,
@@ -72,7 +86,6 @@ const UNGATED_TOOL_FILES: Record<string, string> = {
   "src/tools/list-services.ts": PIN_REASON,
   "src/tools/mcp-servers/mcp-server-get.ts": PIN_REASON,
   "src/tools/mcp-servers/mcp-server-list.ts": PIN_REASON,
-  "src/tools/memory-edit.ts": PIN_REASON,
   "src/tools/memory-get.ts": PIN_REASON,
   "src/tools/memory-rate.ts": PIN_REASON,
   "src/tools/memory-search.ts": PIN_REASON,
@@ -280,7 +293,6 @@ const ROUTE_RBAC_BACKLOG: Record<string, string> = {
   "POST /api/mcp-bridge": BACKLOG_REASON,
   "POST /api/mcp-oauth/{mcpServerId}/manual-client": BACKLOG_REASON,
   "POST /api/mcp-oauth/{mcpServerId}/refresh": BACKLOG_REASON,
-  "POST /api/memory/edit": BACKLOG_REASON,
   "POST /api/memory/index": BACKLOG_REASON,
   "POST /api/memory/list": BACKLOG_REASON,
   "POST /api/memory/rate": BACKLOG_REASON,

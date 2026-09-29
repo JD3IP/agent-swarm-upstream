@@ -63,30 +63,30 @@ describe("selectRandomCredential", () => {
 describe("resolveCredentialPools", () => {
   it("resolves comma-separated CLAUDE_CODE_OAUTH_TOKEN", async () => {
     const env: Record<string, string | undefined> = {
-      CLAUDE_CODE_OAUTH_TOKEN: "token1,token2",
+      CLAUDE_CODE_OAUTH_TOKEN: "example-token1,example-token2",
       OTHER_VAR: "unchanged",
     };
     await resolveCredentialPools(env);
-    expect(["token1", "token2"]).toContain(env.CLAUDE_CODE_OAUTH_TOKEN!);
+    expect(["example-token1", "example-token2"]).toContain(env.CLAUDE_CODE_OAUTH_TOKEN!);
     expect(env.OTHER_VAR).toBe("unchanged");
   });
 
   it("resolves comma-separated ANTHROPIC_API_KEY", async () => {
     const env: Record<string, string | undefined> = {
-      ANTHROPIC_API_KEY: "key1,key2,key3",
+      ANTHROPIC_API_KEY: "example-key1,example-key2,example-key3",
     };
     await resolveCredentialPools(env);
-    expect(["key1", "key2", "key3"]).toContain(env.ANTHROPIC_API_KEY!);
+    expect(["example-key1", "example-key2", "example-key3"]).toContain(env.ANTHROPIC_API_KEY!);
   });
 
   it("leaves single values unchanged", async () => {
     const env: Record<string, string | undefined> = {
-      CLAUDE_CODE_OAUTH_TOKEN: "single-token",
-      ANTHROPIC_API_KEY: "single-key",
+      CLAUDE_CODE_OAUTH_TOKEN: "example-single-token",
+      ANTHROPIC_API_KEY: "example-single-key",
     };
     await resolveCredentialPools(env);
-    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("single-token");
-    expect(env.ANTHROPIC_API_KEY).toBe("single-key");
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("example-single-token");
+    expect(env.ANTHROPIC_API_KEY).toBe("example-single-key");
   });
 
   it("handles undefined credential vars", async () => {
@@ -99,32 +99,47 @@ describe("resolveCredentialPools", () => {
     expect(env.SOME_OTHER_VAR).toBe("value");
   });
 
+  it("keeps a CODEX_OAUTH JSON blob whole despite its commas", async () => {
+    const blob = JSON.stringify({
+      access: "access-token",
+      refresh: "refresh-token",
+      expires: 1_800_000_000_000,
+      accountId: "acct-12345",
+    });
+    const env: Record<string, string | undefined> = { CODEX_OAUTH: blob };
+    const selections = await resolveCredentialPools(env, { provider: "codex" });
+    expect(env.CODEX_OAUTH).toBe(blob);
+    expect(selections).toHaveLength(1);
+    expect(selections[0]?.total).toBe(1);
+    expect(selections[0]?.keySuffix).toBe(blob.slice(-5));
+  });
+
   it("resolves both credential vars independently", async () => {
     const env: Record<string, string | undefined> = {
-      CLAUDE_CODE_OAUTH_TOKEN: "oauth1,oauth2",
-      ANTHROPIC_API_KEY: "apikey1,apikey2",
+      CLAUDE_CODE_OAUTH_TOKEN: "example-oauth1,example-oauth2",
+      ANTHROPIC_API_KEY: "example-apikey1,example-apikey2",
     };
     await resolveCredentialPools(env);
-    expect(["oauth1", "oauth2"]).toContain(env.CLAUDE_CODE_OAUTH_TOKEN!);
-    expect(["apikey1", "apikey2"]).toContain(env.ANTHROPIC_API_KEY!);
+    expect(["example-oauth1", "example-oauth2"]).toContain(env.CLAUDE_CODE_OAUTH_TOKEN!);
+    expect(["example-apikey1", "example-apikey2"]).toContain(env.ANTHROPIC_API_KEY!);
   });
 });
 
 describe("validateClaudeCredentials", () => {
   it("returns 'oauth' when CLAUDE_CODE_OAUTH_TOKEN is set", () => {
-    const env = { CLAUDE_CODE_OAUTH_TOKEN: "some-oauth-token" };
+    const env = { CLAUDE_CODE_OAUTH_TOKEN: "example-some-oauth-token" };
     expect(validateClaudeCredentials(env)).toBe("oauth");
   });
 
   it("returns 'api_key' when only ANTHROPIC_API_KEY is set", () => {
-    const env = { ANTHROPIC_API_KEY: "sk-ant-123" };
+    const env = { ANTHROPIC_API_KEY: "example-sk-ant-123" };
     expect(validateClaudeCredentials(env)).toBe("api_key");
   });
 
   it("returns 'oauth' when both are set (oauth takes priority)", () => {
     const env = {
-      CLAUDE_CODE_OAUTH_TOKEN: "some-oauth-token",
-      ANTHROPIC_API_KEY: "sk-ant-123",
+      CLAUDE_CODE_OAUTH_TOKEN: "example-some-oauth-token",
+      ANTHROPIC_API_KEY: "example-sk-ant-123",
     };
     expect(validateClaudeCredentials(env)).toBe("oauth");
   });

@@ -81,7 +81,11 @@ const LEAD_ONLY_VERBS: PermissionVerb[] = [
   "script.api.delete",
 ];
 
+const OPERATOR_ONLY_VERBS: PermissionVerb[] = [];
+const LEAD_OR_OPERATOR_VERBS: PermissionVerb[] = ["extension.write", "extension.activate"];
+
 const LEAD_OR_RESOURCE_OWNER_VERBS: PermissionVerb[] = [
+  "memory.edit.any",
   "skill.update.any",
   "skill.delete.any",
   "mcp-server.delete.any",
@@ -170,6 +174,8 @@ describe("verb-group partition", () => {
       ...ANY_AUTHENTICATED_VERBS,
       ...REQUESTER_OWNS_TASK_VERBS,
       ...COMPOSITE_VERBS,
+      ...OPERATOR_ONLY_VERBS,
+      ...LEAD_OR_OPERATOR_VERBS,
     ];
     expect(new Set(grouped).size).toBe(grouped.length);
     expect(grouped.sort()).toEqual([...PERMISSION_VERBS].sort());
@@ -212,6 +218,72 @@ describe("lead-only verbs", () => {
     });
     expect(decision.allow).toBe(false);
     if (!decision.allow) expect(decision.reason).toBe("requires lead agent");
+  });
+});
+
+describe("operator-or-user verbs", () => {
+  const expected: Expected = {
+    lead: false,
+    worker: false,
+    ownerWorker: false,
+    creatorWorker: false,
+    userRequester: true,
+    foreignUser: true,
+    operator: true,
+  };
+  for (const verb of OPERATOR_ONLY_VERBS) {
+    test(`${verb}: operator or user allowed`, () => {
+      expectDecisions(verb, { kind: "none" }, expected);
+    });
+  }
+});
+
+describe("lead-or-operator-or-user verbs", () => {
+  const expected: Expected = {
+    lead: true,
+    worker: false,
+    ownerWorker: false,
+    creatorWorker: false,
+    userRequester: true,
+    foreignUser: true,
+    operator: true,
+  };
+  for (const verb of LEAD_OR_OPERATOR_VERBS) {
+    test(`${verb}: lead, operator, or user allowed`, () => {
+      expectDecisions(verb, { kind: "none" }, expected);
+    });
+  }
+});
+
+describe("extension ownership", () => {
+  test("workers create extensions and write only their own existing resource", () => {
+    const worker = { kind: "agent", agentId: "extension-owner", isLead: false } as const;
+    for (const resource of [
+      { kind: "extension" },
+      { kind: "extension", extensionId: "ext-1", createdByAgentId: worker.agentId },
+    ] as const) {
+      expect(
+        can({ principal: worker, verb: "extension.write", resource, source: "http" }).allow,
+      ).toBe(true);
+    }
+    for (const createdByAgentId of [null, "other-agent"]) {
+      expect(
+        can({
+          principal: worker,
+          verb: "extension.write",
+          resource: { kind: "extension", extensionId: "ext-1", createdByAgentId },
+          source: "http",
+        }).allow,
+      ).toBe(false);
+    }
+    expect(
+      can({
+        principal: { ...worker, agentId: "" },
+        verb: "extension.write",
+        resource: { kind: "extension" },
+        source: "http",
+      }).allow,
+    ).toBe(false);
   });
 });
 

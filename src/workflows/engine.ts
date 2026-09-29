@@ -1,3 +1,11 @@
+import { notifyAutomationPreflightFailure } from "../automation-preflight-alert";
+import {
+  getAutomationSetupStates,
+  preflightAutomation,
+  recordWorkflowPreflightFailure,
+  renderAutomationTokens,
+  workflowPreflightInput,
+} from "../be/automation-preflight";
 import {
   createWorkflowRun,
   createWorkflowRunStep,
@@ -12,8 +20,9 @@ import {
   updateWorkflowRunStep,
 } from "../be/db";
 import { telemetry } from "../telemetry";
-import type { Workflow, WorkflowDefinition, WorkflowNode } from "../types";
+import type { Workflow, WorkflowDefinition, WorkflowNode, WorkflowRunStep } from "../types";
 import { checkpointStep, checkpointStepFailure, checkpointStepWaiting } from "./checkpoint";
+import { loadCompletedStepRouting } from "./completed-step-routing";
 import { shouldSkipCooldown } from "./cooldown";
 import { findEntryNodes, getNextTargets, getSuccessors } from "./definition";
 import type { AsyncExecutorResult } from "./executors/base";
@@ -49,6 +58,18 @@ export class TriggerSchemaError extends Error {
   }
 }
 
+async function resolveRenderedWorkflowInputs(
+  input: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const stringInputs: Record<string, string> = {};
+  const resolved: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value === "string") stringInputs[key] = value;
+    else resolved[key] = value;
+  }
+  return { ...resolved, ...(await resolveInputs(stringInputs)) };
+}
+
 // ─── Public API ────────────────────────────────────────────
 
 /**
@@ -66,6 +87,27 @@ export async function startWorkflowExecution(
   registry: ExecutorRegistry,
   options: WorkflowExecutionOptions = {},
 ): Promise<string> {
+  const preflight = preflightAutomation(
+    workflowPreflightInput(workflow),
+    await getAutomationSetupStates(),
+  );
+  if (preflight.state === "needs_setup") {
+    const { runId, recorded } = await recordWorkflowPreflightFailure({
+      workflowId: workflow.id,
+      triggerType: options.triggerType ?? "manual",
+      triggerData,
+      failureReason: preflight.failureReason!,
+      createdBy: options.requestedByUserId,
+    });
+    if (recorded) await notifyAutomationPreflightFailure(preflight);
+    return runId;
+  }
+
+  // Templates can consume install params outside the graph definition (most
+  // importantly workflow.input). Render the complete runtime snapshot once;
+  // exact-token values retain their JSON type, including COMPETITORS arrays.
+  workflow = renderAutomationTokens(workflow, workflow.params ?? {});
+
   // Validate trigger data against triggerSchema (before any DB writes)
   if (workflow.triggerSchema) {
     const validationErrors = validateJsonSchema(workflow.triggerSchema, triggerData);
@@ -119,7 +161,7 @@ export async function startWorkflowExecution(
 
   if (workflow.input) {
     try {
-      const resolved = await resolveInputs(workflow.input);
+      const resolved = await resolveRenderedWorkflowInputs(workflow.input);
       Object.assign(ctx, { input: resolved });
     } catch (err) {
       await updateWorkflowRun(runId, {
@@ -156,6 +198,14 @@ interface StepResult {
   successors: WorkflowNode[];
 }
 
+// A run may have overlapping resume walks. Keep ownership until the last walk
+// settles, including checkpointing and routing between executor calls.
+const activeWalks = new Map<string, number>();
+
+export function isWorkflowRunActive(runId: string): boolean {
+  return activeWalks.has(runId);
+}
+
 /**
  * Event-loop style graph walker.
  *
@@ -164,6 +214,26 @@ interface StepResult {
  * predecessors), then executes the next batch. Repeats until done.
  */
 export async function walkGraph(
+  def: WorkflowDefinition,
+  runId: string,
+  ctx: Record<string, unknown>,
+  startNodes: WorkflowNode[],
+  registry: ExecutorRegistry,
+  workflowId?: string,
+  secretKeys: Set<string> = new Set(),
+  options: WorkflowExecutionOptions = {},
+): Promise<void> {
+  activeWalks.set(runId, (activeWalks.get(runId) ?? 0) + 1);
+  try {
+    await walkGraphOwned(def, runId, ctx, startNodes, registry, workflowId, secretKeys, options);
+  } finally {
+    const remaining = activeWalks.get(runId)! - 1;
+    if (remaining === 0) activeWalks.delete(runId);
+    else activeWalks.set(runId, remaining);
+  }
+}
+
+async function walkGraphOwned(
   def: WorkflowDefinition,
   runId: string,
   ctx: Record<string, unknown>,
@@ -189,49 +259,11 @@ export async function walkGraph(
   if (!("run" in ctx)) {
     ctx.run = { id: runId };
   }
-  const completedNodeIds = new Set(await getCompletedStepNodeIds(runId));
+  const { completedNodeIds } = await rehydrateCompletedStepOutputs(def, runId, ctx, registry);
 
   // Track active edges: "sourceId→targetId" — only edges on actually-taken
   // execution paths, not all structural edges in the definition.
-  const activeEdges = new Set<string>();
-
-  // For memoized re-walks, inject stored outputs into context and
-  // reconstruct active edges from completed steps' stored nextPort.
-  // Use the LATEST step per node to support loops (a node may have
-  // multiple completed steps from different iterations).
-  if (completedNodeIds.size > 0) {
-    for (const nodeId of completedNodeIds) {
-      // Synthetic foreach children persist their own step output for the join,
-      // but only the parent aggregate belongs in workflow context or routing.
-      if (resolveForeachParent(def, nodeId)) continue;
-
-      const step = await getLatestStepForNode(runId, nodeId);
-      if (step?.output !== undefined) {
-        // Bug 5 fix: Validate stored output against executor schema on recovery
-        const node = def.nodes.find((n) => n.id === nodeId);
-        if (node && registry.has(node.type)) {
-          const executor = registry.get(node.type);
-          const parseResult = executor.outputSchema.safeParse(step.output);
-          if (!parseResult.success) {
-            console.warn(
-              `[workflow] Recovery: step ${nodeId} output failed validation: ${parseResult.error.message}`,
-            );
-            continue; // Skip corrupted output
-          }
-        }
-        ctx[nodeId] = step.output;
-      }
-      // Reconstruct active edges from the stored nextPort.
-      // If nextPort is set, use it for port-specific routing.
-      // If not set, get all successors (fan-out).
-      const successors = step?.nextPort
-        ? getSuccessors(def, nodeId, step.nextPort)
-        : getSuccessors(def, nodeId);
-      for (const succ of successors) {
-        activeEdges.add(`${nodeId}→${succ.id}`);
-      }
-    }
-  }
+  const { activeEdges } = await loadCompletedStepRouting(def, runId, completedNodeIds);
 
   // Circuit breaker: fail the run if total steps exceed the per-run limit.
   // This prevents runaway workflows (e.g. infinite loop-backs) from consuming
@@ -422,6 +454,52 @@ export async function walkGraph(
 }
 
 /**
+ * Restore completed node outputs from their step checkpoints into workflow context.
+ * Every recovery path must do this before resolving a node's declared inputs.
+ */
+export async function rehydrateCompletedStepOutputs(
+  def: WorkflowDefinition,
+  runId: string,
+  ctx: Record<string, unknown>,
+  registry: ExecutorRegistry,
+): Promise<{
+  completedNodeIds: Set<string>;
+  latestSteps: Map<string, WorkflowRunStep>;
+}> {
+  const completedNodeIds = new Set(await getCompletedStepNodeIds(runId));
+  const latestSteps = new Map<string, WorkflowRunStep>();
+
+  for (const nodeId of completedNodeIds) {
+    // Synthetic foreach children persist their own step output for the join,
+    // but only the parent aggregate belongs in workflow context or routing.
+    if (resolveForeachParent(def, nodeId)) continue;
+
+    const step = await getLatestStepForNode(runId, nodeId);
+    if (!step) continue;
+
+    if (step.output !== undefined) {
+      // Validate stored output against the executor schema before recovery.
+      const node = def.nodes.find((candidate) => candidate.id === nodeId);
+      if (node && registry.has(node.type)) {
+        const executor = registry.get(node.type);
+        const parseResult = executor.outputSchema.safeParse(step.output);
+        if (!parseResult.success) {
+          console.warn(
+            `[workflow] Recovery: step ${nodeId} output failed validation: ${parseResult.error.message}`,
+          );
+          continue;
+        }
+      }
+      ctx[nodeId] = step.output;
+    }
+
+    latestSteps.set(nodeId, step);
+  }
+
+  return { completedNodeIds, latestSteps };
+}
+
+/**
  * Get all predecessor node IDs for a given node.
  * A predecessor is any node that references this node via its `next` field.
  */
@@ -464,6 +542,11 @@ async function executeStep(
   // concurrent executions of the same node instead of an orphan step row
   // committing before a follow-up key UPDATE throws.
   const dedup = await getDbClient().transaction(async () => {
+    const run = await getWorkflowRun(runId);
+    if (!run || (run.status !== "running" && run.status !== "waiting")) {
+      return { halted: true as const };
+    }
+
     // Count existing steps for this node to determine the current iteration.
     const iteration = await getStepCountForNode(runId, node.id);
     const idempotencyKey = `${runId}:${node.id}:${iteration}`;
@@ -503,6 +586,8 @@ async function executeStep(
     }
     return { existingStep, stepId, deduped: false };
   });
+
+  if ("halted" in dedup) return { outcome: "completed", successors: [] };
 
   if (dedup.deduped && dedup.existingStep) {
     if (dedup.existingStep.status === "completed") {
@@ -642,8 +727,8 @@ async function executeStep(
 
   // Check for async result
   if ("async" in result && (result as AsyncExecutorResult).async) {
-    await checkpointStepWaiting(runId, stepId, ctx);
-    return { outcome: "waiting", successors: [] };
+    const waiting = await checkpointStepWaiting(runId, stepId, ctx);
+    return { outcome: waiting ? "waiting" : "completed", successors: [] };
   }
 
   // 6b. Validate output against node-level outputSchema if defined
@@ -862,6 +947,25 @@ export function interpolateNodeConfig(
         body,
       },
       unresolved: [...configResult.unresolved, ...overResult.unresolved],
+    };
+  }
+
+  if (node.type === "human-in-the-loop" && typeof node.config.questions === "string") {
+    // Dynamic questions: an exact `{{token}}` injects the upstream array as-is
+    // (string interpolation would JSON-stringify it). The resolved value is
+    // display data, never re-interpolated; the executor validates it before
+    // creating the approval card. Static question arrays keep the default path.
+    const { questions, ...configWithoutQuestions } = node.config;
+    const configResult = deepInterpolate(configWithoutQuestions, interpolationCtx);
+    const questionsResult = deepInterpolate(questions, interpolationCtx, {
+      preserveRawTokens: true,
+    });
+    return {
+      value: {
+        ...(configResult.value as Record<string, unknown>),
+        questions: questionsResult.value,
+      },
+      unresolved: [...configResult.unresolved, ...questionsResult.unresolved],
     };
   }
 

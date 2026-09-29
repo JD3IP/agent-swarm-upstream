@@ -20,7 +20,10 @@ RUN bun install --frozen-lockfile
 
 # Copy source files
 COPY src/ ./src/
+COPY plugin/opencode-plugins/lib/memory-raters.ts ./plugin/opencode-plugins/lib/memory-raters.ts
 COPY templates/ ./templates/
+# Bundled into the binary by src/slack/manifest.ts (onboarding Slack step).
+COPY slack-manifest.json ./
 COPY tsconfig.json ./
 
 # Pre-bundle script runtime files into self-contained JS bundles.
@@ -42,7 +45,10 @@ RUN mkdir -p scripts-runtime script-workflows-runtime && \
       --outfile ./scripts-runtime/swarm-sdk.bundle.js && \
     bun build ./node_modules/zod/index.js \
       --target bun --no-splitting \
-      --outfile ./scripts-runtime/zod.bundle.js
+      --outfile ./scripts-runtime/zod.bundle.js && \
+    bun build ./src/extensions/contract-runtime.ts \
+      --target bun --no-splitting \
+      --outfile ./scripts-runtime/extensions-contract.bundle.js
 
 # Copy TypeScript lib .d.ts files for script typecheck in compiled binary mode.
 # The compiled binary embeds .js modules in /$bunfs/ but not .d.ts files, so
