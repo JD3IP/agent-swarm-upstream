@@ -1538,9 +1538,44 @@ export interface CodexOAuthCredentialInfo {
   isPoolBacked: boolean;
 }
 
+/**
+ * Per-agent Codex pool-slot policy, resolved from the worker's swarm_config env.
+ *
+ * - `CODEX_OAUTH_PINNED_SLOT` (agent scope): this agent draws ONLY that slot.
+ * - `CODEX_OAUTH_RESERVED_SLOTS` (global scope, comma-separated): slots that
+ *   unpinned agents must never draw. Together they dedicate one ChatGPT
+ *   account to one agent (e.g. the Lead) without a second pool.
+ *
+ * Malformed values are ignored with a warning rather than wedging the worker.
+ */
+export interface CodexSlotPolicy {
+  pinnedSlot?: number;
+  reservedSlots: number[];
+}
+
+export function parseCodexSlotPolicy(env: Record<string, string | undefined>): CodexSlotPolicy {
+  const parseSlot = (raw: string, name: string): number | undefined => {
+    const str = raw.trim();
+    if (!/^\d+$/.test(str)) {
+      console.warn(`[credentials] Ignoring invalid ${name} entry ${JSON.stringify(raw)}`);
+      return undefined;
+    }
+    return Number(str);
+  };
+  const pinnedRaw = env.CODEX_OAUTH_PINNED_SLOT?.trim();
+  const pinnedSlot = pinnedRaw ? parseSlot(pinnedRaw, "CODEX_OAUTH_PINNED_SLOT") : undefined;
+  const reservedSlots = (env.CODEX_OAUTH_RESERVED_SLOTS ?? "")
+    .split(",")
+    .filter((part) => part.trim() !== "")
+    .map((part) => parseSlot(part, "CODEX_OAUTH_RESERVED_SLOTS"))
+    .filter((n): n is number => n !== undefined);
+  return { pinnedSlot, reservedSlots };
+}
+
 export async function resolveCodexOAuthCredentialInfo(
   apiUrl?: string,
   apiKey?: string,
+  policy: CodexSlotPolicy = { reservedSlots: [] },
 ): Promise<CodexOAuthCredentialInfo | null> {
   // Pool path: enumerate slots from the config store, pick one with rate-limit
   // awareness, materialise auth.json for the selected slot.
@@ -1567,9 +1602,28 @@ export async function resolveCodexOAuthCredentialInfo(
           // Non-critical — fall through to random selection
         }
 
-        const allSlotIndices = slots.map((s) => s.slot);
+        // Slot policy: a pinned agent uses exactly its slot; everyone else
+        // draws from the pool minus the reserved (dedicated) slots.
+        const { pinnedSlot, reservedSlots } = policy;
+        const pinnedPresent = pinnedSlot !== undefined && slots.some((s) => s.slot === pinnedSlot);
+        if (pinnedSlot !== undefined && !pinnedPresent) {
+          console.warn(
+            `[credentials] CODEX_OAUTH_PINNED_SLOT=${pinnedSlot} has no credentials in the config store — falling back to the shared pool`,
+          );
+        }
+        const allSlotIndices = pinnedPresent
+          ? [pinnedSlot!]
+          : slots.map((s) => s.slot).filter((i) => !reservedSlots.includes(i));
+        if (allSlotIndices.length === 0) {
+          console.warn(
+            `[credentials] CODEX_OAUTH: every pool slot is reserved (${reservedSlots.join(",")}) and this agent is not pinned — no shared Codex credential available`,
+          );
+          return null;
+        }
         let selectedSlot: number;
-        if (availableIndices && availableIndices.length > 0) {
+        if (pinnedPresent) {
+          selectedSlot = pinnedSlot!;
+        } else if (availableIndices && availableIndices.length > 0) {
           const eligible = allSlotIndices.filter((i) => availableIndices!.includes(i));
           const pool = eligible.length > 0 ? eligible : allSlotIndices;
           selectedSlot = pool[Math.floor(Math.random() * pool.length)]!;
@@ -3295,7 +3349,11 @@ async function spawnProviderProcess(
   // `CodexOAuthCredentialInfo`).
   let oauthIsPoolBacked = false;
   if (adapter.name === "codex") {
-    const oauthInfo = await resolveCodexOAuthCredentialInfo(opts.apiUrl, opts.apiKey);
+    const oauthInfo = await resolveCodexOAuthCredentialInfo(
+      opts.apiUrl,
+      opts.apiKey,
+      parseCodexSlotPolicy(freshEnv),
+    );
     oauthSelection = oauthInfo?.selection;
     oauthIsPoolBacked = oauthInfo?.isPoolBacked ?? false;
     const oauthIsPrimary =
