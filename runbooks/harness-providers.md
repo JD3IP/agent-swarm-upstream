@@ -405,6 +405,17 @@ The adapter's actually-applied level flows back through `ProviderResult.appliedR
 
 Refs: [reasoning-effort runtime control research](../thoughts/taras/research/2026-05-26-agent-reasoning-effort-runtime-control.md).
 
+## Dedicating a Codex account to one agent (slot pinning)
+
+The Codex OAuth pool (`codex_oauth_<n>`) is shared: each task draws a random, non-rate-limited slot. To dedicate one ChatGPT account to one agent (for example the Lead on its own plan), use two `swarm_config` keys, resolved per agent like `MODEL_OVERRIDE`:
+
+| Key | Scope | Meaning |
+|---|---|---|
+| `CODEX_OAUTH_PINNED_SLOT` | agent | This agent draws ONLY that slot. A pinned slot with no stored credentials logs a warning and falls back to the shared (non-reserved) pool. |
+| `CODEX_OAUTH_RESERVED_SLOTS` | global, comma-separated | Slots unpinned agents never draw. If every slot is reserved, an unpinned agent gets no shared credential (fails closed). |
+
+Both are worker-side (`parseCodexSlotPolicy` + `resolveCodexOAuthCredentialInfo` in `src/commands/runner.ts`); the API needs no change, and a worker must run this code to honour the reservation. Malformed values are ignored with a warning. Tests: `src/tests/codex-oauth-slot-policy.test.ts`.
+
 ## pi-mono + Amazon Bedrock auth
 
 ### Mode selection
