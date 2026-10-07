@@ -1098,7 +1098,7 @@ export async function handleAgentsRest(
       return true;
     }
     const updated = await retireAgent(parsed.params.id);
-    retireAgentRoute.respond(res, 200, agentWithCapacity(updated as Agent));
+    retireAgentRoute.respond(res, 200, await agentWithCapacity(updated as Agent));
     return true;
   }
 
