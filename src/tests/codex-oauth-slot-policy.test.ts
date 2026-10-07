@@ -87,7 +87,10 @@ describe("parseCodexSlotPolicy", () => {
 
   it("ignores malformed entries instead of throwing", () => {
     expect(
-      parseCodexSlotPolicy({ CODEX_OAUTH_PINNED_SLOT: "lead", CODEX_OAUTH_RESERVED_SLOTS: "2,x,," }),
+      parseCodexSlotPolicy({
+        CODEX_OAUTH_PINNED_SLOT: "lead",
+        CODEX_OAUTH_RESERVED_SLOTS: "2,x,,",
+      }),
     ).toEqual({ pinnedSlot: undefined, reservedSlots: [2] });
   });
 });

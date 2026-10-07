@@ -520,7 +520,8 @@ const retireAgentRoute = route({
   method: "post",
   path: "/api/agents/{id}/retire",
   pattern: ["api", "agents", null, "retire"],
-  summary: "Tombstone (retire) an agent: role=retired, capabilities=[], status=offline. Never deletes any row.",
+  summary:
+    "Tombstone (retire) an agent: role=retired, capabilities=[], status=offline. Never deletes any row.",
   tags: ["Agents"],
   params: z.object({ id: z.string() }),
   rbac: { permission: "agent.retire.any" },
