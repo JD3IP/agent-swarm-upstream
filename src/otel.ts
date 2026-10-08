@@ -28,6 +28,18 @@ export interface SpanOptions {
 import type { SessionCostMetric } from "./otel-impl";
 export type { SessionCostMetric };
 
+export interface DbRetentionSweepMetric {
+  table: string;
+  dryRun: boolean;
+  outcome: "converged" | "budget_exhausted" | "error";
+  rowsDeleted: number;
+  backlogRemaining: number;
+  batches: number;
+  tableDurationMs: number;
+  slowestStatementMs: number;
+  batchSize: number;
+}
+
 /**
  * Whether OTLP export is configured.
  *
@@ -72,14 +84,28 @@ let realInjectTraceContext:
   | undefined;
 let realShutdown: (() => Promise<void>) | undefined;
 let realRecordSessionCost: ((m: SessionCostMetric) => void) | undefined;
+let realRecordDbRetentionSweep: ((m: DbRetentionSweepMetric) => void) | undefined;
+let realRecordDbRetentionStatement:
+  | ((table: string, dryRun: boolean, durationMs: number) => void)
+  | undefined;
+let realRecordSlackReactionInvalidName: ((event: string) => void) | undefined;
 
 export function isOtelEnabled(): boolean {
   return otelConfigured();
 }
 
-export function isPollTracingEnabled(): boolean {
-  const v = (process.env.OTEL_TRACE_POLL ?? "").trim().toLowerCase();
+function envFlagEnabled(name: string): boolean {
+  const v = (process.env[name] ?? "").trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+export function isPollTracingEnabled(): boolean {
+  return envFlagEnabled("OTEL_TRACE_POLL");
+}
+
+/** Mirror the API's console output to the OTLP collector as log records. Off by default. */
+export function isApiLogExportEnabled(): boolean {
+  return envFlagEnabled("OTEL_EXPORT_API_LOGS");
 }
 
 export async function initOtel(serviceRole = process.env.AGENT_ROLE || "api"): Promise<void> {
@@ -88,7 +114,9 @@ export async function initOtel(serviceRole = process.env.AGENT_ROLE || "api"): P
 
   try {
     const impl = await import("./otel-impl");
-    await impl.boot(serviceRole);
+    await impl.boot(serviceRole, {
+      exportConsoleLogs: serviceRole === "api" && isApiLogExportEnabled(),
+    });
     realWithSpan = impl.withSpan;
     realStartSpan = impl.startSpan;
     realWithRemoteContext = impl.withRemoteContext;
@@ -96,6 +124,9 @@ export async function initOtel(serviceRole = process.env.AGENT_ROLE || "api"): P
     realInjectTraceContext = impl.injectTraceContext;
     realShutdown = impl.shutdown;
     realRecordSessionCost = impl.recordSessionCost;
+    realRecordDbRetentionSweep = impl.recordDbRetentionSweep;
+    realRecordDbRetentionStatement = impl.recordDbRetentionStatement;
+    realRecordSlackReactionInvalidName = impl.recordSlackReactionInvalidName;
     console.log(`[OTel] enabled for ${impl.resolveServiceName(serviceRole)} (${serviceRole})`);
   } catch (error) {
     console.warn(`[OTel] disabled after initialization failure: ${error}`);
@@ -154,6 +185,25 @@ export function recordSessionCost(m: SessionCostMetric): void {
   realRecordSessionCost(m);
 }
 
+export function recordDbRetentionSweep(m: DbRetentionSweepMetric): void {
+  if (!otelConfigured() || !realRecordDbRetentionSweep) return;
+  realRecordDbRetentionSweep(m);
+}
+
+export function recordDbRetentionStatement(
+  table: string,
+  dryRun: boolean,
+  durationMs: number,
+): void {
+  if (!otelConfigured() || !realRecordDbRetentionStatement) return;
+  realRecordDbRetentionStatement(table, dryRun, durationMs);
+}
+
+export function recordSlackReactionInvalidName(event: string): void {
+  if (!otelConfigured() || !realRecordSlackReactionInvalidName) return;
+  realRecordSlackReactionInvalidName(event);
+}
+
 export function _resetOtelForTests() {
   initialized = false;
   realWithSpan = undefined;
@@ -163,4 +213,7 @@ export function _resetOtelForTests() {
   realInjectTraceContext = undefined;
   realShutdown = undefined;
   realRecordSessionCost = undefined;
+  realRecordDbRetentionSweep = undefined;
+  realRecordDbRetentionStatement = undefined;
+  realRecordSlackReactionInvalidName = undefined;
 }

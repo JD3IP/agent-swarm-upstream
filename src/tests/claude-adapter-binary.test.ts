@@ -17,15 +17,25 @@
  *      `projects[cwd].hasTrustDialogAccepted: true` to `$HOME/.claude.json`
  *      before spawning. Idempotent. No-op for "claude".
  *
- * `Bun.spawn` and the synchronous binary-version probe are stubbed so the
- * tests don't actually exec anything; we read the argv off the call args.
+ * `Bun.spawn` is stubbed so the tests don't actually exec anything; we read
+ * the session argv off the call args and ignore the binary-version probe.
  * `Bun.which` is stubbed for the tmux gate so the tests don't depend on the
  * host having tmux installed. `$HOME` is redirected to a tmp dir so the
  * trust-preseed never touches the real `~/.claude.json`.
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  rmdir,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -36,8 +46,12 @@ import {
   resolveClaudeBinary,
   resolveClaudeBinaryArgv,
   resolveClaudeBridgeEnabled,
+  resolveClaudeTrustDirs,
 } from "../providers/claude-adapter";
 import type { ProviderSessionConfig } from "../providers/types";
+import { setFlockForTests } from "../utils/file-lock";
+import { holdFileLock } from "./fixtures/hold-file-lock";
+import { CHILD_PROCESS_TEST_BUDGET_MS, expectChildOk, runChild } from "./test-proc";
 
 const LEGACY_BRIDGE_COMPAT_BINARY = "shan" + "non";
 const LEGACY_BRIDGE_COMPAT_PACKAGE = `@dexh/${LEGACY_BRIDGE_COMPAT_BINARY}`;
@@ -60,6 +74,74 @@ function makeConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSes
   };
 }
 
+// Bun's child_process shim calls Bun.spawn, so the spawn mocks below must pass
+// the trust-dir `git` lookup through to the real implementation.
+const realSpawn = Bun.spawn;
+const isGit = (cmd: unknown) =>
+  (Array.isArray(cmd) ? cmd : (cmd as { cmd?: unknown[] } | null)?.cmd)?.[0] === "git";
+
+// `git rev-parse --local-env-vars`. git exports GIT_DIR to a pre-push hook run
+// from a linked worktree; a fixture `git` child that inherits it acts on the
+// pushing repo (commits, worktrees, core.bare) instead of its temp dir.
+const REPO_LOCAL_GIT_ENV = [
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_GRAFT_FILE",
+  "GIT_INDEX_FILE",
+  "GIT_NO_REPLACE_OBJECTS",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_PREFIX",
+  "GIT_SHALLOW_FILE",
+  "GIT_COMMON_DIR",
+];
+
+/** Run a fixture `git` command with the repo-local git env stripped. */
+function runFixtureGit(args: string[]) {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of REPO_LOCAL_GIT_ENV) delete env[key];
+  return runChild(["git", ...args], { env });
+}
+
+async function setUpWorktreeFixture(repo: string, wt: string): Promise<void> {
+  for (const args of [
+    ["init", "-q"],
+    ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
+    ["worktree", "add", "-q", wt],
+  ]) {
+    expectChildOk(await runFixtureGit(["-C", repo, ...args]), `git ${args[0]}`);
+  }
+}
+
+async function setUpSeparateGitDirFixture(root: string, checkout: string, wt: string) {
+  await mkdir(checkout);
+  await mkdir(join(root, "metadata"));
+  expectChildOk(
+    await runFixtureGit([
+      "init",
+      "-q",
+      `--separate-git-dir=${join(root, "metadata", "repo.git")}`,
+      checkout,
+    ]),
+    "git init",
+  );
+  for (const args of [
+    ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
+    ["worktree", "add", "-q", wt],
+  ]) {
+    expectChildOk(await runFixtureGit(["-C", checkout, ...args]), `git ${args[0]}`);
+  }
+}
+
+async function setUpBareFixture(bare: string): Promise<void> {
+  expectChildOk(await runFixtureGit(["init", "-q", "--bare", bare]), "git init");
+}
+
 /** Fake Bun.Subprocess that behaves as a process that exited cleanly with no output. */
 function makeFakeProc(): ReturnType<typeof Bun.spawn> {
   return {
@@ -74,17 +156,6 @@ function makeFakeProc(): ReturnType<typeof Bun.spawn> {
     ref: () => {},
     unref: () => {},
   } as unknown as ReturnType<typeof Bun.spawn>;
-}
-
-/**
- * The adapter probes `<binary> --version` synchronously before it spawns the
- * session. Keep integration tests hermetic: a `bunx <package>` probe can do
- * package resolution and outlive Bun's per-test timeout under CI load.
- */
-function mockClaudeVersionProbe(): ReturnType<typeof spyOn> {
-  return spyOn(Bun, "spawnSync").mockImplementation((() => ({
-    success: false,
-  })) as typeof Bun.spawnSync);
 }
 
 async function createCompletedSession(adapter: ClaudeAdapter, config: ProviderSessionConfig) {
@@ -238,7 +309,7 @@ describe("SWARM_USE_CLAUDE_BRIDGE boolean parsing", () => {
 describe("resolveClaudeBinaryArgv — claude-bridge requires an OAuth token", () => {
   test("bridge requested + OAuth token present → routes to claude-bridge", () => {
     const r = resolveClaudeBinaryArgv(
-      { SWARM_USE_CLAUDE_BRIDGE: "true", CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-x" },
+      { SWARM_USE_CLAUDE_BRIDGE: "true", CLAUDE_CODE_OAUTH_TOKEN: "example-sk-ant-oat01-x" },
       {},
     );
     expect(r.useClaudeBridge).toBe(true);
@@ -248,7 +319,7 @@ describe("resolveClaudeBinaryArgv — claude-bridge requires an OAuth token", ()
 
   test("bridge requested + no OAuth (only API key) → falls back to stock claude", () => {
     const r = resolveClaudeBinaryArgv(
-      { SWARM_USE_CLAUDE_BRIDGE: "true", ANTHROPIC_API_KEY: "sk-ant-api" },
+      { SWARM_USE_CLAUDE_BRIDGE: "true", ANTHROPIC_API_KEY: "example-sk-ant-api" },
       {},
     );
     expect(r.useClaudeBridge).toBe(false);
@@ -265,7 +336,7 @@ describe("resolveClaudeBinaryArgv — claude-bridge requires an OAuth token", ()
   test("OAuth token from fallbackEnv (container env) also enables the bridge", () => {
     const r = resolveClaudeBinaryArgv(
       { SWARM_USE_CLAUDE_BRIDGE: "true" },
-      { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-fallback" },
+      { CLAUDE_CODE_OAUTH_TOKEN: "example-sk-ant-oat01-fallback" },
     );
     expect(r.useClaudeBridge).toBe(true);
     expect(r.bridgeRequestedWithoutOAuth).toBe(false);
@@ -281,7 +352,7 @@ describe("resolveClaudeBinaryArgv — claude-bridge requires an OAuth token", ()
   });
 
   test("bridge not requested → never flagged, stock claude", () => {
-    const r = resolveClaudeBinaryArgv({ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-x" }, {});
+    const r = resolveClaudeBinaryArgv({ CLAUDE_CODE_OAUTH_TOKEN: "example-sk-ant-oat01-x" }, {});
     expect(r.useClaudeBridge).toBe(false);
     expect(r.bridgeRequestedWithoutOAuth).toBe(false);
     expect(r.argv).toEqual(["claude"]);
@@ -301,7 +372,7 @@ describe("preseedClaudeTrustDialog", () => {
 
   test("creates ~/.claude.json with the cwd trusted when file is missing", async () => {
     const cwd = "/abs/cwd/x";
-    await preseedClaudeTrustDialog(cwd, homeDir);
+    await preseedClaudeTrustDialog([cwd], homeDir);
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects[cwd].hasTrustDialogAccepted).toBe(true);
@@ -317,7 +388,7 @@ describe("preseedClaudeTrustDialog", () => {
         unrelated: "value",
       }),
     );
-    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+    await preseedClaudeTrustDialog(["/abs/cwd/x"], homeDir);
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.hasCompletedOnboarding).toBe(true);
@@ -338,7 +409,7 @@ describe("preseedClaudeTrustDialog", () => {
         },
       }),
     );
-    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+    await preseedClaudeTrustDialog(["/abs/cwd/x"], homeDir);
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/other/project"]).toEqual({
@@ -358,19 +429,255 @@ describe("preseedClaudeTrustDialog", () => {
       }),
     );
     const beforeStat = await Bun.file(join(homeDir, ".claude.json")).text();
-    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+    await preseedClaudeTrustDialog(["/abs/cwd/x"], homeDir);
     const afterStat = await Bun.file(join(homeDir, ".claude.json")).text();
 
     // No-op → file contents unchanged.
     expect(afterStat).toBe(beforeStat);
   });
 
-  test("malformed file: starts from {} and writes the entry", async () => {
+  test("malformed file: backs it up, then writes the entry", async () => {
     await writeFile(join(homeDir, ".claude.json"), "{ this is not valid json");
-    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+    await preseedClaudeTrustDialog(["/abs/cwd/x"], homeDir);
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+    const backup = (await readdir(homeDir)).find((f) => f.includes(".malformed-"));
+    expect(backup).toBeDefined();
+    expect(await readFile(join(homeDir, backup as string), "utf-8")).toBe(
+      "{ this is not valid json",
+    );
+  });
+
+  test("scrubs secrets from the success and malformed-file log lines", async () => {
+    const secret = `ghp_${"a1B2c3D4e5".repeat(4).slice(0, 36)}`;
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await writeFile(join(homeDir, ".claude.json"), "{ not json");
+      await preseedClaudeTrustDialog([`/abs/${secret}`], homeDir);
+      const out = [...logSpy.mock.calls, ...warnSpy.mock.calls].flat().join("\n");
+      expect(out).toContain("Pre-seeded trust");
+      expect(out).toContain("unreadable");
+      expect(out).not.toContain(secret);
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  test(
+    "worktree: seeds the worktree and the main checkout",
+    async () => {
+      const repo = await realpath(await mkdtemp(join(tmpdir(), "claude-trust-repo-")));
+      const wt = join(repo, "..", `wt-${Date.now()}`);
+      try {
+        await setUpWorktreeFixture(repo, wt);
+        const dirs = await resolveClaudeTrustDirs(wt);
+        expect(dirs).toEqual([await realpath(wt), repo]);
+        await preseedClaudeTrustDialog(dirs, homeDir);
+        const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+        expect(Object.keys(data.projects).sort()).toEqual([...dirs].sort());
+      } finally {
+        await rm(wt, { recursive: true, force: true });
+        await rm(repo, { recursive: true, force: true });
+      }
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS,
+  );
+
+  test(
+    "separate-git-dir: seeds the checkout, not the metadata parent",
+    async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "claude-trust-sep-")));
+      try {
+        const checkout = join(root, "checkout");
+        const wt = join(root, "wt");
+        await setUpSeparateGitDirFixture(root, checkout, wt);
+        expect(await resolveClaudeTrustDirs(checkout)).toEqual([checkout]);
+        // The checkout is not discoverable from a linked worktree here; never fall back to metadata.
+        expect(await resolveClaudeTrustDirs(wt)).toEqual([wt]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS,
+  );
+
+  test(
+    "bare repository: no checkout is trusted beyond cwd",
+    async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "claude-trust-bare-")));
+      try {
+        const bare = join(root, "bare.git");
+        await setUpBareFixture(bare);
+        expect(await resolveClaudeTrustDirs(bare)).toEqual([bare]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS,
+  );
+
+  test(
+    "fixture git setup never touches the repo named by an inherited GIT_DIR",
+    async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "claude-trust-gitdir-")));
+      const sentinel = join(root, "sentinel");
+      const gitDir = join(sentinel, ".git");
+      const sentinelGit = (...args: string[]) => runFixtureGit(["--git-dir", gitDir, ...args]);
+      // A leaked GIT_WORK_TREE can turn `.git` into a gitfile; record that as a diff, not a throw.
+      const snapshot = async () => ({
+        head: (await sentinelGit("rev-parse", "HEAD")).stdout,
+        config: await readFile(join(gitDir, "config"), "utf-8").catch((e) => `<${e.code}>`),
+        worktrees: (await sentinelGit("worktree", "list", "--porcelain")).stdout,
+      });
+      const saved = Object.fromEntries(REPO_LOCAL_GIT_ENV.map((k) => [k, process.env[k]]));
+      const restoreEnv = () => {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      };
+      try {
+        await mkdir(sentinel);
+        await mkdir(join(root, "repo"));
+        await setUpWorktreeFixture(sentinel, join(root, "sentinel-wt"));
+        const before = await snapshot();
+        // What a pre-push hook run from a linked worktree hands its children.
+        process.env.GIT_DIR = gitDir;
+        let setupError: unknown;
+        try {
+          await setUpWorktreeFixture(join(root, "repo"), join(root, "wt"));
+          await setUpSeparateGitDirFixture(root, join(root, "checkout"), join(root, "sep-wt"));
+          await setUpBareFixture(join(root, "bare.git"));
+        } catch (err) {
+          setupError = err;
+        } finally {
+          restoreEnv();
+        }
+        // A leaked GIT_DIR can also fail a step, so compare the sentinel first.
+        expect(await snapshot()).toEqual(before);
+        if (setupError) throw setupError;
+      } finally {
+        restoreEnv();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS,
+  );
+
+  test("concurrent seeding keeps every entry and unrelated keys", async () => {
+    await writeFile(
+      join(homeDir, ".claude.json"),
+      JSON.stringify({ theme: "dark", projects: { "/kept": { custom: 1 } } }),
+    );
+    const dirs = Array.from({ length: 8 }, (_, i) => `/concurrent/${i}`);
+    await Promise.all(dirs.map((d) => preseedClaudeTrustDialog([d], homeDir)));
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.theme).toBe("dark");
+    expect(data.projects["/kept"]).toEqual({ custom: 1 });
+    for (const d of dirs) expect(data.projects[d].hasTrustDialogAccepted).toBe(true);
+    const leftovers = (await readdir(homeDir)).filter(
+      (f) => f.endsWith(".tmp") || f.endsWith(".lock"),
+    );
+    expect(leftovers).toEqual([]);
+  });
+
+  test("waits for a fresh held lock until it is released", async () => {
+    const lock = join(homeDir, ".claude.json.lock");
+    await mkdir(lock);
+    let done = false;
+    const seeding = preseedClaudeTrustDialog(["/after/held"], homeDir).then(() => {
+      done = true;
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(done).toBe(false);
+    await rmdir(lock);
+    await seeding;
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/after/held"].hasTrustDialogAccepted).toBe(true);
+  });
+
+  test("clears a stale lock", async () => {
+    const lock = join(homeDir, ".claude.json.lock");
+    await mkdir(lock);
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lock, old, old);
+    await preseedClaudeTrustDialog(["/after/stale"], homeDir);
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/after/stale"].hasTrustDialogAccepted).toBe(true);
+  });
+
+  test("a suspended owner whose mkdir lock aged out keeps exclusion", async () => {
+    // Owner A holds the flock and its mkdir lock has expired (as if A was
+    // suspended past the lease). B must not enter until A finishes: otherwise
+    // A's late commit of an older snapshot would erase B's entry.
+    const releaseA = await holdFileLock(join(homeDir, ".claude.json.swarm-lock"));
+    const lock = join(homeDir, ".claude.json.lock");
+    await mkdir(lock);
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lock, old, old);
+
+    let bDone = false;
+    const b = preseedClaudeTrustDialog(["/b"], homeDir).then(() => {
+      bDone = true;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(bDone).toBe(false);
+    await expect(readFile(join(homeDir, ".claude.json"), "utf-8")).rejects.toThrow();
+
+    // A resumes and commits its snapshot, then releases both locks.
+    await writeFile(
+      join(homeDir, ".claude.json"),
+      JSON.stringify({ projects: { "/a": { hasTrustDialogAccepted: true } } }),
+    );
+    await rmdir(lock);
+    await releaseA();
+    await b;
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/a"].hasTrustDialogAccepted).toBe(true);
+    expect(data.projects["/b"].hasTrustDialogAccepted).toBe(true);
+    expect(await readdir(homeDir)).toEqual([".claude.json", ".claude.json.swarm-lock"]);
+  });
+
+  test("many writers on an expired mkdir lock keep every entry of every round", async () => {
+    const all: string[] = [];
+    for (let round = 0; round < 5; round++) {
+      const lock = join(homeDir, ".claude.json.lock");
+      await mkdir(lock);
+      const old = new Date(Date.now() - 60_000);
+      await utimes(lock, old, old);
+      const dirs = Array.from({ length: 6 }, (_, i) => `/round${round}/${i}`);
+      all.push(...dirs);
+      await Promise.all(dirs.map((d) => preseedClaudeTrustDialog([d], homeDir)));
+      const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+      for (const d of all) expect(data.projects[d].hasTrustDialogAccepted).toBe(true);
+    }
+    expect((await readdir(homeDir)).sort()).toEqual([".claude.json", ".claude.json.swarm-lock"]);
+  });
+
+  test("without flock it fails closed and writes nothing", async () => {
+    setFlockForTests(null);
+    try {
+      await expect(preseedClaudeTrustDialog(["/noflock"], homeDir)).rejects.toThrow(
+        /flock unavailable/,
+      );
+    } finally {
+      setFlockForTests(undefined);
+    }
+    expect(await Bun.file(join(homeDir, ".claude.json")).exists()).toBe(false);
+  });
+
+  test("an unopenable lock file fails closed", async () => {
+    await mkdir(join(homeDir, ".claude.json.swarm-lock"));
+    await expect(preseedClaudeTrustDialog(["/nolockfile"], homeDir)).rejects.toThrow(/cannot open/);
+    expect(await Bun.file(join(homeDir, ".claude.json")).exists()).toBe(false);
+  });
+
+  test("non-repo cwd: only its real path", async () => {
+    expect(await resolveClaudeTrustDirs(homeDir)).toEqual([await realpath(homeDir)]);
   });
 });
 
@@ -378,18 +685,20 @@ describe("preseedClaudeTrustDialog", () => {
 
 describe("CLAUDE_BINARY env override", () => {
   // Cache the originals and restore after each test so the suite stays clean.
+  let originalClaudeTransport: string | undefined;
   let originalClaudeBinary: string | undefined;
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
   let originalHome: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
-  let spawnSyncSpy: ReturnType<typeof spyOn>;
   let whichSpy: ReturnType<typeof spyOn>;
   let spawnedArgs: Array<readonly string[]>;
   let spawnedEnvs: Array<Record<string, string> | undefined>;
 
   beforeEach(async () => {
+    originalClaudeTransport = process.env.CLAUDE_TRANSPORT;
+    delete process.env.CLAUDE_TRANSPORT;
     originalClaudeBinary = process.env.CLAUDE_BINARY;
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -400,16 +709,18 @@ describe("CLAUDE_BINARY env override", () => {
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
     delete process.env.CLAUDE_QUEUE_STEERING;
     // Credential check runs before binary resolution; satisfy it.
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "example-test-token";
 
     spawnedArgs = [];
     spawnedEnvs = [];
     spawnSpy = spyOn(Bun, "spawn").mockImplementation(((cmd: readonly string[], opts?: unknown) => {
-      spawnedArgs.push(cmd);
-      spawnedEnvs.push((opts as { env?: Record<string, string> } | undefined)?.env);
+      if (isGit(cmd)) return (realSpawn as (...a: unknown[]) => unknown)(cmd, opts);
+      if (cmd.at(-1) !== "--version") {
+        spawnedArgs.push(cmd);
+        spawnedEnvs.push((opts as { env?: Record<string, string> } | undefined)?.env);
+      }
       return makeFakeProc();
     }) as typeof Bun.spawn);
-    spawnSyncSpy = mockClaudeVersionProbe();
 
     // Default: pretend tmux IS on PATH so non-tmux-gate tests don't trip.
     whichSpy = spyOn(Bun, "which").mockImplementation((name: string) => {
@@ -420,13 +731,17 @@ describe("CLAUDE_BINARY env override", () => {
 
   afterEach(async () => {
     spawnSpy.mockRestore();
-    spawnSyncSpy.mockRestore();
     whichSpy.mockRestore();
     await rm(homeDir, { recursive: true, force: true });
     if (originalHome === undefined) {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalClaudeTransport === undefined) {
+      delete process.env.CLAUDE_TRANSPORT;
+    } else {
+      process.env.CLAUDE_TRANSPORT = originalClaudeTransport;
     }
     if (originalClaudeBinary === undefined) {
       delete process.env.CLAUDE_BINARY;
@@ -542,7 +857,7 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           CLAUDE_BINARY: LEGACY_BRIDGE_COMPAT_BINARY,
-          CLAUDE_CODE_OAUTH_TOKEN: "test-token",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-test-token",
         } as Record<string, string>,
       }),
     );
@@ -559,7 +874,7 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           CLAUDE_BINARY: LEGACY_BRIDGE_COMPAT_COMMAND,
-          CLAUDE_CODE_OAUTH_TOKEN: "test-token",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-test-token",
         } as Record<string, string>,
       }),
     );
@@ -576,7 +891,7 @@ describe("CLAUDE_BINARY env override", () => {
       adapter,
       makeConfig({
         // env has CLAUDE_CODE_OAUTH_TOKEN but no CLAUDE_BINARY → process.env wins.
-        env: { CLAUDE_CODE_OAUTH_TOKEN: "test-token" } as Record<string, string>,
+        env: { CLAUDE_CODE_OAUTH_TOKEN: "example-test-token" } as Record<string, string>,
       }),
     );
 
@@ -602,7 +917,7 @@ describe("CLAUDE_BINARY env override", () => {
     await createCompletedSession(adapter, makeConfig());
 
     expect(spawnedArgs[0][0]).toBe("claude-bridge");
-    expect(spawnedEnvs[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBe("test-token");
+    expect(spawnedEnvs[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBe("example-test-token");
   });
 
   test("SWARM_USE_CLAUDE_BRIDGE=true forwards Anthropic local auth through bridge flag", async () => {
@@ -612,14 +927,14 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           SWARM_USE_CLAUDE_BRIDGE: "true",
-          ANTHROPIC_API_KEY: "sk-ant-test",
+          ANTHROPIC_API_KEY: "example-sk-ant-test",
         } as Record<string, string>,
       }),
     );
 
     expect(spawnedArgs[0][0]).toBe("claude-bridge");
     expect(spawnedArgs[0]).toContain("--desplega-local-auth");
-    expect(spawnedEnvs[0]?.ANTHROPIC_API_KEY).toBe("sk-ant-test");
+    expect(spawnedEnvs[0]?.ANTHROPIC_API_KEY).toBe("example-sk-ant-test");
     expect(spawnedEnvs[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
   });
 
@@ -642,7 +957,7 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           SWARM_USE_CLAUDE_BRIDGE: "true",
-          CLAUDE_CODE_OAUTH_TOKEN: "test-token",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-test-token",
         } as Record<string, string>,
       }),
     );
@@ -659,7 +974,7 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           SWARM_USE_CLAUDE_BRIDGE: "false",
-          CLAUDE_CODE_OAUTH_TOKEN: "test-token",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-test-token",
         } as Record<string, string>,
       }),
     );
@@ -670,7 +985,7 @@ describe("CLAUDE_BINARY env override", () => {
   test("SWARM_USE_CLAUDE_BRIDGE=true without OAuth token falls back to stock claude", async () => {
     const origApiKey = process.env.ANTHROPIC_API_KEY;
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+    process.env.ANTHROPIC_API_KEY = "example-sk-ant-test";
     process.env.SWARM_USE_CLAUDE_BRIDGE = "true";
     try {
       const adapter = new ClaudeAdapter();
@@ -689,16 +1004,18 @@ describe("CLAUDE_BINARY env override", () => {
 });
 
 describe("Claude Bridge tmux fail-fast gate", () => {
+  let originalClaudeTransport: string | undefined;
   let originalClaudeBinary: string | undefined;
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
   let originalHome: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
-  let spawnSyncSpy: ReturnType<typeof spyOn>;
   let whichSpy: ReturnType<typeof spyOn>;
 
   beforeEach(async () => {
+    originalClaudeTransport = process.env.CLAUDE_TRANSPORT;
+    delete process.env.CLAUDE_TRANSPORT;
     originalClaudeBinary = process.env.CLAUDE_BINARY;
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -707,21 +1024,27 @@ describe("Claude Bridge tmux fail-fast gate", () => {
     process.env.HOME = homeDir;
     delete process.env.CLAUDE_BINARY;
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
-    spawnSpy = spyOn(Bun, "spawn").mockImplementation((() => makeFakeProc()) as typeof Bun.spawn);
-    spawnSyncSpy = mockClaudeVersionProbe();
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "example-test-token";
+    spawnSpy = spyOn(Bun, "spawn").mockImplementation(((cmd: unknown, opts?: unknown) =>
+      isGit(cmd)
+        ? (realSpawn as (...a: unknown[]) => unknown)(cmd, opts)
+        : makeFakeProc()) as typeof Bun.spawn);
     whichSpy = spyOn(Bun, "which");
   });
 
   afterEach(async () => {
     spawnSpy.mockRestore();
-    spawnSyncSpy.mockRestore();
     whichSpy.mockRestore();
     await rm(homeDir, { recursive: true, force: true });
     if (originalHome === undefined) {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalClaudeTransport === undefined) {
+      delete process.env.CLAUDE_TRANSPORT;
+    } else {
+      process.env.CLAUDE_TRANSPORT = originalClaudeTransport;
     }
     if (originalClaudeBinary === undefined) {
       delete process.env.CLAUDE_BINARY;
@@ -809,16 +1132,18 @@ describe("Claude Bridge tmux fail-fast gate", () => {
 });
 
 describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
+  let originalClaudeTransport: string | undefined;
   let originalClaudeBinary: string | undefined;
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
   let originalHome: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
-  let spawnSyncSpy: ReturnType<typeof spyOn>;
   let whichSpy: ReturnType<typeof spyOn>;
 
   beforeEach(async () => {
+    originalClaudeTransport = process.env.CLAUDE_TRANSPORT;
+    delete process.env.CLAUDE_TRANSPORT;
     originalClaudeBinary = process.env.CLAUDE_BINARY;
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -827,9 +1152,11 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     process.env.HOME = homeDir;
     delete process.env.CLAUDE_BINARY;
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
-    spawnSpy = spyOn(Bun, "spawn").mockImplementation((() => makeFakeProc()) as typeof Bun.spawn);
-    spawnSyncSpy = mockClaudeVersionProbe();
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "example-test-token";
+    spawnSpy = spyOn(Bun, "spawn").mockImplementation(((cmd: unknown, opts?: unknown) =>
+      isGit(cmd)
+        ? (realSpawn as (...a: unknown[]) => unknown)(cmd, opts)
+        : makeFakeProc()) as typeof Bun.spawn);
     whichSpy = spyOn(Bun, "which").mockImplementation((name: string) => {
       if (name === "tmux") return "/usr/bin/tmux";
       return null;
@@ -838,13 +1165,17 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
 
   afterEach(async () => {
     spawnSpy.mockRestore();
-    spawnSyncSpy.mockRestore();
     whichSpy.mockRestore();
     await rm(homeDir, { recursive: true, force: true });
     if (originalHome === undefined) {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalClaudeTransport === undefined) {
+      delete process.env.CLAUDE_TRANSPORT;
+    } else {
+      process.env.CLAUDE_TRANSPORT = originalClaudeTransport;
     }
     if (originalClaudeBinary === undefined) {
       delete process.env.CLAUDE_BINARY;
@@ -872,6 +1203,27 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects[cwd].hasTrustDialogAccepted).toBe(true);
     expect(data.projects[cwd].hasCompletedProjectOnboarding).toBe(true);
+  });
+
+  test("headless (no bridge) session also seeds trust", async () => {
+    const cwd = "/some/headless/cwd";
+    await createCompletedSession(new ClaudeAdapter(), makeConfig({ cwd }));
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects[cwd].hasTrustDialogAccepted).toBe(true);
+  });
+
+  test("CLAUDE_TRUST_PRESEED=false writes nothing", async () => {
+    const cwd = "/some/off/cwd";
+    await createCompletedSession(
+      new ClaudeAdapter(),
+      makeConfig({
+        cwd,
+        env: { CLAUDE_CODE_OAUTH_TOKEN: "example-test-token", CLAUDE_TRUST_PRESEED: "false" },
+      }),
+    );
+
+    expect(await Bun.file(join(homeDir, ".claude.json")).exists()).toBe(false);
   });
 
   test("legacy CLAUDE_BINARY command string also triggers the pre-seed", async () => {
@@ -911,16 +1263,6 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/other/cwd"]).toEqual({ hasTrustDialogAccepted: true, custom: 1 });
     expect(data.projects["/new/cwd"].hasTrustDialogAccepted).toBe(true);
-  });
-
-  test("default CLAUDE_BINARY=claude does NOT touch ~/.claude.json", async () => {
-    delete process.env.CLAUDE_BINARY;
-    const adapter = new ClaudeAdapter();
-    await createCompletedSession(adapter, makeConfig({ cwd: "/some/abs/cwd" }));
-
-    // No .claude.json should have been written.
-    const exists = await Bun.file(join(homeDir, ".claude.json")).exists();
-    expect(exists).toBe(false);
   });
 
   test("SWARM_USE_CLAUDE_BRIDGE=true writes hasTrustDialogAccepted for config.cwd", async () => {

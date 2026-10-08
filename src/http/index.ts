@@ -4,12 +4,19 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { ensure, initialize } from "@desplega.ai/business-use";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { getEnabledCapabilities, hasCapability } from "@/server";
 import { initAgentMail } from "../agentmail";
-import { closeDb, getSwarmConfigs, upsertSwarmConfig } from "../be/db";
+import { initAzureDevOps } from "../azure-devops";
+import { drainApi, isApiDraining } from "../be/api-drain";
+import {
+  closeDb,
+  emitBuiltInIntegrationConnectedOnce,
+  getSwarmConfigs,
+  upsertSwarmConfig,
+} from "../be/db";
 import { startDbRetention, stopDbRetention } from "../be/db-retention";
+import { startHumanFreeDrain, stopHumanFreeDrain } from "../be/human-free-drain";
 import {
   enqueueAuditRow,
   flushAuditBuffer,
@@ -20,6 +27,11 @@ import {
 } from "../be/rbac-audit";
 import { startScratchScriptGc, stopScratchScriptGc } from "../be/scripts/retention";
 import { seedLegacyCapabilitiesConfig } from "../be/seed-capabilities";
+import {
+  loadEnabledExtensions,
+  setExtensionLoopbackBaseUrl,
+  stopExtensionRuntime,
+} from "../extensions/lifecycle";
 import { initGitHub } from "../github";
 import { initGitLab } from "../gitlab";
 import { stopHeartbeat } from "../heartbeat";
@@ -34,11 +46,17 @@ import {
 } from "../otel";
 import { startQueueStallAlarm, stopQueueStallAlarm } from "../queue-stall-alarm";
 import { clearAuditSink, isRbacEnabled, setAuditSink } from "../rbac";
+import { realtimeBus } from "../realtime/bus";
+import { closeRooms, removeNamespaceRooms, sweepRooms } from "../realtime/rooms";
+import { attachRealtimeTransport } from "../realtime/transport";
 import { startScriptRunSupervisor, stopScriptRunSupervisor } from "../script-workflows/supervisor";
 import { getServerSessionsProcessed } from "../server-runtime-counters";
 import { startSlackApp, stopSlackApp } from "../slack";
 import { initTelemetry, telemetry } from "../telemetry";
+import { startTelemetryTicker } from "../telemetry-snapshot";
+import { API_DRAINING_HEADER } from "../utils/api-drain";
 import { getApiKey } from "../utils/api-key";
+import { ensure, initialize } from "../utils/business-use";
 import { getMcpBaseUrl } from "../utils/constants";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { scrubSecrets } from "../utils/secret-scrubber";
@@ -50,13 +68,16 @@ import { handleApprovalRequests } from "./approval-requests";
 import { handleApps } from "./apps";
 import { handleAssets } from "./assets";
 import { handleBudgets } from "./budgets";
+import { handleCodexOAuthDevice } from "./codex-oauth-device";
 import { handleCodexOAuthKeepWarm } from "./codex-oauth-keep-warm";
+import { handleComb } from "./comb";
 import { handleConfig } from "./config";
 import { handleContext } from "./context";
 import { handleCore, loadGlobalConfigsIntoEnv } from "./core";
 import { handleDbQuery } from "./db-query";
 import { handleEcosystem } from "./ecosystem";
 import { handleEvents } from "./events";
+import { handleExtensions } from "./extensions";
 import { handleFavorites } from "./favorites";
 import { handleFs } from "./fs";
 import { handleHeartbeat } from "./heartbeat";
@@ -80,13 +101,16 @@ import { handleModelsCatalog } from "./models-catalog";
 import { handleOAuthCallback, startOAuthPendingGc, stopOAuthPendingGc } from "./oauth-callback";
 import { handleGenericOAuth } from "./oauth-generic";
 import { handleOAuthLocks } from "./oauth-locks";
+import { handleOnboarding } from "./onboarding";
 import { handlePageProxy } from "./page-proxy";
 import { handlePages } from "./pages";
 import { handlePagesPublic } from "./pages-public";
 import { handlePoll } from "./poll";
 import { handlePricing } from "./pricing";
 import { handlePromptTemplates } from "./prompt-templates";
+import { handleRealtimeAsset, handleRealtimeTicket } from "./realtime";
 import { handleRepos } from "./repos";
+import { handleRooms } from "./rooms";
 import { describeRequestRoute } from "./route-def";
 import { handleSchedules } from "./schedules";
 import { handleScriptConnectionProxy } from "./script-connection-proxy";
@@ -108,7 +132,9 @@ import {
   parseQueryParams,
   safeRequestUrlForLog,
   setCorsHeaders,
+  warnIfCorsAllowsAnyOrigin,
   wireHttpSpanLifecycle,
+  writeUnhandledError,
 } from "./utils";
 import { handleWebhooks } from "./webhooks";
 import { handleWorkflowEvents } from "./workflow-events";
@@ -139,6 +165,8 @@ const globalState = globalThis as typeof globalThis & {
   __sigintRegistered?: boolean;
   __apiGcInterval?: ReturnType<typeof setInterval>;
   __runId?: string;
+  __closeRealtime?: () => void;
+  __stopExtensions?: () => Promise<void>;
 };
 
 const API_GC_INTERVAL_MS = 5 * 60 * 1000;
@@ -174,6 +202,9 @@ function startApiGcInterval() {
   }
 
   const interval = setInterval(() => {
+    void sweepRooms().catch((error) =>
+      console.error("[rooms] Sweep failed:", scrubSecrets(String(error))),
+    );
     const closedOwnerTransports = closeIdleMcpTransports(transports, transportActivity, {
       idleTimeoutMs: MCP_TRANSPORT_IDLE_TIMEOUT_MS,
       label: "MCP",
@@ -200,6 +231,8 @@ function startApiGcInterval() {
 
 // Clean up previous server on hot reload
 if (globalState.__httpServer) {
+  globalState.__closeRealtime?.();
+  await globalState.__stopExtensions?.();
   console.log("[HTTP] Hot reload detected, closing previous server...");
   globalState.__httpServer.close();
 }
@@ -290,6 +323,8 @@ const httpServer = createHttpServer(async (req, res) => {
     // nest under it instead of attaching to the root with no parent.
     const handleRequest = async () => {
       setCorsHeaders(req, res);
+      // Tells polling workers to hand off in-flight tasks while this API still serves.
+      if (isApiDraining()) res.setHeader(API_DRAINING_HEADER, "1");
 
       const queryParams = parseQueryParams(req.url || "");
       const myAgentId = req.headers["x-agent-id"] as string | undefined;
@@ -309,6 +344,8 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleTasks(req, res, pathSegments, queryParams, myAgentId),
         () => handleStats(req, res, pathSegments, queryParams, myAgentId),
         () => handleStatus(req, res, pathSegments, queryParams),
+        () => handleOnboarding(req, res, pathSegments, queryParams),
+        () => handleCodexOAuthDevice(req, res, pathSegments, queryParams),
         () => handleActiveSessions(req, res, pathSegments, queryParams, myAgentId),
         () => handlePricing(req, res, pathSegments, queryParams, myAgentId),
         () => handleSchedules(req, res, pathSegments, queryParams, myAgentId),
@@ -318,13 +355,17 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleApps(req, res, pathSegments, queryParams, myAgentId),
         () => handleConfig(req, res, pathSegments, queryParams),
         () => handleFs(req, res, pathSegments, queryParams, myAgentId),
+        () => handleComb(req, res, pathSegments, queryParams, myAgentId),
         () => handleKv(req, res, pathSegments, queryParams),
-        () => handleIntegrations(req, res, pathSegments),
+        () => handleRooms(req, res, pathSegments, queryParams),
+        () => handleRealtimeTicket(req, res, pathSegments, queryParams),
+        () => handleRealtimeAsset(req, res),
+        () => handleIntegrations(req, res, pathSegments, queryParams),
         () => handlePromptTemplates(req, res, pathSegments, queryParams),
         () => handleDbQuery(req, res, pathSegments, queryParams),
         () => handleMetrics(req, res, pathSegments, queryParams, myAgentId),
         () => handleModelsCatalog(req, res, pathSegments, queryParams),
-        () => handleRepos(req, res, pathSegments, queryParams),
+        () => handleRepos(req, res, pathSegments, queryParams, myAgentId),
         () => handleSkills(req, res, pathSegments, queryParams, myAgentId),
         () => handleScriptConnections(req, res, pathSegments, queryParams, myAgentId),
         () => handleScriptConnectionProxy(req, res, pathSegments, queryParams, myAgentId),
@@ -345,6 +386,7 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleApiKeys(req, res, pathSegments, queryParams),
         () => handleHeartbeat(req, res, pathSegments),
         () => handleEvents(req, res, pathSegments, queryParams, myAgentId),
+        () => handleExtensions(req, res, pathSegments, queryParams, myAgentId),
         () => handleFavorites(req, res, pathSegments, queryParams, myAgentId),
         () => handleUsers(req, res, pathSegments, queryParams),
         () => handleSessions(req, res, pathSegments, queryParams),
@@ -374,16 +416,7 @@ const httpServer = createHttpServer(async (req, res) => {
           span.recordException(err);
           span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
         }
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          `[HTTP] ❌ ${req.method} ${safeRequestUrlForLog(req.url)} → ${scrubSecrets(message)}`,
-        );
-        if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: message }));
-        } else if (!res.writableEnded) {
-          res.end();
-        }
+        writeUnhandledError(res, err, req);
       }
     };
 
@@ -396,6 +429,16 @@ const httpServer = createHttpServer(async (req, res) => {
 });
 
 // Store references in globalThis for hot reload persistence
+const detachRealtime = attachRealtimeTransport(httpServer);
+const stopRoomDeletion = realtimeBus.subscribe("room:namespace-deleted", (namespace) => {
+  void Promise.resolve(removeNamespaceRooms(String(namespace))).catch((error) =>
+    console.error("[rooms] Deletion failed:", scrubSecrets(String(error))),
+  );
+});
+globalState.__closeRealtime = () => {
+  detachRealtime();
+  stopRoomDeletion();
+};
 globalState.__httpServer = httpServer;
 globalState.__transports = transports;
 globalState.__transportsUser = transportsUser;
@@ -403,8 +446,10 @@ globalState.__mcpSessionAgents = mcpSessionAgents;
 globalState.__sessionUsers = sessionUsers;
 globalState.__transportActivity = transportActivity;
 globalState.__transportActivityUser = transportActivityUser;
+globalState.__stopExtensions = stopExtensionRuntime;
 
 async function shutdown() {
+  globalState.__closeRealtime?.();
   console.log("Shutting down HTTP server...");
   telemetry.server("shutdown", {
     signal: shutdownSignal,
@@ -423,6 +468,10 @@ async function shutdown() {
 
   // Stop the out-of-band queue alarm before disconnecting its Slack notifier.
   stopQueueStallAlarm();
+
+  // Dispatch has stopped. Keep serving, bounded, while workers hand off their
+  // in-flight tasks; new work waits for the next API (see src/be/api-drain.ts).
+  await drainApi();
 
   // Stop durable script workflow subprocesses
   await stopScriptRunSupervisor();
@@ -445,8 +494,13 @@ async function shutdown() {
   // Stop opt-in session, agent-log, and event retention before closing SQLite.
   await stopDbRetention();
 
+  // Stop the human-free reclassification drain before closing SQLite.
+  stopHumanFreeDrain();
+
   // Stop scratch-script retention garbage collector
   stopScratchScriptGc();
+
+  await stopExtensionRuntime();
 
   // Stop RBAC audit: retention GC, flush interval, final drain, detach sink
   stopAuditGc();
@@ -476,13 +530,14 @@ async function shutdown() {
     delete transportActivityUser[id];
   }
 
-  // Close all active connections forcefully
-  httpServer.closeAllConnections();
-  httpServer.close(() => {
-    closeDb();
-    console.log("MCP HTTP server closed, and database connection closed");
-    process.exit(0);
+  // Drain accepted requests before flushing rooms and closing their database.
+  await new Promise<void>((resolve, reject) => {
+    httpServer.close((error) => (error ? reject(error) : resolve()));
   });
+  await closeRooms();
+  closeDb();
+  console.log("MCP HTTP server closed, and database connection closed");
+  process.exit(0);
 }
 
 // Only register signal handlers once (avoid duplicates on hot reload)
@@ -519,14 +574,20 @@ startApiGcInterval();
 
 // Load global swarm configs before the server starts listening so decrypt/key
 // failures fail closed instead of leaving the runtime half-initialized.
+// override=true: a value saved in the dashboard wins over the deployment env
+// at boot, matching the reload path and `createServer`. Otherwise a rotated
+// credential saved only in swarm_config silently reverts to the stale env
+// value on the next deploy (2026-09-16 prod Slack outage). Reserved keys
+// (API_KEY, SECRETS_ENCRYPTION_KEY, ...) stay env-only regardless.
 let startupConfigsInjected: string[] = [];
 try {
-  startupConfigsInjected = await loadGlobalConfigsIntoEnv(false);
+  startupConfigsInjected = await loadGlobalConfigsIntoEnv(true);
 } catch (err) {
   console.error("[startup] Failed to load global swarm configs before listen:", err);
   process.exitCode = 1;
   throw err;
 }
+warnIfCorsAllowsAnyOrigin();
 
 // Upgrade seed: explicit CAPABILITIES env values that predate capability
 // gating get the previously always-registered groups backfilled into a
@@ -543,8 +604,10 @@ try {
 // here surfaces the count in the boot log and makes the API ready to recompute
 // USD before the first POST /api/session-costs lands.
 try {
-  const { seedPricingFromModelsDev } = await import("../be/seed-pricing");
-  seedPricingFromModelsDev();
+  // Guarded per DB handle: `createServer()` (one per MCP session) calls the
+  // same helper, so seeding here is what keeps session init off this path.
+  const { ensurePricingSeeded } = await import("../be/boot-seeds");
+  ensurePricingSeeded();
   const { startPricingRefreshLoop } = await import("../be/pricing-refresh");
   startPricingRefreshLoop();
 } catch (err) {
@@ -552,8 +615,8 @@ try {
 }
 
 try {
-  const { ensureRbacSeedsSynced } = await import("../be/rbac-roles");
-  ensureRbacSeedsSynced();
+  const { ensureRbacSeeded } = await import("../be/boot-seeds");
+  ensureRbacSeeded();
 } catch (err) {
   console.error("[startup] Failed to sync RBAC seed rows:", err);
   // RBAC flag-on must fail closed; flag-off deployments should not be bricked
@@ -574,6 +637,15 @@ try {
   console.error("[startup] Failed to seed built-in entities:", err);
 }
 
+try {
+  await loadEnabledExtensions();
+} catch (err) {
+  console.error(
+    "[startup] Failed to initialize extensions:",
+    scrubSecrets(err instanceof Error ? err.message : String(err)),
+  );
+}
+
 // Wire the RBAC permission-audit sink into can() and start the batched writer
 // (2s flush) + retention GC (daily tick) BEFORE the server accepts traffic —
 // installing it inside the listen callback would leave an unaudited startup
@@ -591,6 +663,10 @@ await initOtel("api");
 
 httpServer
   .listen(port, async () => {
+    const boundAddress = httpServer.address();
+    if (boundAddress && typeof boundAddress === "object") {
+      setExtensionLoopbackBaseUrl(`http://127.0.0.1:${boundAddress.port}`);
+    }
     console.log(`MCP HTTP server running on http://localhost:${port}/mcp`);
 
     ensure({
@@ -612,18 +688,31 @@ httpServer
     // The api-server is the sole authority for the install identity — pass
     // generateIfMissing so it mints a new install ID on first boot. Workers
     // must NOT mint (see src/commands/runner.ts).
-    await initTelemetry(
-      "api-server",
-      async (key) => (await getSwarmConfigs({ scope: "global", key }))?.[0]?.value,
-      async (key, value) => {
-        await upsertSwarmConfig({ scope: "global", key, value });
-      },
-      { generateIfMissing: true },
-    );
+    const telemetryGetConfig = async (key: string) =>
+      (await getSwarmConfigs({ scope: "global", key }))?.[0]?.value;
+    const telemetrySetConfig = async (key: string, value: string) => {
+      await upsertSwarmConfig({ scope: "global", key, value });
+    };
+    await initTelemetry("api-server", telemetryGetConfig, telemetrySetConfig, {
+      generateIfMissing: true,
+    });
     telemetry.server("started", { port });
+    // Org email domain (hourly + on user changes) and the daily org.snapshot.
+    startTelemetryTicker({ getConfig: telemetryGetConfig, setConfig: telemetrySetConfig });
+    if (process.env.GITHUB_TOKEN) {
+      await emitBuiltInIntegrationConnectedOnce("github");
+    }
 
-    // Start Slack bot (if configured)
-    await startSlackApp();
+    // Start Slack bot (if configured). Never let a Slack failure abort the
+    // rest of this callback: on 2026-09-16 an invalid app token made
+    // app.start() reject here, and the scheduler, heartbeat, script-run
+    // supervisor, and OAuth sweeps below never started while /health stayed
+    // green for 7 hours. Slack is one integration, not the boot path.
+    try {
+      await startSlackApp();
+    } catch (err) {
+      console.error("[Slack] Failed to start, continuing boot without Slack:", err);
+    }
 
     // Independent of workers, scheduler targets, and heartbeat agent tasks.
     startQueueStallAlarm();
@@ -633,6 +722,9 @@ httpServer
 
     // Initialize GitLab webhook handler (if configured)
     initGitLab();
+
+    // Initialize Azure DevOps service-hook handler (if configured)
+    initAzureDevOps();
 
     // Initialize AgentMail webhook handler (if configured)
     initAgentMail();
@@ -692,6 +784,10 @@ httpServer
     // Start the opt-in DB retention sweep after config hydration. Every key is
     // read on each tick, so config reloads take effect without a restart.
     await startDbRetention();
+
+    // Finish the human-free reclassification a request left queued (a very large
+    // task tree, or a restart mid-drain). Wakes on demand; see human-free-drain.ts.
+    startHumanFreeDrain();
 
     // (RBAC audit sink is wired pre-listen — see above httpServer.listen.)
 

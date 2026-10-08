@@ -1,5 +1,7 @@
 import type { EventCategory, EventName, EventSource, EventStatus, SwarmEvent } from "../types";
 import { getDbClient } from "./db";
+import type { DbExecutor } from "./db-client";
+import { recordSkillInvocation } from "./skill-invocations";
 
 // -- Events --
 
@@ -57,9 +59,8 @@ export interface CreateEventInput {
   data?: Record<string, unknown>;
 }
 
-export async function createEvent(input: CreateEventInput): Promise<SwarmEvent> {
-  const id = crypto.randomUUID();
-  await getDbClient().run(INSERT_EVENT_SQL, [
+async function insertEvent(db: DbExecutor, id: string, input: CreateEventInput): Promise<void> {
+  await db.run(INSERT_EVENT_SQL, [
     id,
     input.category,
     input.event,
@@ -73,6 +74,17 @@ export async function createEvent(input: CreateEventInput): Promise<SwarmEvent> 
     input.durationMs ?? null,
     input.data ? JSON.stringify(input.data) : null,
   ]);
+  // `skill.invoke` also feeds the per-skill counter and invocation history.
+  await recordSkillInvocation(db, input, id);
+}
+
+export async function createEvent(input: CreateEventInput): Promise<SwarmEvent> {
+  const id = crypto.randomUUID();
+  if (input.event === "skill.invoke") {
+    await getDbClient().transaction((tx) => insertEvent(tx, id, input));
+  } else {
+    await insertEvent(getDbClient(), id, input);
+  }
   return {
     id,
     category: input.category,
@@ -93,20 +105,7 @@ export async function createEvent(input: CreateEventInput): Promise<SwarmEvent> 
 export async function createEventsBatch(inputs: CreateEventInput[]): Promise<number> {
   await getDbClient().transaction(async (tx) => {
     for (const input of inputs) {
-      await tx.run(INSERT_EVENT_SQL, [
-        crypto.randomUUID(),
-        input.category,
-        input.event,
-        input.status ?? "ok",
-        input.source,
-        input.agentId ?? null,
-        input.taskId ?? null,
-        input.sessionId ?? null,
-        input.parentEventId ?? null,
-        input.numericValue ?? null,
-        input.durationMs ?? null,
-        input.data ? JSON.stringify(input.data) : null,
-      ]);
+      await insertEvent(tx, crypto.randomUUID(), input);
     }
   });
   return inputs.length;
@@ -238,6 +237,15 @@ export async function getEventsFiltered(filters: {
   since?: string;
   until?: string;
   limit?: number;
+  /** Match any of these event names (`event IN (...)`), ANDed with `event`. */
+  events?: EventName[];
+  /**
+   * Return only the newest row per (event, data.field) pair, for every pair of
+   * these event names and field values. Each pair is its own indexed
+   * `ORDER BY createdAt DESC LIMIT 1` lookup, so the cost does not grow with
+   * the agent's event history.
+   */
+  latestPerDataField?: { events: EventName[]; dataFields: string[] };
 }): Promise<SwarmEvent[]> {
   const conditions: string[] = [];
   const params: (string | number)[] = [];
@@ -249,6 +257,10 @@ export async function getEventsFiltered(filters: {
   if (filters.event) {
     conditions.push("event = ?");
     params.push(filters.event);
+  }
+  if (filters.events && filters.events.length > 0) {
+    conditions.push(`event IN (${filters.events.map(() => "?").join(", ")})`);
+    params.push(...filters.events);
   }
   if (filters.status) {
     conditions.push("status = ?");
@@ -283,8 +295,27 @@ export async function getEventsFiltered(filters: {
     params.push(filters.until);
   }
 
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const limit = filters.limit ?? 100;
+
+  if (filters.latestPerDataField) {
+    const lookups: string[] = [];
+    const lookupParams: (string | number)[] = [];
+    for (const event of filters.latestPerDataField.events) {
+      for (const field of filters.latestPerDataField.dataFields) {
+        const where = [...conditions, "event = ?", "json_extract(data, '$.field') = ?"];
+        lookups.push(
+          `SELECT * FROM (SELECT * FROM events WHERE ${where.join(" AND ")} ORDER BY createdAt DESC LIMIT 1)`,
+        );
+        lookupParams.push(...params, event, field);
+      }
+    }
+    if (lookups.length === 0) return [];
+    const sql = `${lookups.join(" UNION ALL ")} ORDER BY createdAt DESC LIMIT ?`;
+    const rows = await getDbClient().query<EventRow>(sql, [...lookupParams, limit]);
+    return rows.map(rowToSwarmEvent);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   params.push(limit);
 
   const sql = `SELECT * FROM events ${where} ORDER BY createdAt DESC LIMIT ?`;

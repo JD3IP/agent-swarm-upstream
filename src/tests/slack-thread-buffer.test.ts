@@ -7,6 +7,7 @@ import {
   createUser,
   getLatestActiveTaskInThread,
   getMostRecentTaskInThread,
+  getSlackTasksInThread,
   initDb,
 } from "../be/db";
 import { type IdentityActor, linkIdentity } from "../be/users";
@@ -258,9 +259,12 @@ describe("Slack thread buffer", () => {
 
       await instantFlush(`${channelId}:${threadTs}`);
 
-      const followUp = await getMostRecentTaskInThread(channelId, threadTs);
-      expect(followUp).not.toBeNull();
-      expect(followUp!.id).not.toBe(existingTask.id);
+      // Task creation can share a timestamp. Identify the new task by its ID.
+      const followUps = (await getSlackTasksInThread(channelId, threadTs)).filter(
+        (task) => task.id !== existingTask.id,
+      );
+      expect(followUps).toHaveLength(1);
+      const followUp = followUps[0];
       expect(followUp!.task).toContain("[Thread follow-up — 1 message(s) buffered]");
       expect(followUp!.task).toContain("regular human follow-up");
     });
@@ -450,6 +454,35 @@ describe("Slack thread buffer", () => {
 
       // Clean up: flush via instant (to clear the buffer)
       await instantFlush(`${channelId}:${threadTs}`);
+    });
+  });
+
+  describe("flush does not inherit the latest thread task's outputSchema", () => {
+    test("continuation of a schema-carrying worker task is created with none", async () => {
+      const channelId = "C750";
+      const threadTs = "7500.0001";
+      const worker = await createAgent({
+        name: "buf-worker-schema",
+        isLead: false,
+        status: "idle",
+        capabilities: [],
+      });
+      const workerTask = await createTaskExtended("worker task with a contract", {
+        agentId: worker.id,
+        slackChannelId: channelId,
+        slackThreadTs: threadTs,
+        outputSchema: { type: "object", properties: { prs: { type: "array" } } },
+      });
+
+      bufferThreadMessage(channelId, threadTs, "status?", "U1", "7500.0010");
+      await instantFlush(`${channelId}:${threadTs}`);
+
+      const continuation = await getMostRecentTaskInThread(channelId, threadTs);
+      expect(continuation).not.toBeNull();
+      expect(continuation!.id).not.toBe(workerTask.id);
+      expect(continuation!.source).toBe("slack");
+      expect(continuation!.parentTaskId).toBe(workerTask.id);
+      expect(continuation!.outputSchema).toBeUndefined();
     });
   });
 

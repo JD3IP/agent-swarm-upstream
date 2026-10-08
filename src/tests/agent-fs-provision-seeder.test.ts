@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import {
   closeDb,
@@ -99,17 +99,18 @@ function createFetchStub(
         body.email !== "admin@example.test"
       ) {
         return Response.json({
-          apiKey: "afs-agent-key",
+          apiKey: "example-afs-agent-key",
           userId: "agent-user",
           orgId: "agent-personal-org",
         });
       }
       return Response.json({
-        apiKey: "afs-admin-key",
+        apiKey: "example-afs-admin-key",
         userId: "admin-user",
         orgId: "personal-org",
       });
     }
+    if (url.pathname === "/auth/profile" && method === "PATCH") return Response.json(body);
     if (url.pathname === "/auth/me" && method === "GET") {
       return Response.json({
         userId: "admin-user",
@@ -208,7 +209,7 @@ describe("agent-fs provisioning seeder", () => {
 
     expect(result.failed).toEqual([]);
     expect(result.created).toBe(1);
-    expect(await configValue("API_AGENT_FS_API_KEY")).toBe("afs-admin-key");
+    expect(await configValue("API_AGENT_FS_API_KEY")).toBe("example-afs-admin-key");
     expect(
       (await getSwarmConfigs({ scope: "global", key: "API_AGENT_FS_API_KEY" }))[0]?.encrypted,
     ).toBe(true);
@@ -216,7 +217,7 @@ describe("agent-fs provisioning seeder", () => {
     expect(await configValue("AGENT_FS_DEFAULT_ORG_ID")).toBe("shared-org");
     expect(await configValue("AGENT_FS_SHARED_ORG_ID")).toBe("shared-org");
     expect(await configValue("AGENT_FS_DEFAULT_DRIVE_ID")).toBe("shared-drive");
-    expect(process.env.API_AGENT_FS_API_KEY).toBe("afs-admin-key");
+    expect(process.env.API_AGENT_FS_API_KEY).toBe("example-afs-admin-key");
 
     const register = records.find((r) => r.path === "/auth/register");
     expect(register?.body).toEqual({ email: "admin@example.test" });
@@ -255,7 +256,7 @@ describe("agent-fs provisioning seeder", () => {
     await upsertSwarmConfig({
       scope: "global",
       key: "API_AGENT_FS_API_KEY",
-      value: "afs-admin-key",
+      value: "example-afs-admin-key",
       isSecret: true,
     });
     await upsertSwarmConfig({
@@ -324,7 +325,7 @@ describe("agent-fs provisioning seeder", () => {
     await upsertSwarmConfig({
       scope: "global",
       key: "API_AGENT_FS_API_KEY",
-      value: "afs-admin-key",
+      value: "example-afs-admin-key",
       isSecret: true,
     });
     await upsertSwarmConfig({
@@ -388,7 +389,7 @@ describe("agent-fs provisioning seeder", () => {
     await upsertSwarmConfig({
       scope: "global",
       key: "API_AGENT_FS_API_KEY",
-      value: "afs-admin-key",
+      value: "example-afs-admin-key",
       isSecret: true,
     });
     await upsertSwarmConfig({
@@ -438,7 +439,7 @@ describe("agent-fs provisioning seeder", () => {
     await upsertSwarmConfig({
       scope: "global",
       key: "API_AGENT_FS_API_KEY",
-      value: "afs-admin-key",
+      value: "example-afs-admin-key",
       isSecret: true,
     });
     await upsertSwarmConfig({
@@ -492,7 +493,7 @@ describe("agent-fs provisioning seeder", () => {
         key: "AGENT_FS_API_KEY",
       })
     )[0];
-    expect(agentKey?.value).toBe("afs-agent-key");
+    expect(agentKey?.value).toBe("example-afs-agent-key");
     expect(agentKey?.encrypted).toBe(true);
     expect(records.find((r) => r.path === "/auth/register")?.body).toEqual({
       email: `custom-worker-${suffix}@example.test`,
@@ -502,11 +503,64 @@ describe("agent-fs provisioning seeder", () => {
       role: "editor",
     });
 
+    expect(records.find((r) => r.path === "/auth/profile")).toMatchObject({
+      method: "PATCH",
+      body: { displayName: worker.name },
+      authorization: "Bearer example-afs-agent-key",
+      hasSignal: true,
+    });
     records.length = 0;
     const second = await ensureAgentFsCredentialsForAgent(worker.id);
 
     expect(second.created).toBe(false);
-    expect(records).toEqual([]);
+    expect(records).toEqual([
+      {
+        method: "PATCH",
+        path: "/auth/profile",
+        body: { displayName: "Credential Worker" },
+        authorization: "Bearer example-afs-agent-key",
+        hasSignal: true,
+      },
+    ]);
+  });
+
+  test("profile sync failures leave existing credentials usable and retry later", async () => {
+    process.env.AGENT_FS_API_URL = "https://agent-fs.example.test";
+    const worker = await createAgent({
+      name: "Legacy Worker",
+      description: "Profile compatibility",
+      role: "worker",
+      isLead: false,
+      status: "idle",
+      maxTasks: 1,
+      capabilities: [],
+    });
+    await upsertSwarmConfig({
+      scope: "agent",
+      scopeId: worker.id,
+      key: "AGENT_FS_API_KEY",
+      value: "example-profile-key",
+      isSecret: true,
+    });
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const status of [404, 405, 500, 0]) {
+        setAgentFsProvisionFetchForTests((async (_input, init) => {
+          expect(init?.signal).toBeInstanceOf(AbortSignal);
+          if (!status) throw new DOMException("Timed out", "TimeoutError");
+          return Response.json({ error: "unsupported" }, { status });
+        }) as typeof fetch);
+        expect((await ensureAgentFsCredentialsForAgent(worker.id)).created).toBe(false);
+      }
+      expect(warn).toHaveBeenCalledTimes(4);
+      const records: RequestRecord[] = [];
+      setAgentFsProvisionFetchForTests(createFetchStub(records));
+      await ensureAgentFsCredentialsForAgent(worker.id);
+      expect(records[0].body).toEqual({ displayName: "Legacy Worker" });
+      expect(records[0].authorization).toBe("Bearer example-profile-key");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("recovers a lost agent credential by registering an alias after a 409", async () => {
@@ -516,7 +570,7 @@ describe("agent-fs provisioning seeder", () => {
     await upsertSwarmConfig({
       scope: "global",
       key: "API_AGENT_FS_API_KEY",
-      value: "afs-admin-key",
+      value: "example-afs-admin-key",
       isSecret: true,
     });
     await upsertSwarmConfig({
@@ -570,7 +624,7 @@ describe("agent-fs provisioning seeder", () => {
           key: "AGENT_FS_API_KEY",
         })
       )[0]?.value,
-    ).toBe("afs-agent-key");
+    ).toBe("example-afs-agent-key");
 
     const registrations = records
       .filter((record) => record.path === "/auth/register")
@@ -595,7 +649,7 @@ describe("agent-fs provisioning seeder", () => {
     const invite = records.find((r) => r.path === "/orgs/shared-org/members/invite");
     expect(invite?.method).toBe("POST");
     expect(invite?.body).toEqual({ email: "Customer@Example.test", role: "admin" });
-    expect(invite?.authorization).toBe("Bearer afs-admin-key");
+    expect(invite?.authorization).toBe("Bearer example-afs-admin-key");
   });
 
   test("does not re-invite an external email whose current role already covers the request", async () => {

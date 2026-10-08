@@ -18,7 +18,7 @@ import { listenOnFreePort } from "./test-net";
 
 let TEST_BASE_URL = "";
 const ORG_ID = "org-adapter-test";
-const API_KEY = "cog_adapter_key";
+const API_KEY = "example-cog_adapter_key";
 
 // ---------------------------------------------------------------------------
 // Controllable mock state
@@ -715,5 +715,46 @@ describe("Structured output and PR tracking", () => {
       expect(data.prUrl).toBe("https://github.com/org/repo/pull/42");
       expect(data.prState).toBe("open");
     }
+  });
+});
+
+describe("Secret scrubbing at the emit boundary", () => {
+  test("listener events and the JSONL log never carry a token Devin echoed", async () => {
+    // Built at runtime so no secret-shaped literal lands in the repo.
+    const secret = `gh${"p"}_${"Z".repeat(36)}`;
+    pollResponse.status = "running";
+    pollResponse.status_detail = "working";
+    pollResponse.structured_output = { output: `pushed with token ${secret} ok` };
+
+    const timer = setTimeout(() => {
+      pollResponse.status = "exit";
+      pollResponse.status_detail = "finished";
+    }, 150);
+
+    const config = testConfig();
+    const adapter = new DevinAdapter();
+    const { events } = await runUntilSettled(adapter, config);
+    clearTimeout(timer);
+
+    const outputEvent = events.find(
+      (e) => e.type === "custom" && e.name === "devin.structured_output",
+    );
+    expect(outputEvent).toBeDefined();
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(secret);
+    expect(JSON.stringify(outputEvent)).toContain("[REDACTED:");
+    expect(JSON.stringify(outputEvent)).toContain("pushed with token");
+
+    // settle() flushes the writer asynchronously; give it a tick.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const log = await Bun.file(config.logFile).text();
+    expect(log).not.toContain(secret);
+    expect(log).toContain("[REDACTED:");
+    // The raw poll snapshot line is scrubbed too, not only emitted events.
+    const rawPollLine = log
+      .split("\n")
+      .find((line) => line.includes('"type":"raw_log"') && line.includes("structured_output"));
+    expect(rawPollLine).toBeDefined();
+    expect(rawPollLine).toContain("REDACTED");
   });
 });

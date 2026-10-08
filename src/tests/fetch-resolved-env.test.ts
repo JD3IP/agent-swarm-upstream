@@ -1,9 +1,13 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   applyResolvedEnvToProcessEnv,
+  fetchRepoConfig,
   fetchResolvedEnv,
   RELOADABLE_ENV_KEYS,
 } from "../commands/runner";
+import { checkCodexCredentials } from "../providers/codex-adapter";
+
+const noFiles = { existsSync: () => false };
 
 /**
  * Tests for the fetchResolvedEnv() / applyResolvedEnvToProcessEnv() behavior
@@ -23,6 +27,9 @@ const defaultMockResponse: MockResponse = {
   body: { configs: [] },
 };
 const mockResponsesByAgentId = new Map<string, MockResponse>();
+const requestedRepoIds = new Map<string, string | null>();
+/** Every `GET /api/keys/available` query string observed by the mock server, most recent last. */
+const keysAvailableRequests: string[] = [];
 
 beforeAll(() => {
   server = Bun.serve({
@@ -32,11 +39,19 @@ beforeAll(() => {
 
       if (url.pathname === "/api/config/resolved") {
         const agentId = url.searchParams.get("agentId") ?? "";
+        requestedRepoIds.set(agentId, url.searchParams.get("repoId"));
         const mockResponse = mockResponsesByAgentId.get(agentId) ?? defaultMockResponse;
         return new Response(JSON.stringify(mockResponse.body), {
           status: mockResponse.status,
           headers: { "Content-Type": "application/json" },
         });
+      }
+
+      if (url.pathname === "/api/keys/available") {
+        keysAvailableRequests.push(url.search);
+        const totalKeys = Number(url.searchParams.get("totalKeys") ?? "1");
+        const availableIndices = Array.from({ length: totalKeys }, (_, i) => i);
+        return Response.json({ success: true, availableIndices, totalKeys });
       }
 
       return new Response("Not found", { status: 404 });
@@ -50,6 +65,244 @@ afterAll(() => {
 });
 
 describe("fetchResolvedEnv", () => {
+  test("repository scope requires the requested repository identity", async () => {
+    const repoId = crypto.randomUUID();
+    let url = "https://github.com/another-owner/fixture";
+    const api = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ repos: [{ id: repoId, url, name: "fixture" }] }),
+    });
+    try {
+      expect(
+        await fetchRepoConfig(api.url.toString(), "fixture", "owner/fixture", true),
+      ).toBeNull();
+      url = "https://github.com/owner/fixture-extra";
+      expect(
+        await fetchRepoConfig(api.url.toString(), "fixture", "owner/fixture", true),
+      ).toBeNull();
+      for (const repositoryUrl of [
+        "https://github.com/owner/fixture.git",
+        "git@github.com:owner/fixture.git",
+      ]) {
+        url = repositoryUrl;
+        expect(
+          (await fetchRepoConfig(api.url.toString(), "fixture", "owner/fixture", true))?.id,
+        ).toBe(repoId);
+      }
+    } finally {
+      api.stop(true);
+    }
+  });
+
+  test("resolves full repository URLs and normalizes the API name filter", async () => {
+    const repoId = crypto.randomUUID();
+    let registeredUrl = "https://github.com/owner/fixture.git";
+    const requestedNames: Array<string | null> = [];
+    const api = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const name = new URL(req.url).searchParams.get("name");
+        requestedNames.push(name);
+        return Response.json({
+          repos: name === "fixture" ? [{ id: repoId, url: registeredUrl, name: "fixture" }] : [],
+        });
+      },
+    });
+    try {
+      for (const requested of [
+        "https://github.com/owner/fixture",
+        "https://github.com/owner/fixture.git",
+        "https://github.com/owner/fixture.git/",
+        "owner/fixture.git/",
+      ]) {
+        expect((await fetchRepoConfig(api.url.toString(), "fixture", requested, true))?.id).toBe(
+          repoId,
+        );
+      }
+      registeredUrl = "git@github.com:owner/fixture.git";
+      expect((await fetchRepoConfig(api.url.toString(), "fixture", registeredUrl, true))?.id).toBe(
+        repoId,
+      );
+      registeredUrl = "https://another-host.test/owner/fixture";
+      expect(
+        await fetchRepoConfig(
+          api.url.toString(),
+          "fixture",
+          "https://github.com/owner/fixture",
+          true,
+        ),
+      ).toBeNull();
+      expect(requestedNames.every((name) => name === "fixture")).toBe(true);
+    } finally {
+      api.stop(true);
+    }
+  });
+
+  test("passes repository scope and restores the transport default after deletion", async () => {
+    const agentId = crypto.randomUUID();
+    const repoId = crypto.randomUUID();
+    const baseEnv = { CLAUDE_TRANSPORT: "cli" };
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: { configs: [{ key: "CLAUDE_TRANSPORT", value: "sdk" }] },
+    });
+    const assigned = await fetchResolvedEnv(testUrl, "key", agentId, baseEnv, undefined, {
+      repoId,
+    });
+    expect(requestedRepoIds.get(agentId)).toBe(repoId);
+    expect(assigned.env.CLAUDE_TRANSPORT).toBe("sdk");
+    expect(baseEnv.CLAUDE_TRANSPORT).toBe("cli");
+    expect(RELOADABLE_ENV_KEYS.has("CLAUDE_TRANSPORT")).toBe(false);
+
+    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+    const inherited = await fetchResolvedEnv(testUrl, "key", agentId, baseEnv);
+    expect(inherited.env.CLAUDE_TRANSPORT).toBe("cli");
+    expect(requestedRepoIds.get(agentId)).toBeNull();
+  });
+
+  test("keeps codex_oauth rows out of the resolved env and records only the pool-slot count", async () => {
+    const agentId = crypto.randomUUID();
+    const slot = (access: string) =>
+      JSON.stringify({ access, refresh: "rt.secret", expires: 1, accountId: "acct" });
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: {
+        configs: [
+          { key: "codex_oauth", value: slot("legacy") },
+          { key: "codex_oauth_0", value: slot("a0") },
+          { key: "codex_oauth_1", value: slot("a1") },
+          { key: "codex_oauth_2", value: "not-json" },
+          { key: "FOO", value: "bar" },
+        ],
+      },
+    });
+    // An older entrypoint exported the slot at boot; the loader drops it too.
+    const baseEnv = { codex_oauth_7: slot("stale") };
+    const { env } = await fetchResolvedEnv(testUrl, "key", agentId, baseEnv);
+
+    expect(Object.keys(env).filter((key) => key.startsWith("codex_oauth"))).toEqual([]);
+    expect(JSON.stringify(env)).not.toContain("rt.secret");
+    expect(env.FOO).toBe("bar");
+    expect(env.CODEX_OAUTH_POOL_SLOTS).toBe("2");
+    expect(checkCodexCredentials(env, { homeDir: "/nonexistent", fs: noFiles }).ready).toBe(true);
+
+    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+    const emptied = await fetchResolvedEnv(testUrl, "key", agentId, {
+      CODEX_OAUTH_POOL_SLOTS: "2",
+    });
+    expect(emptied.env.CODEX_OAUTH_POOL_SLOTS).toBeUndefined();
+    expect(checkCodexCredentials(emptied.env, { homeDir: "/nonexistent", fs: noFiles }).ready).toBe(
+      false,
+    );
+  });
+
+  test("applies the pool-slot count to process.env and clears it when the pool is deleted", async () => {
+    const agentId = crypto.randomUUID();
+    const previous = process.env.CODEX_OAUTH_POOL_SLOTS;
+    delete process.env.CODEX_OAUTH_POOL_SLOTS;
+    try {
+      mockResponsesByAgentId.set(agentId, {
+        status: 200,
+        body: { configs: [{ key: "codex_oauth_0", value: JSON.stringify({ access: "a0" }) }] },
+      });
+      const withPool = await fetchResolvedEnv(testUrl, "key", agentId);
+      expect(applyResolvedEnvToProcessEnv(withPool.env)).toContain("CODEX_OAUTH_POOL_SLOTS");
+      expect(process.env.CODEX_OAUTH_POOL_SLOTS).toBe("1");
+
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      const withoutPool = await fetchResolvedEnv(testUrl, "key", agentId);
+      applyResolvedEnvToProcessEnv(withoutPool.env);
+      expect(process.env.CODEX_OAUTH_POOL_SLOTS).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_OAUTH_POOL_SLOTS;
+      else process.env.CODEX_OAUTH_POOL_SLOTS = previous;
+    }
+  });
+
+  test("selects both Claude credential pools for the executing adapter despite repository harness config", async () => {
+    const agentId = crypto.randomUUID();
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: {
+        configs: [
+          { key: "HARNESS_PROVIDER", value: "codex" },
+          { key: "CLAUDE_CODE_OAUTH_TOKEN", value: "fixture-oauth-a,fixture-oauth-b" },
+          { key: "ANTHROPIC_API_KEY", value: "fixture-api-a,fixture-api-b" },
+          { key: "CLAUDE_TRANSPORT", value: "sdk" },
+        ],
+      },
+    });
+    const result = await fetchResolvedEnv(testUrl, "key", agentId, {}, "claude-haiku-4-5", {
+      repoId: crypto.randomUUID(),
+      provider: "claude",
+    });
+    expect(result.resolvedProvider).toBe("claude");
+    expect(result.env.HARNESS_PROVIDER).toBe("claude");
+    expect(result.env.CLAUDE_TRANSPORT).toBe("sdk");
+    expect(result.env.CLAUDE_CODE_OAUTH_TOKEN).toMatch(/^fixture-oauth-[ab]$/);
+    expect(result.env.ANTHROPIC_API_KEY).toMatch(/^fixture-api-[ab]$/);
+    expect(result.credentialSelections.map((selection) => selection.keyType)).toEqual([
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "ANTHROPIC_API_KEY",
+    ]);
+  });
+
+  describe("model-scoped window filter — GET /api/keys/available?model=<family>", () => {
+    beforeEach(() => {
+      keysAvailableRequests.length = 0;
+    });
+
+    function envWithOauthPool(totalKeys: number): Record<string, string> {
+      return {
+        CLAUDE_CODE_OAUTH_TOKEN: Array.from({ length: totalKeys }, (_, i) => `tok-${i}`).join(","),
+      };
+    }
+
+    test("modelTier: 'ultra' and no model issues model=fable", async () => {
+      const agentId = "agent-model-ultra";
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      await fetchResolvedEnv(testUrl, "key", agentId, envWithOauthPool(32), undefined, {
+        provider: "claude",
+        modelTier: "ultra",
+      });
+      expect(keysAvailableRequests).toEqual([
+        "?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32&model=fable",
+      ]);
+    });
+
+    test("model: 'claude-fable-5-1' issues the same model=fable", async () => {
+      const agentId = "agent-model-fable-explicit";
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      await fetchResolvedEnv(testUrl, "key", agentId, envWithOauthPool(32), "claude-fable-5-1", {
+        provider: "claude",
+      });
+      expect(keysAvailableRequests).toEqual([
+        "?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32&model=fable",
+      ]);
+    });
+
+    test("model: 'claude-sonnet-5' issues model=sonnet", async () => {
+      const agentId = "agent-model-sonnet";
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      await fetchResolvedEnv(testUrl, "key", agentId, envWithOauthPool(32), "claude-sonnet-5", {
+        provider: "claude",
+      });
+      expect(keysAvailableRequests).toEqual([
+        "?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32&model=sonnet",
+      ]);
+    });
+
+    test("modelTier: 'smol' issues no model param (haiku has no weekly window)", async () => {
+      const agentId = "agent-model-smol";
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      await fetchResolvedEnv(testUrl, "key", agentId, envWithOauthPool(32), undefined, {
+        provider: "claude",
+        modelTier: "smol",
+      });
+      expect(keysAvailableRequests).toEqual(["?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32"]);
+    });
+  });
+
   test("returns baseEnv when apiUrl is empty", async () => {
     const baseEnv = { EXISTING: "value" };
     const result = await fetchResolvedEnv("", "key", "agent-1", baseEnv);
@@ -286,5 +539,118 @@ describe("applyResolvedEnvToProcessEnv", () => {
 
     expect(changed).toContain("MODEL_OVERRIDE");
     expect(process.env.MODEL_OVERRIDE).toBe("new-value");
+  });
+});
+
+describe("memory rater config reload", () => {
+  const deploymentValue = process.env.MEMORY_RATERS;
+  afterEach(() => {
+    if (deploymentValue === undefined) delete process.env.MEMORY_RATERS;
+    else process.env.MEMORY_RATERS = deploymentValue;
+  });
+
+  test("empty override survives reload; deleting it restores the deployment value", async () => {
+    const agentId = "memory-rater-reload";
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: { configs: [{ key: "MEMORY_RATERS", value: "" }] },
+    });
+    const disabled = await fetchResolvedEnv(testUrl, "key", agentId);
+    applyResolvedEnvToProcessEnv(disabled.env);
+    expect(process.env.MEMORY_RATERS).toBe("");
+    const repeated = await fetchResolvedEnv(testUrl, "key", agentId);
+    expect(repeated.env.MEMORY_RATERS).toBe("");
+
+    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+    const removed = await fetchResolvedEnv(testUrl, "key", agentId);
+    applyResolvedEnvToProcessEnv(removed.env);
+    expect(process.env.MEMORY_RATERS).toBe(deploymentValue);
+  });
+
+  test.each([undefined, "", "llm"])("missing row restores base value %s", async (value) => {
+    const result = await fetchResolvedEnv(testUrl, "key", "memory-rater-base", {
+      MEMORY_RATERS: value,
+    });
+    process.env.MEMORY_RATERS = "explicit-self,llm";
+    applyResolvedEnvToProcessEnv(result.env);
+    expect(process.env.MEMORY_RATERS).toBe(value);
+  });
+
+  test("failed reload retains the last applied empty override", async () => {
+    process.env.MEMORY_RATERS = "";
+    mockResponsesByAgentId.set("memory-rater-failure", { status: 500, body: {} });
+    const result = await fetchResolvedEnv(testUrl, "key", "memory-rater-failure");
+    applyResolvedEnvToProcessEnv(result.env);
+    expect(process.env.MEMORY_RATERS).toBe("");
+  });
+});
+
+describe("agent-scoped PI_CODEMODE_MODELS reaches the worker env", () => {
+  // The server merges global, agent and repo rows into /api/config/resolved
+  // (getResolvedConfig); the worker applies the result to process.env, which
+  // the pi adapter reads when the next task's session starts. PI_CODEMODE and
+  // PI_TOOL_DEFERRAL take the same path and are covered below.
+  const saved = process.env.PI_CODEMODE_MODELS;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.PI_CODEMODE_MODELS;
+    else process.env.PI_CODEMODE_MODELS = saved;
+  });
+
+  test("the row lands in process.env and is reported as changed", async () => {
+    delete process.env.PI_CODEMODE_MODELS;
+    mockResponsesByAgentId.set("pi-pilot-agent", {
+      status: 200,
+      body: { configs: [{ key: "PI_CODEMODE_MODELS", value: "true" }] },
+    });
+    const result = await fetchResolvedEnv(testUrl, "key", "pi-pilot-agent");
+    const changed = applyResolvedEnvToProcessEnv(result.env);
+    expect(changed).toContain("PI_CODEMODE_MODELS");
+    expect(process.env.PI_CODEMODE_MODELS).toBe("true");
+  });
+});
+
+describe("deleting a reloadable config row", () => {
+  // One key per test: the runner remembers each overridden key's boot value
+  // for the life of the process.
+  const keys = ["PI_CODEMODE", "PI_TOOL_DEFERRAL", "SWARM_ORG_NAME"];
+  const saved = new Map(keys.map((key) => [key, process.env[key]]));
+  afterEach(() => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  async function reload(agentId: string, configs: Array<{ key: string; value: string }>) {
+    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs } });
+    const result = await fetchResolvedEnv(testUrl, "key", agentId);
+    return applyResolvedEnvToProcessEnv(result.env);
+  }
+
+  test("unset at boot: deleting the row unsets the var", async () => {
+    delete process.env.PI_CODEMODE;
+    await reload("row-delete-unset", [{ key: "PI_CODEMODE", value: "true" }]);
+    expect(process.env.PI_CODEMODE).toBe("true");
+
+    const changed = await reload("row-delete-unset", []);
+    expect(changed).toContain("PI_CODEMODE");
+    expect(process.env.PI_CODEMODE).toBeUndefined();
+  });
+
+  test("set at boot: deleting the overriding row restores the boot value", async () => {
+    process.env.PI_TOOL_DEFERRAL = "false";
+    await reload("row-delete-boot", [{ key: "PI_TOOL_DEFERRAL", value: "true" }]);
+    expect(process.env.PI_TOOL_DEFERRAL).toBe("true");
+
+    const changed = await reload("row-delete-boot", []);
+    expect(changed).toContain("PI_TOOL_DEFERRAL");
+    expect(process.env.PI_TOOL_DEFERRAL).toBe("false");
+  });
+
+  test("set at boot and never overridden: untouched", async () => {
+    process.env.SWARM_ORG_NAME = "container-org";
+    const changed = await reload("row-never-set", []);
+    expect(changed).not.toContain("SWARM_ORG_NAME");
+    expect(process.env.SWARM_ORG_NAME).toBe("container-org");
   });
 });
