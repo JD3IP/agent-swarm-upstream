@@ -14725,6 +14725,7 @@ export interface paths {
                         modelTier?: "smol" | "regular" | "smart" | "ultra";
                         /** @enum {string} */
                         effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
+                        followUpConfig?: components["schemas"]["FollowUpConfig"];
                     };
                 };
             };

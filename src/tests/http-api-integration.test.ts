@@ -482,6 +482,23 @@ describe("Tasks", () => {
     ids.task2 = body.id;
   });
 
+  test("POST /api/tasks — persists disabled follow-up configuration", async () => {
+    const { status, body } = await post("/api/tasks", {
+      agentId: ids.leadAgent,
+      body: {
+        task: "Integration test task with follow-ups disabled",
+        agentId: ids.workerAgent,
+        followUpConfig: { disabled: true },
+      },
+    });
+    expect(status).toBe(201);
+    expect(body.followUpConfig).toEqual({ disabled: true });
+
+    const persisted = await get(`/api/tasks/${body.id}`);
+    expect(persisted.status).toBe(200);
+    expect(persisted.body.followUpConfig).toEqual({ disabled: true });
+  });
+
   test("GET /api/tasks — list all tasks", async () => {
     const { status, body } = await get("/api/tasks");
     expect(status).toBe(200);

@@ -37572,6 +37572,9 @@
                       "xhigh",
                       "max"
                     ]
+                  },
+                  "followUpConfig": {
+                    "$ref": "#/components/schemas/FollowUpConfig"
                   }
                 },
                 "required": [
