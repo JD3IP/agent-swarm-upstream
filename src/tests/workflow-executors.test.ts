@@ -15,7 +15,7 @@ import {
   PropertyMatchExecutor,
   PropertyMatchOutputSchema,
 } from "../workflows/executors/property-match";
-import { RawLlmExecutor } from "../workflows/executors/raw-llm";
+import { executeRawLlm, RawLlmExecutor } from "../workflows/executors/raw-llm";
 import { createExecutorRegistry } from "../workflows/executors/registry";
 import { ScriptExecutor, ScriptOutputSchema } from "../workflows/executors/script";
 import { ValidateExecutor, ValidateOutputSchema } from "../workflows/executors/validate";
@@ -404,8 +404,109 @@ describe("RawLlmExecutor", () => {
       model: "openai/gpt-4o",
       schema: { type: "object", properties: { category: { type: "string" } } },
       fallbackPort: "error",
+      provider: "anthropic",
+      agentId: "sweep-agent",
+      maxTokens: 128,
     });
     expect(result.success).toBe(true);
+  });
+
+  test("anthropic provider returns bounded structured output and usage", async () => {
+    const previous = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+    try {
+      const result = await executeRawLlm(
+        {
+          prompt: "Classify one ambiguity",
+          provider: "anthropic",
+          model: "claude-sonnet-test",
+          maxTokens: 128,
+          schema: {
+            type: "object",
+            properties: { disposition: { type: "string" } },
+            required: ["disposition"],
+          },
+        },
+        {
+          anthropicCreate: async (apiKey, params) => {
+            expect(apiKey).toBe("test-anthropic-key");
+            expect(params.max_tokens).toBe(128);
+            expect(params.tool_choice).toEqual({ type: "tool", name: "submit_result" });
+            return {
+              content: [
+                {
+                  type: "tool_use",
+                  name: "submit_result",
+                  input: { disposition: "leave_unmodified" },
+                },
+              ],
+              usage: {
+                input_tokens: 47,
+                output_tokens: 9,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+              },
+            };
+          },
+        },
+      );
+
+      expect(result).toEqual({
+        status: "success",
+        output: {
+          result: { disposition: "leave_unmodified" },
+          model: "claude-sonnet-test",
+          usage: {
+            inputTokens: 47,
+            outputTokens: 9,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+          },
+        },
+      });
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previous;
+    }
+  });
+
+  test("anthropic provider rejects incomplete structured output", async () => {
+    const previous = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+    try {
+      const result = await executeRawLlm(
+        {
+          prompt: "Classify one ambiguity",
+          provider: "anthropic",
+          schema: {
+            type: "object",
+            properties: {
+              disposition: { type: "string" },
+              reason: { type: "string" },
+            },
+            required: ["disposition", "reason"],
+          },
+        },
+        {
+          anthropicCreate: async () => ({
+            content: [
+              {
+                type: "tool_use",
+                name: "submit_result",
+                input: { disposition: "leave_unmodified" },
+              },
+            ],
+          }),
+        },
+      );
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("schema validation");
+      expect(result.error).toContain("reason");
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previous;
+    }
   });
 
   // LLM integration tests — behavior depends on whether OPENROUTER_API_KEY is set
