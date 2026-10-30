@@ -5,10 +5,20 @@
 
 import { claudeAccountIdentity, codexAccountIdentity } from "../src/utils/account-identity.ts";
 import { getApiKey } from "../src/utils/api-key.ts";
+import {
+  CLAUDE_POOL_LOCK,
+  type ClaudeOAuthCredential,
+  claudeCredential,
+  claudeCredentialRecord,
+  replaceClaudeSlot,
+} from "./claude-account-credentials.ts";
 
-interface CredentialFile {
+export { replaceClaudeSlot } from "./claude-account-credentials.ts";
+
+interface CredentialFile extends Partial<ClaudeOAuthCredential> {
   tokens?: { access_token?: string; refresh_token?: string; account_id?: string };
   token?: string;
+  claudeAiOauth?: unknown;
 }
 interface AccountPolicy {
   id: string;
@@ -54,21 +64,6 @@ export function codexIdentity(auth: CredentialFile): { identityKey: string; cred
   };
 }
 
-export function replaceClaudeSlot(pool: string, index: number, token: string): string {
-  const values = pool ? pool.split(",").map((v) => v.trim()) : [];
-  if (
-    !Number.isSafeInteger(index) ||
-    index < 0 ||
-    index > values.length ||
-    !token ||
-    token.includes(",") ||
-    values.some((v) => !v)
-  )
-    throw new Error("Invalid Claude slot");
-  values[index] = token;
-  return values.join(",");
-}
-
 export async function enroll(options: {
   spec: AccountPolicy;
   credential: CredentialFile;
@@ -79,12 +74,20 @@ export async function enroll(options: {
   fetchImpl?: typeof fetch;
 }): Promise<{ accountId: string; identityKey: string; enabled: boolean }> {
   const request = options.fetchImpl ?? fetch;
+  let lockDeadline: number | undefined;
   async function json<T = unknown>(
     url: string,
     token: string,
     method = "GET",
     body?: unknown,
   ): Promise<T> {
+    if (
+      lockDeadline !== undefined &&
+      method !== "GET" &&
+      method !== "DELETE" &&
+      Date.now() >= lockDeadline
+    )
+      throw new Error("Enrollment refresh lock expired");
     const response = await request(url, {
       method,
       headers: {
@@ -140,15 +143,20 @@ export async function enroll(options: {
   let identityKey: string;
   let stored: string;
   let configKey: string;
+  let claude: ClaudeOAuthCredential | undefined;
   if (policy.provider === "codex") {
     const account = codexIdentity(options.credential);
     identityKey = account.identityKey;
     stored = JSON.stringify(account.credentials);
     configKey = `codex_oauth_${ref.index}`;
   } else if (policy.provider === "claude") {
-    const token = options.credential?.token;
-    if (typeof token !== "string" || !token || /[\r\n,]/.test(token))
-      throw new Error("Invalid Claude token file");
+    claude = claudeCredential(options.credential);
+    if (
+      claude.expiresAt <= Date.now() ||
+      (claude.refreshTokenExpiresAt != null && claude.refreshTokenExpiresAt <= Date.now())
+    )
+      throw new Error("Claude CLI login is expired");
+    const token = claude.accessToken;
     const profile = await json<{ account?: { uuid?: string } }>(
       "https://api.anthropic.com/api/oauth/profile",
       token,
@@ -172,12 +180,22 @@ export async function enroll(options: {
   )
     throw new Error("Provider identity already enrolled");
   // Lock the same Codex key as the refresh broker. Claude pool imports serialize together.
-  const lockUrl = `${options.apiUrl}/api/oauth/refresh-locks/${encodeURIComponent(policy.provider === "codex" ? configKey : "claude-account-enrollment")}`;
-  const lock = await json<{ owner: string }>(lockUrl, options.apiKey, "POST", { ttlMs: 120000 });
+  const lockUrl = `${options.apiUrl}/api/oauth/refresh-locks/${encodeURIComponent(policy.provider === "codex" ? configKey : CLAUDE_POOL_LOCK)}`;
+  const lockTtl = policy.provider === "claude" ? 300000 : 120000;
+  const lockStarted = Date.now();
+  const lock = await json<{ owner: string }>(lockUrl, options.apiKey, "POST", { ttlMs: lockTtl });
+  lockDeadline = lockStarted + lockTtl - 1000;
   try {
     const accountPolicy = { ...policy, identityKey, enabled: false };
     await json(`${options.sidecarUrl}/accounts/${id}`, options.sidecarToken, "PUT", accountPolicy);
     if (policy.provider === "claude") {
+      await json(`${options.apiUrl}/api/config`, options.apiKey, "PUT", {
+        scope: "global",
+        key: `claude_oauth_${ref.index}`,
+        value: JSON.stringify(claudeCredentialRecord(identityKey, claude!)),
+        isSecret: true,
+        description: "Managed Claude refresh credential (central broker only)",
+      });
       const data = await json<ConfigRow[] | { configs: ConfigRow[] }>(
         `${options.apiUrl}/api/config?includeSecrets=true`,
         options.apiKey,

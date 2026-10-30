@@ -46,16 +46,32 @@ describe("managed resolved config integration", () => {
             scope: "global",
             scopeId: null,
           },
+          {
+            key: "claude_oauth_1",
+            value: "private-refresh-family",
+            scope: "global",
+            scopeId: null,
+          },
+          { key: "CLAUDE_OAUTH_7", value: "other-private-family", scope: "global", scopeId: null },
         ],
       })) as typeof fetch;
     const resolved = await fetchResolvedEnv("http://swarm.test", "test-key", agentId, {
       HARNESS_PROVIDER: "claude",
       MODEL_OVERRIDE: model,
       OPENAI_API_KEY: "paid-api",
+      CLAUDE_OAUTH: "default-metadata-refresh-family",
+      CLAUDE_CODE_OAUTH_REFRESH_TOKEN: "inherited-refresh",
+      CLAUDE_CODE_OAUTH_SCOPES: "user:profile user:inference",
     });
     expect(resolved.configFetched).toBe(true);
     expect(resolved.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("second");
     expect(resolved.env.OPENAI_API_KEY).toBe("");
+    expect(resolved.env.CLAUDE_OAUTH).toBe("");
+    expect(resolved.env.claude_oauth_1).toBe("");
+    expect(resolved.env.CLAUDE_OAUTH_7).toBe("");
+    expect(resolved.env.CLAUDE_CODE_OAUTH_REFRESH_TOKEN).toBe("");
+    expect(resolved.env.CLAUDE_CODE_OAUTH_SCOPES).toBe("");
+    expect(JSON.stringify(resolved.env)).not.toContain("refresh-family");
     expect(resolved.credentialSelections[0]?.index).toBe(1);
     expect(process.env.SWARM_ACCOUNT_MANAGED).toBe("true");
   });

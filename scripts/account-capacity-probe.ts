@@ -4,6 +4,11 @@
 import { getValidCodexOAuth, loadCodexOAuth } from "../src/providers/codex-oauth/storage.ts";
 import { claudeAccountIdentity, codexAccountIdentity } from "../src/utils/account-identity.ts";
 import { getApiKey } from "../src/utils/api-key.ts";
+import {
+  ClaudeAccountAuthError,
+  ClaudeReauthenticationRequiredError,
+  getClaudeAccountCredential,
+} from "./claude-account-credentials.ts";
 
 type Window = {
   id: string;
@@ -27,6 +32,7 @@ type Observation = {
   observedAt: string;
   source: string;
   authState: "healthy" | "invalid" | "unknown";
+  authAction: "reauthenticate" | null;
   state: "healthy" | "exhausted" | "throttled" | "unavailable" | "unknown";
   cooldownUntil: string | null;
   windows: Window[];
@@ -115,6 +121,7 @@ export async function probeAccount(account: Account, deps: Dependencies): Promis
     observedAt: new Date(deps.now()).toISOString(),
     source: `${account.provider}-usage`,
     authState: "unknown",
+    authAction: null,
     state: "unknown",
     cooldownUntil: null,
     windows: [],
@@ -201,9 +208,11 @@ export async function probeAccount(account: Account, deps: Dependencies): Promis
     } else if (!response.ok) observation.state = "unavailable";
     if (observation.windows.some((w) => w.models === null && w.usedPercent === 100))
       observation.state = "exhausted";
-  } catch {
+  } catch (error) {
     // Never emit upstream exception bodies: they may include a bearer or OAuth payload.
-    observation.authState = "unknown";
+    observation.authState = error instanceof ClaudeAccountAuthError ? "invalid" : "unknown";
+    observation.authAction =
+      error instanceof ClaudeReauthenticationRequiredError ? "reauthenticate" : null;
     observation.state = "unavailable";
     observation.windows = [];
   }
@@ -247,30 +256,14 @@ export async function collectAccounts(options: {
             ? loadCodexOAuth(options.apiUrl, options.apiKey, slot)
             : getValidCodexOAuth(options.apiUrl, options.apiKey, slot)),
       claudeCredential: async (a) => {
-        if (a.credentialRef.keyType !== "claude_oauth") return null;
-        const query = new URLSearchParams({ includeSecrets: "true" });
-        if (a.credentialRef.scope === "agent" && a.credentialRef.scopeId)
-          query.set("agentId", a.credentialRef.scopeId);
-        const response = await fetchImpl(`${options.apiUrl}/api/config/resolved?${query}`, {
-          headers: { Authorization: `Bearer ${options.apiKey}` },
-          signal: AbortSignal.timeout(15000),
+        return getClaudeAccountCredential({
+          apiUrl: options.apiUrl,
+          apiKey: options.apiKey,
+          account: a,
+          dryRun: options.dryRun,
+          fetchImpl,
+          now: options.now,
         });
-        if (!response.ok) return null;
-        const data = (await response.json()) as {
-          configs: { key: string; value: string; scope: string; scopeId?: string | null }[];
-        };
-        const row = data.configs.find(
-          (r) =>
-            r.key === "CLAUDE_CODE_OAUTH_TOKEN" &&
-            r.scope === a.credentialRef.scope &&
-            (r.scopeId ?? null) === a.credentialRef.scopeId,
-        );
-        return (
-          row?.value
-            .split(",")
-            .map((v) => v.trim())
-            .filter(Boolean)[a.credentialRef.index] ?? null
-        );
       },
     });
     let published = false;
@@ -287,6 +280,18 @@ export async function collectAccounts(options: {
       published = response.ok;
     }
     results.push({ accountId: account.id, state: observation.state, published });
+  }
+  if (!options.dryRun) {
+    try {
+      const response = await fetchImpl(`${options.sidecarUrl}/account-auth-notices/reconcile`, {
+        method: "POST",
+        headers: sidecarHeaders,
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) console.error("Account renewal notice reconciliation unavailable");
+    } catch {
+      console.error("Account renewal notice reconciliation unavailable");
+    }
   }
   return results;
 }

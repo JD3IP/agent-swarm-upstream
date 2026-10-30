@@ -442,7 +442,7 @@ export async function verifyTaskFilteredPollSupport(apiUrl: string, apiKey: stri
 /** Auth is stripped first: managed sessions may never fall back to another provider/account. */
 export function clearManagedCredentials(env: Record<string, string | undefined>): void {
   for (const key of Object.keys(env)) {
-    if (/^codex_oauth(?:_\d+)?$/i.test(key)) env[key] = "";
+    if (/^(?:codex|claude)_oauth(?:_\d+)?$/i.test(key)) env[key] = "";
   }
   for (const key of [
     "ANTHROPIC_API_KEY",
@@ -453,6 +453,8 @@ export function clearManagedCredentials(env: Record<string, string | undefined>)
     "CODEX_OAUTH",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "AGENT_SWARM_CLAUDE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
   ]) {
     env[key] = "";
   }

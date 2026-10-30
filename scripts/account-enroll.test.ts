@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { claudeAccountIdentity } from "../src/utils/account-identity.ts";
 import { codexIdentity, enroll, replaceClaudeSlot } from "./account-enroll.ts";
 
 const token = (subject: string) =>
@@ -33,6 +34,46 @@ test("Claude original indices are preserved and sparse imports refused", () => {
   expect(replaceClaudeSlot("account-a", 1, "new-b")).toBe("account-a,new-b");
   expect(() => replaceClaudeSlot("account-a", 2, "new-b")).toThrow();
   expect(() => replaceClaudeSlot("a,,b", 1, "new-b")).toThrow();
+});
+
+test("full Claude CLI login persists encrypted refresh metadata before the access-only pool projection", async () => {
+  const configs: Record<string, unknown>[] = [];
+  const profile = { account: { uuid: "fixture-claude-account" } };
+  const full = {
+    accessToken: "fixture-access",
+    refreshToken: "fixture-refresh",
+    expiresAt: Date.now() + 3600_000,
+    scopes: ["user:profile", "user:inference"],
+  };
+  const result = await enroll({
+    apiUrl: "http://swarm.invalid",
+    apiKey: "fixture",
+    sidecarUrl: "http://sidecar.invalid",
+    sidecarToken: "fixture",
+    spec: {
+      ...spec,
+      id: "claude-b",
+      provider: "claude",
+      credentialRef: { keyType: "claude_oauth", scope: "global", scopeId: null, index: 1 },
+    },
+    credential: { claudeAiOauth: full },
+    fetchImpl: (async (url, init) => {
+      if (String(url).endsWith("/accounts")) return Response.json({ accounts: [] });
+      if (String(url).endsWith("/profile")) return Response.json(profile);
+      if (String(url).includes("includeSecrets=true"))
+        return Response.json([
+          { key: "CLAUDE_CODE_OAUTH_TOKEN", scope: "global", value: "neighbor,old" },
+        ]);
+      if (String(url).endsWith("/api/config")) configs.push(JSON.parse(String(init?.body)));
+      return Response.json(String(url).includes("refresh-locks") ? { owner: "fixture-owner" } : {});
+    }) as typeof fetch,
+  });
+  expect(configs.map((c) => c.key)).toEqual(["claude_oauth_1", "CLAUDE_CODE_OAUTH_TOKEN"]);
+  expect(configs.every((c) => c.isSecret === true)).toBe(true);
+  expect(JSON.parse(String(configs[0]?.value)).credentials.refreshToken).toBe("fixture-refresh");
+  expect(configs[1]?.value).toBe("neighbor,fixture-access");
+  expect(result.identityKey).toBe(claudeAccountIdentity(profile));
+  expect(JSON.stringify(result)).not.toContain("fixture-refresh");
 });
 
 function fixture(existing: unknown[] = [], failConfig = false) {

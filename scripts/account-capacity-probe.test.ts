@@ -6,6 +6,10 @@ import {
   collectAccounts,
   probeAccount,
 } from "./account-capacity-probe.ts";
+import {
+  ClaudeAccountAuthError,
+  ClaudeReauthenticationRequiredError,
+} from "./claude-account-credentials.ts";
 
 const now = Date.parse("2026-10-30T03:00:00Z");
 const access = `fake.${Buffer.from(JSON.stringify({ sub: "user-b" })).toString("base64url")}.fake`;
@@ -35,6 +39,50 @@ const deps = (fetchImpl: typeof fetch) => ({
 });
 
 describe("account-scoped quota collector", () => {
+  test("only durable unconfirmed renewal asks for owner action while unknown stays unknown", async () => {
+    for (const error of [
+      new ClaudeReauthenticationRequiredError("fixture"),
+      new Error("fixture outage"),
+    ]) {
+      const result = await probeAccount(
+        {
+          ...account,
+          provider: "claude",
+          credentialRef: { ...account.credentialRef, keyType: "claude_oauth" },
+        },
+        {
+          ...deps((async () => {
+            throw new Error("No provider request expected");
+          }) as typeof fetch),
+          claudeCredential: async () => {
+            throw error;
+          },
+        },
+      );
+      expect(result.authState).toBe("unknown");
+      expect(result.authAction).toBe(
+        error instanceof ClaudeReauthenticationRequiredError ? "reauthenticate" : null,
+      );
+    }
+  });
+  test("known Claude refresh rejection remains invalid for renewal notices", async () => {
+    const result = await probeAccount(
+      {
+        ...account,
+        provider: "claude",
+        credentialRef: { ...account.credentialRef, keyType: "claude_oauth" },
+      },
+      {
+        ...deps((async () => {
+          throw new Error("No provider request expected");
+        }) as typeof fetch),
+        claudeCredential: async () => {
+          throw new ClaudeAccountAuthError("fixture-invalid");
+        },
+      },
+    );
+    expect(result).toMatchObject({ authState: "invalid", state: "unavailable", windows: [] });
+  });
   test("overwritten credential identity cannot borrow another account's reserves", async () => {
     let requests = 0;
     const result = await probeAccount(
@@ -235,5 +283,41 @@ describe("account-scoped quota collector", () => {
       }) as typeof fetch,
     });
     expect(methods).toEqual(["GET", "GET"]);
+  });
+  test("notice reconciliation follows real observations and its failure cannot undo healthy capacity", async () => {
+    const order: string[] = [],
+      errors: unknown[][] = [];
+    const saved = console.error;
+    console.error = (...args) => {
+      errors.push(args);
+    };
+    try {
+      const result = await collectAccounts({
+        apiUrl: "http://swarm.invalid",
+        apiKey: "fixture",
+        sidecarUrl: "http://sidecar.invalid",
+        sidecarToken: "fixture",
+        now: () => now,
+        codexCredential: async () => ({ access, accountId: "test-workspace" }),
+        fetchImpl: (async (url, init) => {
+          if (String(url).endsWith("/accounts")) return Response.json({ accounts: [account] });
+          if (String(url).endsWith("/observation")) {
+            order.push("observation");
+            return Response.json({});
+          }
+          if (String(url).endsWith("/account-auth-notices/reconcile")) {
+            expect(init?.body).toBeUndefined();
+            order.push("notices");
+            return new Response("sensitive upstream fixture", { status: 503 });
+          }
+          return Response.json({ rate_limit: { allowed: true, primary_window: window(18000) } });
+        }) as typeof fetch,
+      });
+      expect(result).toEqual([{ accountId: account.id, state: "healthy", published: true }]);
+      expect(order).toEqual(["observation", "notices"]);
+      expect(errors).toEqual([["Account renewal notice reconciliation unavailable"]]);
+    } finally {
+      console.error = saved;
+    }
   });
 });
