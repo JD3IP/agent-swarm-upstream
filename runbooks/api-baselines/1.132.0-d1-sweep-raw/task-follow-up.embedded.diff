@@ -1,0 +1,22 @@
+--- /home/jodyernst/releases/account-capacity-runtime-e6cb79c0/api-module-diffs/src_http_tasks.ts.live	2026-10-30 15:29:23.147707684 +1100
++++ /home/jodyernst/releases/account-capacity-runtime-e6cb79c0/api-module-diffs/src_http_tasks.ts.baseline	2026-10-30 15:29:23.147707684 +1100
+@@ -134,8 +134,7 @@
+     requestedByUserId: exports_external.string().optional(),
+     model: exports_external.string().optional(),
+     modelTier: ModelTierSchema.optional(),
+-    effort: ReasoningEffortSchema.optional(),
+-    followUpConfig: FollowUpConfigSchema.optional()
++    effort: ReasoningEffortSchema.optional()
+   }),
+   responses: {
+     201: { description: "Task created", schema: AgentTaskSchema },
+@@ -596,8 +595,7 @@
+           model: parsed.body.model,
+           modelTier: parsed.body.modelTier
+         }),
+-        effort: parsed.body.effort,
+-        followUpConfig: parsed.body.followUpConfig
++        effort: parsed.body.effort
+       });
+       ensure({
+         id: "created",

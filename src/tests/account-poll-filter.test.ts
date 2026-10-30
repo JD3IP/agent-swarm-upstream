@@ -69,6 +69,23 @@ async function poll(agentId: string, taskId?: string) {
 }
 
 describe("task-filtered account admission polling", () => {
+  test("HTTP task creation retains the installed raw-sweep follow-up configuration", async () => {
+    const lead = createAgent({ name: "lead", isLead: true, status: "idle", maxTasks: 1 });
+    const config = {
+      disabled: true,
+      onCompleted: "raw-sweep-complete",
+      onFailed: "raw-sweep-failed",
+    };
+    const response = await fetch(`${taskOrigin}/api/tasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agent-ID": lead.id },
+      body: JSON.stringify({ task: "raw sweep fixture", followUpConfig: config }),
+    });
+    expect(response.status).toBe(201);
+    const created = (await response.json()) as { id: string; followUpConfig: unknown };
+    expect(created.followUpConfig).toEqual(config);
+    expect(getTaskById(created.id)?.followUpConfig).toEqual(config);
+  });
   test("HTTP managed builder handoff preserves the queued review and review-retry provenance", async () => {
     const builder = createAgent({ name: "builder", isLead: false, status: "idle", maxTasks: 1 });
     const reviewer = createAgent({ name: "reviewer", isLead: false, status: "idle", maxTasks: 1 });

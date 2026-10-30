@@ -1,6 +1,14 @@
+import type {
+  Message,
+  MessageCreateParamsNonStreaming,
+  Tool,
+  ToolUseBlock,
+} from "@anthropic-ai/sdk/resources/messages";
 import { z } from "zod";
+import { getResolvedConfig } from "../../be/db";
 import type { ExecutorMeta } from "../../types";
 import { getOpenRouterBaseUrl } from "../../utils/openrouter-base-url";
+import { validateJsonSchema } from "../json-schema-validator";
 import { BaseExecutor, type ExecutorResult } from "./base";
 
 // ─── Schemas ────────────────────────────────────────────────
@@ -10,22 +18,109 @@ export const RawLlmConfigSchema = z.object({
   model: z.string().optional(),
   schema: z.record(z.string(), z.unknown()).optional(),
   fallbackPort: z.string().optional(),
+  provider: z.enum(["openrouter", "anthropic"]).optional(),
+  agentId: z.string().optional(),
+  maxTokens: z.number().int().min(1).max(4096).optional(),
 });
 
 export const RawLlmOutputSchema = z.object({
   result: z.unknown(),
   model: z.string(),
+  usage: z
+    .object({
+      inputTokens: z.number().int().nonnegative(),
+      outputTokens: z.number().int().nonnegative(),
+      cacheReadTokens: z.number().int().nonnegative(),
+      cacheWriteTokens: z.number().int().nonnegative(),
+    })
+    .optional(),
 });
+
+function resolveAnthropicKey(agentId?: string): string | undefined {
+  if (agentId) {
+    const scoped = getResolvedConfig(agentId).find((config) => config.key === "ANTHROPIC_API_KEY");
+    if (scoped?.value) return scoped.value;
+  }
+  return process.env.ANTHROPIC_API_KEY;
+}
+
+async function createAnthropicMessage(
+  apiKey: string,
+  params: MessageCreateParamsNonStreaming,
+): Promise<Message> {
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  const client = new Anthropic({ apiKey });
+  return await client.messages.create(params);
+}
 
 export async function executeRawLlm(
   config: z.infer<typeof RawLlmConfigSchema>,
+  dependencies: { anthropicCreate?: typeof createAnthropicMessage } = {},
 ): Promise<
   | { status: "success"; output: z.infer<typeof RawLlmOutputSchema>; error?: string }
   | { status: "failed"; error: string }
 > {
-  const modelName = config.model ?? "google/gemini-3-flash-preview";
+  const provider = config.provider ?? "openrouter";
+  const modelName =
+    config.model ??
+    (provider === "anthropic" ? "claude-sonnet-5" : "google/gemini-3-flash-preview");
 
   try {
+    if (provider === "anthropic") {
+      const apiKey = resolveAnthropicKey(config.agentId);
+      if (!apiKey) throw new Error("ANTHROPIC_API_KEY is unavailable for the requested agent");
+      const params: MessageCreateParamsNonStreaming = {
+        model: modelName,
+        max_tokens: config.maxTokens ?? 512,
+        messages: [{ role: "user", content: config.prompt }],
+      };
+      if (config.schema) {
+        params.tools = [
+          {
+            name: "submit_result",
+            description: "Return the requested structured result.",
+            input_schema: config.schema as Tool.InputSchema,
+          },
+        ];
+        params.tool_choice = { type: "tool", name: "submit_result" };
+      }
+      const create = dependencies.anthropicCreate ?? createAnthropicMessage;
+      const response = await create(apiKey, params);
+      const result = config.schema
+        ? (
+            response.content.find(
+              (part) => part.type === "tool_use" && part.name === "submit_result",
+            ) as ToolUseBlock | undefined
+          )?.input
+        : response.content
+            .filter((part) => part.type === "text")
+            .map((part) => part.text ?? "")
+            .join("\n");
+      if (result === undefined || result === "") {
+        throw new Error("Anthropic returned no usable result");
+      }
+      if (config.schema) {
+        const validationErrors = validateJsonSchema(config.schema, result);
+        if (validationErrors.length > 0) {
+          throw new Error(
+            `Anthropic result failed schema validation: ${validationErrors.join("; ")}`,
+          );
+        }
+      }
+      return {
+        status: "success",
+        output: {
+          result,
+          model: modelName,
+          usage: {
+            inputTokens: response.usage?.input_tokens ?? 0,
+            outputTokens: response.usage?.output_tokens ?? 0,
+            cacheReadTokens: response.usage?.cache_read_input_tokens ?? 0,
+            cacheWriteTokens: response.usage?.cache_creation_input_tokens ?? 0,
+          },
+        },
+      };
+    }
     const { createOpenAI } = await import("@ai-sdk/openai");
     const openrouter = createOpenAI({
       baseURL: getOpenRouterBaseUrl(),

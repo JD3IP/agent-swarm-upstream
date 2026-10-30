@@ -31149,6 +31149,21 @@
                   },
                   "fallbackPort": {
                     "type": "string"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "enum": [
+                      "openrouter",
+                      "anthropic"
+                    ]
+                  },
+                  "agentId": {
+                    "type": "string"
+                  },
+                  "maxTokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4096
                   }
                 },
                 "required": [
@@ -31169,6 +31184,33 @@
                     "result": {},
                     "model": {
                       "type": "string"
+                    },
+                    "usage": {
+                      "type": "object",
+                      "properties": {
+                        "inputTokens": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "outputTokens": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "cacheReadTokens": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "cacheWriteTokens": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "required": [
+                        "inputTokens",
+                        "outputTokens",
+                        "cacheReadTokens",
+                        "cacheWriteTokens"
+                      ]
                     }
                   },
                   "required": [
@@ -37671,6 +37713,9 @@
                       "xhigh",
                       "max"
                     ]
+                  },
+                  "followUpConfig": {
+                    "$ref": "#/components/schemas/FollowUpConfig"
                   }
                 },
                 "required": [

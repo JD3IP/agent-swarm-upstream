@@ -1,0 +1,155 @@
+function resolveAnthropicKey(agentId) {
+  if (agentId) {
+    const scoped = getResolvedConfig(agentId).find((config3) => config3.key === "ANTHROPIC_API_KEY");
+    if (scoped?.value)
+      return scoped.value;
+  }
+  return process.env.ANTHROPIC_API_KEY;
+}
+async function createAnthropicMessage(apiKey, params) {
+  const { default: Anthropic2 } = await Promise.resolve().then(() => (init_sdk(), exports_sdk));
+  const client2 = new Anthropic2({ apiKey });
+  return await client2.messages.create(params);
+}
+async function executeRawLlm(config3, dependencies = {}) {
+  const provider = config3.provider ?? "openrouter";
+  const modelName = config3.model ?? (provider === "anthropic" ? "claude-sonnet-5" : "google/gemini-3-flash-preview");
+  try {
+    if (provider === "anthropic") {
+      const apiKey = resolveAnthropicKey(config3.agentId);
+      if (!apiKey)
+        throw new Error("ANTHROPIC_API_KEY is unavailable for the requested agent");
+      const params = {
+        model: modelName,
+        max_tokens: config3.maxTokens ?? 512,
+        messages: [{ role: "user", content: config3.prompt }]
+      };
+      if (config3.schema) {
+        params.tools = [
+          {
+            name: "submit_result",
+            description: "Return the requested structured result.",
+            input_schema: config3.schema
+          }
+        ];
+        params.tool_choice = { type: "tool", name: "submit_result" };
+      }
+      const create = dependencies.anthropicCreate ?? createAnthropicMessage;
+      const response = await create(apiKey, params);
+      const result = config3.schema ? response.content.find((part) => part.type === "tool_use" && part.name === "submit_result")?.input : response.content.filter((part) => part.type === "text").map((part) => part.text ?? "").join(`
+`);
+      if (result === undefined || result === "") {
+        throw new Error("Anthropic returned no usable result");
+      }
+      if (config3.schema) {
+        const validationErrors = validateJsonSchema(config3.schema, result);
+        if (validationErrors.length > 0) {
+          throw new Error(`Anthropic result failed schema validation: ${validationErrors.join("; ")}`);
+        }
+      }
+      return {
+        status: "success",
+        output: {
+          result,
+          model: modelName,
+          usage: {
+            inputTokens: response.usage?.input_tokens ?? 0,
+            outputTokens: response.usage?.output_tokens ?? 0,
+            cacheReadTokens: response.usage?.cache_read_input_tokens ?? 0,
+            cacheWriteTokens: response.usage?.cache_creation_input_tokens ?? 0
+          }
+        }
+      };
+    }
+    const { createOpenAI: createOpenAI2 } = await Promise.resolve().then(() => (init_dist6(), exports_dist));
+    const openrouter = createOpenAI2({
+      baseURL: getOpenRouterBaseUrl(),
+      apiKey: process.env.OPENROUTER_API_KEY
+    });
+    const model = openrouter(modelName);
+    if (config3.schema) {
+      const { generateObject: generateObject2, jsonSchema: jsonSchema3 } = await Promise.resolve().then(() => (init_dist8(), exports_dist2));
+      const { object: object5 } = await generateObject2({
+        model,
+        schema: jsonSchema3(config3.schema),
+        prompt: config3.prompt,
+        providerOptions: {
+          openai: { strictJsonSchema: false }
+        }
+      });
+      return {
+        status: "success",
+        output: { result: object5, model: modelName }
+      };
+    }
+    const { generateText: generateText2 } = await Promise.resolve().then(() => (init_dist8(), exports_dist2));
+    const { text: text2 } = await generateText2({
+      model,
+      prompt: config3.prompt
+    });
+    return {
+      status: "success",
+      output: { result: text2, model: modelName }
+    };
+  } catch (err) {
+    const httpStatus = err?.status ?? err?.statusCode;
+    const isRateLimited = httpStatus === 429 || httpStatus === 529 || err instanceof Error && /rate.?limit|too many requests|529/i.test(err.message);
+    if (isRateLimited) {
+      throw err;
+    }
+    if (config3.fallbackPort) {
+      return {
+        status: "success",
+        output: { result: null, model: modelName },
+        error: `LLM call failed, using fallback port: ${err instanceof Error ? err.message : String(err)}`
+      };
+    }
+    return {
+      status: "failed",
+      error: `LLM call failed: ${err instanceof Error ? err.message : String(err)}`
+    };
+  }
+}
+var RawLlmConfigSchema, RawLlmOutputSchema, RawLlmExecutor;
+var init_raw_llm = __esm(() => {
+  init_zod();
+  init_db();
+  RawLlmConfigSchema = exports_external.object({
+    prompt: exports_external.string(),
+    model: exports_external.string().optional(),
+    schema: exports_external.record(exports_external.string(), exports_external.unknown()).optional(),
+    fallbackPort: exports_external.string().optional(),
+    provider: exports_external.enum(["openrouter", "anthropic"]).optional(),
+    agentId: exports_external.string().optional(),
+    maxTokens: exports_external.number().int().min(1).max(4096).optional()
+  });
+  RawLlmOutputSchema = exports_external.object({
+    result: exports_external.unknown(),
+    model: exports_external.string(),
+    usage: exports_external.object({
+      inputTokens: exports_external.number().int().nonnegative(),
+      outputTokens: exports_external.number().int().nonnegative(),
+      cacheReadTokens: exports_external.number().int().nonnegative(),
+      cacheWriteTokens: exports_external.number().int().nonnegative()
+    }).optional()
+  });
+  RawLlmExecutor = class RawLlmExecutor extends BaseExecutor {
+    type = "raw-llm";
+    mode = "instant";
+    configSchema = RawLlmConfigSchema;
+    outputSchema = RawLlmOutputSchema;
+    async execute(config3, context3, _meta2) {
+      const prompt = this.deps.interpolate(config3.prompt, context3);
+      const result = await executeRawLlm({ ...config3, prompt });
+      if (result.status === "success" && result.error) {
+        return {
+          status: "success",
+          output: result.output,
+          nextPort: config3.fallbackPort,
+          error: result.error
+        };
+      }
+      return result;
+    }
+  };
+});

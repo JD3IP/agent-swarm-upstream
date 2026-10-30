@@ -1,0 +1,18 @@
+{
+  "compileExit": 0,
+  "tail": [
+    "[1180ms]  bundle  2811 modules",
+    " [180ms] compile  ./api-recovered-baseline"
+  ],
+  "binarySha256": "3dea575006e45d4e4b1fe7d0b7517bc672a747d7d1c1d241c4b6ccc1cdad64e1",
+  "liveProjectModules": 510,
+  "recoveredProjectModules": 510,
+  "differentModules": [],
+  "embeddedExactEqual": true,
+  "liveImage": "sha256:decb37f21ad6f36ba0003e5ea13c8da4a0ac704c1c26226cc37f103024dfb6e5",
+  "liveBinarySha256": "2974d7d356b42630cc28355fd103579abfe9142c4fb26abfafc90fb1a61c7d91",
+  "reconstructionPatchSha256": "1b58243fd42eb28b213606748953fd319624992f20461dc1d985e8d68d55faa1",
+  "embeddedBytes": 23057277,
+  "liveEmbeddedSha256": "06ed72afc93a2b027ff7739e7912b99531fbd1a3f1d3d3c04f407dd658519a17",
+  "recoveredEmbeddedSha256": "06ed72afc93a2b027ff7739e7912b99531fbd1a3f1d3d3c04f407dd658519a17"
+}

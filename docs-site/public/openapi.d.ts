@@ -14790,6 +14790,7 @@ export interface paths {
                         modelTier?: "smol" | "regular" | "smart" | "ultra";
                         /** @enum {string} */
                         effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
+                        followUpConfig?: components["schemas"]["FollowUpConfig"];
                     };
                 };
             };
@@ -22728,6 +22729,10 @@ export interface operations {
                         [key: string]: unknown;
                     };
                     fallbackPort?: string;
+                    /** @enum {string} */
+                    provider?: "openrouter" | "anthropic";
+                    agentId?: string;
+                    maxTokens?: number;
                 };
             };
         };
@@ -22741,6 +22746,12 @@ export interface operations {
                     "application/json": {
                         result?: unknown;
                         model: string;
+                        usage?: {
+                            inputTokens: number;
+                            outputTokens: number;
+                            cacheReadTokens: number;
+                            cacheWriteTokens: number;
+                        };
                     };
                 };
             };

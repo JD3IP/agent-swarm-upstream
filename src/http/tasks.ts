@@ -56,6 +56,7 @@ import {
   type AgentTaskStatus,
   AgentTaskStatusSchema,
   AssetKeySchema,
+  FollowUpConfigSchema,
   isTerminalTaskStatus,
   ModelTierSchema,
   OnUnsupportedSchema,
@@ -237,6 +238,7 @@ const createTask = route({
     model: z.string().optional(),
     modelTier: ModelTierSchema.optional(),
     effort: ReasoningEffortSchema.optional(),
+    followUpConfig: FollowUpConfigSchema.optional(),
   }),
   responses: {
     201: { description: "Task created", schema: AgentTaskSchema },
@@ -786,6 +788,7 @@ export async function handleTasks(
           modelTier: parsed.body.modelTier,
         }),
         effort: parsed.body.effort,
+        followUpConfig: parsed.body.followUpConfig,
       });
 
       ensure({
