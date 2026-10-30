@@ -126,6 +126,39 @@ The adapter's actually-applied level flows back through `ProviderResult.appliedR
 
 Refs: [reasoning-effort runtime control research](../thoughts/taras/research/2026-05-26-agent-reasoning-effort-runtime-control.md).
 
+## Dedicating a Codex account to one agent (slot pinning)
+
+The Codex OAuth pool (`codex_oauth_<n>`) is shared: each task draws a random, non-rate-limited slot. To dedicate one ChatGPT account to one agent (for example the Lead on its own plan), use two `swarm_config` keys, resolved per agent like `MODEL_OVERRIDE`:
+
+| Key | Scope | Meaning |
+|---|---|---|
+| `CODEX_OAUTH_PINNED_SLOT` | agent | This agent draws ONLY that slot. A pinned slot with no stored credentials logs a warning and falls back to the shared (non-reserved) pool. |
+| `CODEX_OAUTH_RESERVED_SLOTS` | global, comma-separated | Slots unpinned agents never draw. If every slot is reserved, an unpinned agent gets no shared credential (fails closed). |
+
+Both are worker-side (`parseCodexSlotPolicy` + `resolveCodexOAuthCredentialInfo` in `src/commands/runner.ts`); the API needs no change, and a worker must run this code to honour the reservation. Malformed values are ignored with a warning. Tests: `src/tests/codex-oauth-slot-policy.test.ts`.
+
+### Managed account capacity admission
+
+For capacity-controlled workers set `SWARM_ACCOUNT_MANAGED=true` in the **container startup environment**. A config-only switch cannot establish managed status when the API is unavailable at boot. Once observed, managed mode remains enabled for that worker lifetime even if its config row is removed or set false. Unmanaged workers retain legacy pool selection.
+
+The host controller writes one agent-scoped `SWARM_ACCOUNT_BINDING` JSON snapshot with `managed:true`, `state:"ready"`, `accountId`, `provider`, `model`, `credentialRef`, `credentialGeneration`, `admissionId`, `generation`, `owner`, `taskId`, `expiresAt`, and `role`. `owner` must be `account-controller:<agentId>`; `taskId` must name existing durable work. `credentialRef` is `{keyType:"codex_oauth"|"claude_oauth",scope:"global"|"agent",scopeId:null|agentId,index:<original pool index>}`. Codex currently requires global broker slots. Waiting bindings may contain just `managed:true,state:"waiting"`.
+
+For managed workers, concrete models come from the host's per-provider policy `{default,smol,regular,smart,ultra}`. Copy the effective legacy tier map into that policy before enabling the fleet; a legacy model string supports only untiered tasks, and missing tier mappings wait without admission. A binding echoes `modelTier` whenever the task has one, including when an explicit task model takes precedence. The runner uses the binding's concrete model after verifying the task's tier and explicit model still match. It does not independently remap the tier through old worker environment defaults. Unmanaged tier resolution remains unchanged.
+
+Managed workers require fresh resolved config and a matching authoritative sidecar reservation before polling and again before launch. They claim only the bound task through `GET /api/poll?taskId=...`; this suppresses unrelated offers, mentions and pool claims. The API must advertise this parameter in OpenAPI before managed workers poll, so deploy the API filter before enabling managed workers. The controller changes provider/model through existing runtime APIs before publishing a ready snapshot; a config write alone is not launch acknowledgement.
+
+Before controller `--apply`, park legacy workers and verify the new CLI binary hash or immutable image feature on **every** managed lane. Setting the managed environment flag on an old binary proves nothing: old code ignores the binding and can draw unrelated credentials. Mixed-version fleets are not automatically safe. For rollback, disable the controller and drain managed work before restoring old workers; repeat the same binary/image verification before re-enabling managed admission. Deployment and rollback remain controlled operator actions.
+
+Immediately before provider creation, the runner checks the selected credential's stable account identity and activates the sidecar reservation with a fresh runner-session nonce. Only this activation acknowledges launch. Claude tokens retain their original source scope/index for attribution. Codex refreshes retain the API-owned cross-process lock and recheck identity after refresh. Missing/blocked slots, stale configuration, identity mismatch, expired leases and sidecar outages never fall back to local auth, another account or API keys.
+
+The runner renews active admissions and aborts the provider if its lease expires. It releases only after provider completion proves that process stopped. Active admissions never become reusable merely because time elapsed or the API reports no sessions; stopped-container recovery requires host proof. Managed boot deliberately preserves previous active-session records until that proof is reconciled. Tests: `src/tests/account-admission.test.ts`, `account-managed-env.test.ts`, `account-poll-filter.test.ts`, and the strict cases in `codex-oauth-slot-policy.test.ts`.
+
+Managed Claude and Codex launches use the installed Bun executable with `--no-orphans` to supervise the complete provider descendant tree. TERM allows five seconds before a normal supervisor exit forces descendant cleanup; an abort without exit proof within eight seconds exits the worker with code 75 and retains the admission for verified container-stop recovery. Signal-killed supervisors also require container-stop recovery. Managed execution requires Linux or macOS; Windows refuses before provider launch. Production validation targets Linux. Run `bun scripts/qa-managed-provider-stop.ts` on Linux to check TERM-ignoring descendants, normal completion, JSON/stdin forwarding, and ambiguous-stop fencing without provider credentials or model calls.
+
+Quota, authentication and provider availability failures are account incidents, not ordinary failed builds. Once the provider has exited, the runner persists the account incident, then requests same-owner `POST /api/tasks/{id}/supersede` with `pinToOriginalAgent:true`, then releases its stopped admission. This managed path atomically creates a pending successor and rewrites dependent review dependencies/provenance; an interrupted review retains its completed-builder dependency, `review-of:` tag, original policy tags and portable model tier. Ordinary test failures retain the existing failure path. Sidecar/API outages keep the stopped admission fenced while durable handoff and release retry.
+
+An ambiguous activation response or provider creation failure exits the managed worker with code 75. The container supervisor must restart the whole worker container before the host can use its new `StartedAt` as proof against the old admission's `activatedAt`; an in-container process restart alone is insufficient. Today's automatic recovery scope is the directly assigned sweep/build/review pipeline. Workflow-step capacity interruptions are safely paused and require operator/workflow-engine resumption; they are never silently failed or automatically resumed as ordinary worker tasks.
+
 ## pi-mono + Amazon Bedrock auth
 
 ### Mode selection

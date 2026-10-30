@@ -42,7 +42,11 @@ import { findUserById } from "../be/users";
 import { can, type RbacPrincipal, type RbacResource } from "../rbac";
 import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
 import { guardTerminalTaskResultWrite } from "../tasks/terminal-result-guard";
-import { createResumeFollowUp, createWorkerTaskFollowUp } from "../tasks/worker-follow-up";
+import {
+  createManagedCapacityResume,
+  createResumeFollowUp,
+  createWorkerTaskFollowUp,
+} from "../tasks/worker-follow-up";
 import {
   AgentLogSchema,
   type AgentTask,
@@ -153,7 +157,7 @@ const FinishTaskConflictSchema = z.object({
 
 const SupersedeTaskResponseSchema = z.object({
   success: z.literal(true),
-  kind: z.enum(["alreadyFinished", "workflow-failed", "resumed"]),
+  kind: z.enum(["alreadyFinished", "workflow-failed", "resumed", "capacity-paused"]),
   task: AgentTaskSchema.nullable(),
   resumeTaskId: z.string().nullable(),
   resumeTaskStatus: AgentTaskStatusSchema.optional(),
@@ -533,7 +537,15 @@ const supersedeTaskRoute = route({
     'Marks the original task `superseded` (terminal) and creates a fresh `taskType="resume"` follow-up so a worker can pick up the work in a new provider session. Workflow-step tasks (those with `workflowRunStepId`) are carved out: the original is marked `failed` with reason `superseded_workflow_task` and no follow-up is created — the workflow engine\'s retry/failure policy applies.',
   tags: ["Tasks"],
   params: z.object({ id: z.string() }),
-  body: z.object({ reason: ResumeReasonSchema }),
+  body: z.object({
+    reason: ResumeReasonSchema,
+    pinToOriginalAgent: z
+      .boolean()
+      .optional()
+      .describe(
+        "Keep the resume pending on the same worker during verified managed capacity recovery, even while its process is offline.",
+      ),
+  }),
   auth: { apiKey: true, agentId: true },
   responses: {
     200: {
@@ -1473,6 +1485,11 @@ export async function handleTasks(
       return true;
     }
 
+    if (parsed.body.pinToOriginalAgent && (!myAgentId || task.agentId !== myAgentId)) {
+      jsonError(res, "Managed recovery requires the original agent identity", 403);
+      return true;
+    }
+
     if (myAgentId && task.agentId !== myAgentId) {
       jsonError(res, "Task belongs to another agent", 403);
       return true;
@@ -1500,6 +1517,17 @@ export async function handleTasks(
     // Check this BEFORE the supersede UPDATE so we don't leave a workflow
     // step in `superseded` if the engine expects `failed`.
     if (task.workflowRunStepId != null) {
+      if (parsed.body.pinToOriginalAgent) {
+        const paused = pauseTask(task.id);
+        supersedeTaskRoute.respond(res, 200, {
+          success: true,
+          kind: "capacity-paused",
+          task: paused,
+          resumeTaskId: null,
+          resumeTaskStatus: "paused",
+        });
+        return true;
+      }
       const failed = failTask(parsed.params.id, "superseded_workflow_task");
       ensure({
         id: "task.workflow_step_failed_on_supersede",
@@ -1517,6 +1545,22 @@ export async function handleTasks(
         kind: "workflow-failed",
         task: failed,
         resumeTaskId: null,
+      });
+      return true;
+    }
+
+    if (parsed.body.pinToOriginalAgent) {
+      const recovered = createManagedCapacityResume(task.id, parsed.body.reason);
+      if (!recovered) {
+        jsonError(res, "Task changed before managed capacity handoff", 409);
+        return true;
+      }
+      supersedeTaskRoute.respond(res, 200, {
+        success: true,
+        kind: "resumed",
+        task: recovered.task,
+        resumeTaskId: recovered.resume.id,
+        resumeTaskStatus: recovered.resume.status,
       });
       return true;
     }
@@ -1547,6 +1591,7 @@ export async function handleTasks(
     const followUp = createResumeFollowUp({
       parentId: parsed.params.id,
       reason: parsed.body.reason,
+      pinToOriginalAgent: parsed.body.pinToOriginalAgent,
     });
 
     // `workflow-skip` is unreachable here (workflow-step path branched above).

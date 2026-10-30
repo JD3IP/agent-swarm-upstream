@@ -34,12 +34,14 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import { join } from "node:path";
 import { closeDb, initDb } from "../be/db";
 import { handleOAuthLocks } from "../http/oauth-locks";
 import { resolveCodexAuthMode } from "../providers/codex-adapter.js";
 import { resetFetchForTesting, setFetchForTesting } from "../providers/codex-oauth/flow.js";
 import type { CodexOAuthCredentials } from "../providers/codex-oauth/types.js";
 import type { ProviderEvent, ProviderSessionConfig } from "../providers/types.js";
+import { codexAccountIdentity } from "../utils/account-identity";
 
 const TEST_DB_PATH = "./test-codex-adapter-pool-auth-revalidate.sqlite";
 const MOCK_API_URL = "http://localhost:3013";
@@ -106,14 +108,14 @@ function fakeAuthJsonFs(initialContent: string) {
   let file: string | null = initialContent;
   const fs = {
     readFile: async (path: string): Promise<string> => {
-      if (path !== `${FAKE_HOME}/.codex/auth.json` || file === null) {
+      if (path !== join(FAKE_HOME, ".codex", "auth.json") || file === null) {
         throw new Error("ENOENT");
       }
       return file;
     },
     mkdir: async (): Promise<undefined> => undefined,
     writeFile: async (path: string, data: string): Promise<void> => {
-      expect(path).toBe(`${FAKE_HOME}/.codex/auth.json`);
+      expect(path).toBe(join(FAKE_HOME, ".codex", "auth.json"));
       file = data;
     },
   };
@@ -147,6 +149,63 @@ function installMockTransport(store: { creds: CodexOAuthCredentials }): void {
 }
 
 describe("resolveCodexAuthMode — pool path revalidates through the lock", () => {
+  it("managed broker identity mismatch refuses before replacing the existing auth file", async () => {
+    setFetchForTesting(async () => {
+      throw new Error("Unexpected external refresh");
+    });
+    const access = `header.${Buffer.from(JSON.stringify({ sub: "actual-user" })).toString("base64url")}.signature`;
+    const store = {
+      creds: {
+        access,
+        refresh: "fake-refresh",
+        expires: Date.now() + 30 * 86_400_000,
+        accountId: "workspace",
+      },
+    };
+    installMockTransport(store);
+    const original = JSON.stringify({ auth_mode: "chatgpt", tokens: { account_id: "original" } });
+    const { fs, homedir, readCurrent } = fakeAuthJsonFs(original);
+    await expect(
+      resolveCodexAuthMode(
+        { ...baseConfig(0), expectedAccountIdentity: "different-identity" },
+        () => {},
+        { homedir, fs },
+      ),
+    ).rejects.toThrow("[auth-error] Managed Codex credential identity changed");
+    expect(readCurrent()).toBe(original);
+  });
+
+  it("managed account auth writes fail closed even when old auth.json is in ChatGPT mode", async () => {
+    setFetchForTesting(async () => {
+      throw new Error("Unexpected external refresh");
+    });
+    const access = `header.${Buffer.from(JSON.stringify({ sub: "actual-user" })).toString("base64url")}.signature`;
+    const store = {
+      creds: {
+        access,
+        refresh: "fake-refresh",
+        expires: Date.now() + 30 * 86_400_000,
+        accountId: "workspace",
+      },
+    };
+    installMockTransport(store);
+    const { fs, homedir } = fakeAuthJsonFs(JSON.stringify({ auth_mode: "chatgpt" }));
+    await expect(
+      resolveCodexAuthMode(
+        { ...baseConfig(0), expectedAccountIdentity: codexAccountIdentity(access, "workspace") },
+        () => {},
+        {
+          homedir,
+          fs: {
+            ...fs,
+            writeFile: async () => {
+              throw new Error("read only");
+            },
+          },
+        },
+      ),
+    ).rejects.toThrow("[auth-error] Could not materialize the reserved Codex account");
+  });
   it("refreshes an expired pool slot through the lock even though auth.json is already chatgpt mode", async () => {
     const store = {
       creds: {

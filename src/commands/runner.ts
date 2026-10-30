@@ -23,7 +23,10 @@ import { renderMemoriesPrompt } from "../prompts/memories.ts";
 import { configureHttpResolver, resolveTemplateAsync } from "../prompts/resolver.ts";
 import { renderSteeringDelivery } from "../prompts/steering-delivery.ts";
 import { authJsonToCredentialSelection } from "../providers/codex-oauth/auth-json.js";
-import { materializeCodexAuthJson } from "../providers/codex-oauth/auth-json-fs.js";
+import {
+  materializeCodexAuthJson,
+  resolveCodexAuthDirectory,
+} from "../providers/codex-oauth/auth-json-fs.js";
 import { loadAllCodexOAuthSlots } from "../providers/codex-oauth/storage.js";
 import {
   type CostData,
@@ -43,6 +46,7 @@ import {
   resolveTaskModelSelection,
   type SteeringMessage,
 } from "../types.ts";
+import { claudeAccountIdentity, codexAccountIdentity } from "../utils/account-identity.ts";
 import { getApiKey } from "../utils/api-key.ts";
 import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
@@ -65,6 +69,23 @@ import { isSteeringEnabled } from "../utils/steering-enabled.ts";
 import { interpolate } from "../utils/template.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
 import { validateJsonSchema } from "../workflows/json-schema-validator.ts";
+import type { AccountAdmission } from "./account-admission.ts";
+import {
+  AccountCapacityWaitError,
+  assertAdmissionMatches,
+  classifyAccountIncident,
+  clearManagedCredentials,
+  completeManagedAccountSession,
+  isAccountManaged,
+  loadExpectedAccountIdentity,
+  maintainAccountAdmission,
+  managedTaskModel,
+  readAccountBinding,
+  readClaudeAccountProfile,
+  selectManagedClaudeCredential,
+  verifyAccountAdmission,
+  verifyTaskFilteredPollSupport,
+} from "./account-admission.ts";
 import { buildContextPreamble, buildResumeContextPreamble } from "./context-preamble.ts";
 import { awaitCredentials, BootMaxWaitExceededError, EX_CONFIG } from "./credential-wait.ts";
 import {
@@ -653,6 +674,8 @@ async function closeAgent(config: ApiConfig, role: string): Promise<void> {
 export interface ResolvedEnvResult {
   env: Record<string, string | undefined>;
   credentialSelections: CredentialSelection[];
+  /** Managed admission must distinguish an authoritative response from cached boot env. */
+  configFetched: boolean;
   /** Raw config-row value, kept separate from the merged environment so an
    * actual worker environment variable retains precedence. */
   scriptsOnlyConfigValue?: string;
@@ -674,6 +697,9 @@ export async function fetchResolvedEnv(
 ): Promise<ResolvedEnvResult> {
   const env: Record<string, string | undefined> = { ...baseEnv };
   let scriptsOnlyConfigValue: string | undefined;
+  let configFetched = false;
+  let configRows: Array<{ key: string; value: string; scope?: string; scopeId?: string | null }> =
+    [];
 
   if (apiUrl && agentId) {
     try {
@@ -681,14 +707,17 @@ export async function fetchResolvedEnv(
       if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
       const url = `${apiUrl}/api/config/resolved?agentId=${encodeURIComponent(agentId)}&includeSecrets=true`;
-      const response = await fetch(url, { headers });
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(5_000) });
 
       if (!response.ok) {
         console.warn(`[env-reload] Failed to fetch config: ${response.status}`);
       } else {
         const data = (await response.json()) as {
-          configs: Array<{ key: string; value: string }>;
+          configs: typeof configRows;
         };
+        if (!Array.isArray(data.configs)) throw new Error("Invalid config response");
+        configFetched = true;
+        configRows = data.configs;
 
         if (data.configs?.length) {
           scriptsOnlyConfigValue = data.configs.find(
@@ -739,21 +768,38 @@ export async function fetchResolvedEnv(
   // (e.g. OPENAI_API_KEY when an OpenRouter model is selected on opencode).
   const effectiveModel = taskModel || (env.MODEL_OVERRIDE as string | undefined) || "";
 
-  const credentialSelections = await resolveCredentialPools(env, {
-    apiUrl,
-    apiKey,
-    // Provider-aware selection: codex tasks should not get a
-    // CLAUDE_CODE_OAUTH_TOKEN stamped on their task record (and vice
-    // versa) just because both env vars happen to be set in the worker
-    // container. See `PROVIDER_CREDENTIAL_VARS` in src/utils/credentials.ts.
-    //
-    // Use the resolved provider (swarm_config > env) so an operator can flip
-    // the worker's harness from the dashboard without restarting the container.
-    provider: resolvedProvider,
-    model: effectiveModel,
-  });
+  let credentialSelections: CredentialSelection[];
+  if (isAccountManaged(env)) {
+    // Management is sticky for the worker lifetime, even if a config row vanishes.
+    process.env.SWARM_ACCOUNT_MANAGED = "true";
+    env.SWARM_ACCOUNT_MANAGED = "true";
+    try {
+      const binding = readAccountBinding(env, agentId);
+      credentialSelections = selectManagedClaudeCredential(env, binding, configRows);
+    } catch (error) {
+      if (!(error instanceof AccountCapacityWaitError)) throw error;
+      // Waiting is a normal boot/config state, not a process failure. Actual task
+      // admission revalidates the binding and refuses to poll or start a provider.
+      clearManagedCredentials(env);
+      credentialSelections = [];
+    }
+  } else {
+    credentialSelections = await resolveCredentialPools(env, {
+      apiUrl,
+      apiKey,
+      // Provider-aware selection: codex tasks should not get a
+      // CLAUDE_CODE_OAUTH_TOKEN stamped on their task record (and vice
+      // versa) just because both env vars happen to be set in the worker
+      // container. See `PROVIDER_CREDENTIAL_VARS` in src/utils/credentials.ts.
+      //
+      // Use the resolved provider (swarm_config > env) so an operator can flip
+      // the worker's harness from the dashboard without restarting the container.
+      provider: resolvedProvider,
+      model: effectiveModel,
+    });
+  }
 
-  return { env, credentialSelections, resolvedProvider, scriptsOnlyConfigValue };
+  return { env, credentialSelections, resolvedProvider, scriptsOnlyConfigValue, configFetched };
 }
 
 async function ensureAgentFsCredentials(
@@ -1536,11 +1582,49 @@ async function reportKeyUsage(
 export interface CodexOAuthCredentialInfo {
   selection: CredentialSelection;
   isPoolBacked: boolean;
+  identityKey?: string;
+}
+
+/**
+ * Per-agent Codex pool-slot policy, resolved from the worker's swarm_config env.
+ *
+ * - `CODEX_OAUTH_PINNED_SLOT` (agent scope): this agent draws ONLY that slot.
+ * - `CODEX_OAUTH_RESERVED_SLOTS` (global scope, comma-separated): slots that
+ *   unpinned agents must never draw. Together they dedicate one ChatGPT
+ *   account to one agent (e.g. the Lead) without a second pool.
+ *
+ * Malformed values are ignored with a warning rather than wedging the worker.
+ */
+export interface CodexSlotPolicy {
+  pinnedSlot?: number;
+  reservedSlots: number[];
+  /** Managed tasks refuse missing, blocked or unavailable account selection. */
+  strict?: boolean;
+}
+
+export function parseCodexSlotPolicy(env: Record<string, string | undefined>): CodexSlotPolicy {
+  const parseSlot = (raw: string, name: string): number | undefined => {
+    const str = raw.trim();
+    if (!/^\d+$/.test(str)) {
+      console.warn(`[credentials] Ignoring invalid ${name} entry ${JSON.stringify(raw)}`);
+      return undefined;
+    }
+    return Number(str);
+  };
+  const pinnedRaw = env.CODEX_OAUTH_PINNED_SLOT?.trim();
+  const pinnedSlot = pinnedRaw ? parseSlot(pinnedRaw, "CODEX_OAUTH_PINNED_SLOT") : undefined;
+  const reservedSlots = (env.CODEX_OAUTH_RESERVED_SLOTS ?? "")
+    .split(",")
+    .filter((part) => part.trim() !== "")
+    .map((part) => parseSlot(part, "CODEX_OAUTH_RESERVED_SLOTS"))
+    .filter((n): n is number => n !== undefined);
+  return { pinnedSlot, reservedSlots };
 }
 
 export async function resolveCodexOAuthCredentialInfo(
   apiUrl?: string,
   apiKey?: string,
+  policy: CodexSlotPolicy = { reservedSlots: [] },
 ): Promise<CodexOAuthCredentialInfo | null> {
   // Pool path: enumerate slots from the config store, pick one with rate-limit
   // awareness, materialise auth.json for the selected slot.
@@ -1551,8 +1635,8 @@ export async function resolveCodexOAuthCredentialInfo(
         let availableIndices: number[] | undefined;
         try {
           const resp = await fetch(
-            `${apiUrl}/api/keys/available?keyType=CODEX_OAUTH&totalKeys=${slots.length}`,
-            { headers: { Authorization: `Bearer ${apiKey}` } },
+            `${apiUrl}/api/keys/available?keyType=CODEX_OAUTH&totalKeys=${Math.max(...slots.map((slot) => slot.slot)) + 1}`,
+            { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(5_000) },
           );
           if (resp.ok) {
             const data = (await resp.json()) as { availableIndices: number[] };
@@ -1566,10 +1650,35 @@ export async function resolveCodexOAuthCredentialInfo(
         } catch {
           // Non-critical — fall through to random selection
         }
+        if (policy.strict && !availableIndices) {
+          throw new AccountCapacityWaitError("Codex availability is unavailable");
+        }
 
-        const allSlotIndices = slots.map((s) => s.slot);
+        // Slot policy: a pinned agent uses exactly its slot; everyone else
+        // draws from the pool minus the reserved (dedicated) slots.
+        const { pinnedSlot, reservedSlots } = policy;
+        const pinnedPresent = pinnedSlot !== undefined && slots.some((s) => s.slot === pinnedSlot);
+        if (policy.strict && (!pinnedPresent || !availableIndices?.includes(pinnedSlot!))) {
+          throw new AccountCapacityWaitError("reserved Codex slot is missing or blocked");
+        }
+        if (pinnedSlot !== undefined && !pinnedPresent) {
+          console.warn(
+            `[credentials] CODEX_OAUTH_PINNED_SLOT=${pinnedSlot} has no credentials in the config store — falling back to the shared pool`,
+          );
+        }
+        const allSlotIndices = pinnedPresent
+          ? [pinnedSlot!]
+          : slots.map((s) => s.slot).filter((i) => !reservedSlots.includes(i));
+        if (allSlotIndices.length === 0) {
+          console.warn(
+            `[credentials] CODEX_OAUTH: every pool slot is reserved (${reservedSlots.join(",")}) and this agent is not pinned — no shared Codex credential available`,
+          );
+          return null;
+        }
         let selectedSlot: number;
-        if (availableIndices && availableIndices.length > 0) {
+        if (pinnedPresent) {
+          selectedSlot = pinnedSlot!;
+        } else if (availableIndices && availableIndices.length > 0) {
           const eligible = allSlotIndices.filter((i) => availableIndices!.includes(i));
           const pool = eligible.length > 0 ? eligible : allSlotIndices;
           selectedSlot = pool[Math.floor(Math.random() * pool.length)]!;
@@ -1601,23 +1710,37 @@ export async function resolveCodexOAuthCredentialInfo(
           console.log(
             `[credentials] Selected CODEX_OAUTH slot ${selectedSlot + 1}/${slots.length} [...${sel.keySuffix}]`,
           );
-          return { selection: sel, isPoolBacked: true };
+          return {
+            selection: sel,
+            isPoolBacked: true,
+            ...(policy.strict
+              ? {
+                  identityKey: codexAccountIdentity(
+                    slotEntry.creds.access,
+                    slotEntry.creds.accountId,
+                  ),
+                }
+              : {}),
+          };
         }
       }
     } catch (err) {
+      if (policy.strict) {
+        if (err instanceof AccountCapacityWaitError) throw err;
+        throw new AccountCapacityWaitError("reserved Codex credential is unavailable");
+      }
       console.warn(`[credentials] Codex OAuth pool selection failed (non-fatal): ${err}`);
     }
   }
+
+  if (policy.strict) throw new AccountCapacityWaitError("reserved Codex credential is missing");
 
   // Fallback: read existing auth.json (single-credential or pre-pool deploy).
   // NOT pool-backed — `authJsonToCredentialSelection`'s default `slot = 0` is
   // bookkeeping only, not a real `codex_oauth_0` config-store entry. Callers
   // must not treat this as a pool slot (see `CodexOAuthCredentialInfo` above).
   try {
-    const home = process.env.HOME;
-    if (!home) return null;
-
-    const authFile = Bun.file(`${home}/.codex/auth.json`);
+    const authFile = Bun.file(`${resolveCodexAuthDirectory()}/auth.json`);
     if (!(await authFile.exists())) {
       return null;
     }
@@ -1741,6 +1864,7 @@ async function supersedeTaskViaAPI(
   role: string,
   taskId: string,
   reason: "graceful_shutdown" | "context_limits" | "manual_supersede",
+  pinToOriginalAgent = false,
 ): Promise<{ ok: true; resumeTaskId: string | null; kind: string } | { ok: false }> {
   const headers: Record<string, string> = {
     "X-Agent-ID": config.agentId,
@@ -1754,7 +1878,7 @@ async function supersedeTaskViaAPI(
     const response = await fetch(`${config.apiUrl}/api/tasks/${taskId}/supersede`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ reason }),
+      body: JSON.stringify({ reason, ...(pinToOriginalAgent ? { pinToOriginalAgent: true } : {}) }),
     });
 
     if (response.ok) {
@@ -1843,6 +1967,30 @@ async function pauseTaskViaAPI(config: ApiConfig, role: string, taskId: string):
 }
 
 /** Fetch paused tasks from API for this agent */
+async function parkManagedTask(config: ApiConfig, role: string, taskId: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${config.apiUrl}/api/tasks/${encodeURIComponent(taskId)}`, {
+      headers: { Authorization: `Bearer ${config.apiKey}`, "X-Agent-ID": config.agentId },
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) return false;
+    const data = (await response.json()) as {
+      task?: { status?: string; workflowRunStepId?: string };
+    } & { status?: string; workflowRunStepId?: string };
+    const task = data.task ?? data;
+    if (task.status && isTerminalTaskStatus(task.status)) return true;
+    // Workflow failure/retry belongs to the engine: a capacity pause must not
+    // invoke the legacy supersede endpoint's workflow-failed carve-out.
+    if (task.workflowRunStepId) return pauseTaskViaAPI(config, role, taskId);
+  } catch {
+    return false;
+  }
+  const parked = await supersedeTaskViaAPI(config, role, taskId, "manual_supersede", true);
+  if (parked.ok && parked.kind !== "rejected") return true;
+  if (!parked.ok) return pauseTaskViaAPI(config, role, taskId);
+  return false;
+}
+
 async function getPausedTasksFromAPI(config: ApiConfig): Promise<
   Array<{
     id: string;
@@ -2071,6 +2219,7 @@ interface RunningTask {
   triggerType?: string;
   /** Set when the promise resolves, enabling non-blocking completion checks */
   result: ProviderResult | null;
+  accountRecovery?: { waiting: boolean };
   /**
    * When the runner first saw the API report this task terminal while the
    * session was still running (see `abortSessionsForEndedTasks`).
@@ -2613,6 +2762,7 @@ interface PollOptions {
   pollInterval: number;
   pollTimeout: number;
   since?: string; // Optional: for filtering finished tasks
+  taskId?: string; // Managed sessions may claim only the specifically admitted task.
 }
 
 type RequesterProfile = NonNullable<Trigger["requestedBy"]>;
@@ -2740,9 +2890,12 @@ async function pollForTriggerOnce(opts: PollOptions): Promise<Trigger | null> {
     try {
       // Build URL with optional since parameter
       let url = `${opts.apiUrl}/api/poll`;
+      const query = new URLSearchParams();
       if (opts.since) {
-        url += `?since=${encodeURIComponent(opts.since)}`;
+        query.set("since", opts.since);
       }
+      if (opts.taskId) query.set("taskId", opts.taskId);
+      if (query.size > 0) url += `?${query}`;
 
       const response = await fetch(url, {
         method: "GET",
@@ -3245,13 +3398,11 @@ async function spawnProviderProcess(
   // Resolve env first so we can use MODEL_OVERRIDE from config.
   // Pass opts.model (per-task model) so the credential picker can apply
   // the harness × model matrix (e.g. exclude OPENAI_API_KEY for OpenRouter models).
-  const { env: freshEnv, credentialSelections } = await fetchResolvedEnv(
-    opts.apiUrl,
-    opts.apiKey,
-    opts.agentId,
-    process.env,
-    opts.model,
-  );
+  const {
+    env: freshEnv,
+    credentialSelections,
+    configFetched,
+  } = await fetchResolvedEnv(opts.apiUrl, opts.apiKey, opts.agentId, process.env, opts.model);
 
   // Report which key was selected for this task (fire-and-forget)
   if (credentialSelections.length > 0 && realTaskId) {
@@ -3279,8 +3430,27 @@ async function spawnProviderProcess(
     harnessProvider: opts.harnessProvider,
     env: freshEnv,
   });
-  const taskModel = taskModelSelection.model || "";
+  const taskModel = isAccountManaged(freshEnv)
+    ? managedTaskModel(readAccountBinding(freshEnv, opts.agentId), {
+        model: opts.model,
+        modelTier: opts.modelTier,
+      })
+    : taskModelSelection.model || "";
   const model = taskModel || configModel || "";
+  const accountClient = await verifyAccountAdmission(
+    freshEnv,
+    configFetched,
+    opts.agentId,
+    adapter.name,
+    model,
+    effectiveTaskId,
+  );
+  if (accountClient && !realTaskId) {
+    throw new AccountCapacityWaitError("managed sessions require a durable task");
+  }
+  if (accountClient?.binding.provider === "claude" && credentialSelections.length !== 1) {
+    throw new AccountCapacityWaitError("reserved Claude credential is unavailable");
+  }
 
   // Resolve Codex OAuth pool slot BEFORE building ProviderSessionConfig so we
   // can pass codexSlot through and the adapter writes token refreshes back to
@@ -3294,9 +3464,17 @@ async function spawnProviderProcess(
   // config-store slot — gates whether `codexSlot` is set below (see
   // `CodexOAuthCredentialInfo`).
   let oauthIsPoolBacked = false;
+  let selectedAccountIdentity: string | undefined;
   if (adapter.name === "codex") {
-    const oauthInfo = await resolveCodexOAuthCredentialInfo(opts.apiUrl, opts.apiKey);
+    const oauthInfo = await resolveCodexOAuthCredentialInfo(
+      opts.apiUrl,
+      opts.apiKey,
+      accountClient
+        ? { pinnedSlot: accountClient.binding.credentialRef.index, reservedSlots: [], strict: true }
+        : parseCodexSlotPolicy(freshEnv),
+    );
     oauthSelection = oauthInfo?.selection;
+    selectedAccountIdentity = oauthInfo?.identityKey;
     oauthIsPoolBacked = oauthInfo?.isPoolBacked ?? false;
     const oauthIsPrimary =
       credentialSelections.length === 0 ||
@@ -3311,6 +3489,25 @@ async function spawnProviderProcess(
         oauthSelection,
         realTaskId,
       ).catch(() => {});
+    }
+  }
+
+  let expectedAccountIdentity: string | undefined;
+  if (accountClient) {
+    expectedAccountIdentity = await loadExpectedAccountIdentity(freshEnv, accountClient.binding);
+    if (accountClient.binding.provider === "claude") {
+      try {
+        selectedAccountIdentity = claudeAccountIdentity(
+          await readClaudeAccountProfile(freshEnv.CLAUDE_CODE_OAUTH_TOKEN || ""),
+        );
+      } catch {
+        throw new AccountCapacityWaitError("selected Claude account identity is unavailable");
+      }
+    }
+    if (!selectedAccountIdentity || selectedAccountIdentity !== expectedAccountIdentity) {
+      throw new AccountCapacityWaitError(
+        "credential identity changed; account requires verification",
+      );
     }
   }
 
@@ -3330,6 +3527,7 @@ async function spawnProviderProcess(
     resumeSessionId: opts.resumeSessionId,
     iteration: opts.iteration,
     env: freshEnv as Record<string, string>,
+    expectedAccountIdentity,
     // Propagate the selected OAuth slot so the adapter refreshes back to the
     // correct pool key. Undefined for non-codex providers and single-cred
     // deploys — only a real pool slot (isPoolBacked) may set this, otherwise
@@ -3359,27 +3557,71 @@ async function spawnProviderProcess(
     "gen_ai.request.model": model || undefined,
   });
 
-  const session = await withSpanContext(sessionSpan, () =>
-    withSpan(
-      "worker.session.create",
-      async (span) => {
-        const createdSession = await adapter.createSession(config);
-        span.setAttribute("agentswarm.provider.session_id", createdSession.sessionId || "pending");
-        return createdSession;
-      },
-      {
-        "agent.id": opts.agentId,
-        "agentswarm.task.id": effectiveTaskId,
-        "agentswarm.task.real_id": realTaskId,
-        "agentswarm.agent.role": opts.role,
-        "agentswarm.harness_provider": opts.harnessProvider,
-        "gen_ai.request.model": model || undefined,
-        "agentswarm.session.cwd": config.cwd,
-        "agentswarm.session.vcs_repo": opts.vcsRepo,
-        "agentswarm.session.additional_args_count": opts.additionalArgs?.length ?? 0,
-      },
-    ),
-  );
+  // Activation is the launch acknowledgement/fence, not merely a provider config update.
+  // Its unique session nonce prevents a second runner from launching the same lease.
+  let activeAdmission: AccountAdmission | undefined;
+  if (accountClient) {
+    try {
+      activeAdmission = await accountClient.request("activate", {
+        taskId: effectiveTaskId,
+        sessionId: opts.runnerSessionId,
+      });
+      assertAdmissionMatches(accountClient.binding, activeAdmission, effectiveTaskId, "active");
+      if (activeAdmission.sessionId !== opts.runnerSessionId)
+        throw new AccountCapacityWaitError("reservation was activated by another session");
+    } catch {
+      // Activation may have committed even if its response was lost. A full
+      // supervisor restart gives the host a provable stopped-container fence.
+      console.error(
+        "[account-capacity] ambiguous activation; restarting supervised worker for safe recovery",
+      );
+      process.exit(75);
+    }
+  }
+  let session: ProviderSession;
+  try {
+    session = await withSpanContext(sessionSpan, () =>
+      withSpan(
+        "worker.session.create",
+        async (span) => {
+          const createdSession = await adapter.createSession(config);
+          span.setAttribute(
+            "agentswarm.provider.session_id",
+            createdSession.sessionId || "pending",
+          );
+          return createdSession;
+        },
+        {
+          "agent.id": opts.agentId,
+          "agentswarm.task.id": effectiveTaskId,
+          "agentswarm.task.real_id": realTaskId,
+          "agentswarm.agent.role": opts.role,
+          "agentswarm.harness_provider": opts.harnessProvider,
+          "gen_ai.request.model": model || undefined,
+          "agentswarm.session.cwd": config.cwd,
+          "agentswarm.session.vcs_repo": opts.vcsRepo,
+          "agentswarm.session.additional_args_count": opts.additionalArgs?.length ?? 0,
+        },
+      ),
+    );
+  } catch (error) {
+    if (accountClient && activeAdmission) {
+      console.error(
+        "[account-capacity] ambiguous provider creation; restarting supervised worker for safe recovery",
+      );
+      process.exit(75);
+    }
+    throw error;
+  }
+  let accountLeaseExpired = false;
+  const accountRecovery = { waiting: false };
+  const accountHeartbeat =
+    accountClient && activeAdmission
+      ? maintainAccountAdmission(accountClient, activeAdmission, () => {
+          accountLeaseExpired = true;
+          return session.abort("account_admission_expired");
+        })
+      : undefined;
   const initialModelReport = buildLatestModelReport({
     model,
     taskModel,
@@ -3839,6 +4081,36 @@ async function spawnProviderProcess(
   // Create promise that handles completion
   const promise: Promise<ProviderResult> = session
     .waitForCompletion()
+    .then(
+      async (result) => {
+        accountHeartbeat?.stop();
+        if (accountClient) {
+          accountRecovery.waiting = classifyAccountIncident(result, accountLeaseExpired) !== null;
+          await completeManagedAccountSession(
+            freshEnv,
+            accountClient,
+            opts.runnerSessionId,
+            result,
+            () =>
+              realTaskId
+                ? parkManagedTask(
+                    { apiUrl: opts.apiUrl, apiKey: opts.apiKey, agentId: opts.agentId },
+                    opts.role,
+                    realTaskId,
+                  )
+                : Promise.resolve(false),
+            accountLeaseExpired,
+          );
+        }
+        return result;
+      },
+      async (error: unknown) => {
+        accountHeartbeat?.stop();
+        // Provider completion rejected: process termination is not proven, so
+        // retain the active lease until the controller verifies a stopped runner.
+        throw error;
+      },
+    )
     .then((result) =>
       withSpanContext(sessionSpan, async () => {
         // Stop event flush timer and do a final flush
@@ -4024,6 +4296,7 @@ async function spawnProviderProcess(
     startTime: new Date(),
     promise,
     result: null,
+    accountRecovery,
     credentialInfo,
     // Snapshot the provider + local-env trait of the adapter this session is
     // spawned on, so the session-end sync decision survives a live provider
@@ -4158,6 +4431,7 @@ async function checkCompletedProcesses(
     model?: string;
     durationMs: number;
     assistantText?: RunningTask["assistantText"];
+    accountRecovery?: RunningTask["accountRecovery"];
   }> = [];
 
   for (const [taskId, task] of state.activeTasks) {
@@ -4180,6 +4454,7 @@ async function checkCompletedProcesses(
         model: task.model,
         durationMs: Date.now() - task.startTime.getTime(),
         assistantText: task.assistantText,
+        accountRecovery: task.accountRecovery,
       });
     }
   }
@@ -4197,6 +4472,7 @@ async function checkCompletedProcesses(
     model,
     durationMs,
     assistantText,
+    accountRecovery,
   } of completedTasks) {
     state.activeTasks.delete(taskId);
     vcsDetectedTasks.delete(taskId);
@@ -4219,7 +4495,7 @@ async function checkCompletedProcesses(
 
     // Call the finish API to ensure task status is updated
     // This is idempotent - if the agent already marked it, this is a no-op
-    if (apiConfig) {
+    if (apiConfig && !accountRecovery?.waiting) {
       let failureReason: string | undefined;
       if (result.exitCode !== 0 && result.failureReason) {
         failureReason = result.failureReason;
@@ -4996,7 +5272,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   // and starts polling immediately, with a NULL `cred_status` row that the
   // dashboard surfaces as "unreported."
   cachedCredHarnessProvider = state.harnessProvider;
-  if (isCredCheckDisabled(process.env)) {
+  if (isAccountManaged(process.env) || isCredCheckDisabled(process.env)) {
     console.log(`[${role}] CRED_CHECK_DISABLE=1, skipping credential checks`);
   } else {
     try {
@@ -5071,9 +5347,13 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   }
 
   // Clean up any stale active sessions from previous runs (crash recovery)
-  await cleanupActiveSessions(apiConfig);
-  console.log(`[${role}] Cleaned up stale active sessions`);
-  const startupRecoveredOrphans = await recoverOrphanedInProgressTasks(apiConfig);
+  if (!isAccountManaged(process.env)) {
+    await cleanupActiveSessions(apiConfig);
+    console.log(`[${role}] Cleaned up stale active sessions`);
+  }
+  const startupRecoveredOrphans = isAccountManaged(process.env)
+    ? 0
+    : await recoverOrphanedInProgressTasks(apiConfig);
   if (startupRecoveredOrphans > 0) {
     console.log(
       `[${role}] Recovered ${startupRecoveredOrphans} orphaned in-progress task(s) to pending`,
@@ -5357,6 +5637,22 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       console.log(`[${role}] Found ${pausedTasks.length} paused task(s) to resume`);
 
       for (const task of pausedTasks) {
+        if (isAccountManaged(process.env)) {
+          try {
+            const fresh = await fetchResolvedEnv(apiUrl, apiKey, agentId);
+            await verifyAccountAdmission(
+              fresh.env,
+              fresh.configFetched,
+              agentId,
+              state.harnessProvider,
+              fresh.env.MODEL_OVERRIDE || "",
+              task.id,
+            );
+          } catch (error) {
+            if (!(error instanceof AccountCapacityWaitError)) throw error;
+            continue;
+          }
+        }
         // Defensive: skip tasks that already have completion data (zombie prevention)
         if (task.finishedAt || task.output) {
           console.warn(
@@ -5542,6 +5838,11 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             isYolo,
           );
         } catch (spawnErr) {
+          if (spawnErr instanceof AccountCapacityWaitError) {
+            // A pre-launch capacity race is a durable wait, never a failed build.
+            while (!(await parkManagedTask(apiConfig, role, task.id))) await Bun.sleep(10_000);
+            continue;
+          }
           const errMsg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
           console.error(
             `[${role}] Failed to spawn process for resumed task ${task.id.slice(0, 8)}: ${errMsg}`,
@@ -5586,7 +5887,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   // ========== END: Resume paused tasks ==========
 
   // ========== Lead startup self-check ==========
-  if (isLead) {
+  if (isLead && !isAccountManaged(process.env)) {
     console.log(`[${role}] Running startup heartbeat sweep...`);
     const swept = await triggerHeartbeatSweep(apiConfig);
     if (swept) {
@@ -5658,7 +5959,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     // *resolved* harness_provider. Re-runs the snapshot when the provider
     // changes (boot, or after a live swap above) so the dashboard shows
     // up-to-date credential status for the active adapter.
-    if (!isCredCheckDisabled(process.env)) {
+    if (!isAccountManaged(process.env) && !isCredCheckDisabled(process.env)) {
       const currentHarness = state.harnessProvider;
       if (currentHarness !== cachedCredHarnessProvider) {
         cachedCredHarnessProvider = currentHarness;
@@ -5726,6 +6027,32 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
     // Only poll if we have capacity
     if (state.activeTasks.size < state.maxConcurrent) {
+      let admittedTaskId: string | undefined;
+      if (isAccountManaged(process.env)) {
+        try {
+          if (state.activeTasks.size > 0)
+            throw new AccountCapacityWaitError("account already has an active session");
+          const fresh = await fetchResolvedEnv(apiUrl, apiKey, agentId);
+          const permit = await verifyAccountAdmission(
+            fresh.env,
+            fresh.configFetched,
+            agentId,
+            state.harnessProvider,
+            fresh.env.MODEL_OVERRIDE || "",
+          );
+          if (!permit?.binding.taskId)
+            throw new AccountCapacityWaitError(
+              "a durable task reservation is required before polling",
+            );
+          await verifyTaskFilteredPollSupport(apiUrl, apiKey);
+          admittedTaskId = permit.binding.taskId;
+        } catch (error) {
+          if (!(error instanceof AccountCapacityWaitError)) throw error;
+          console.log(`[${role}] ${error.message}`);
+          await Bun.sleep(PollIntervalMs);
+          continue;
+        }
+      }
       if (Date.now() - lastOrphanRecoveryAt > ORPHAN_RECOVERY_INTERVAL_MS) {
         lastOrphanRecoveryAt = Date.now();
         const recoveredOrphans = await recoverOrphanedInProgressTasks(apiConfig);
@@ -5749,6 +6076,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         agentId,
         pollInterval: PollIntervalMs,
         pollTimeout: effectiveTimeout,
+        taskId: admittedTaskId,
       });
 
       if (trigger) {
@@ -6068,6 +6396,14 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             isYolo,
           );
         } catch (spawnErr) {
+          if (spawnErr instanceof AccountCapacityWaitError) {
+            if (trigger.taskId) {
+              while (!(await parkManagedTask(apiConfig, role, trigger.taskId)))
+                await Bun.sleep(10_000);
+            }
+            console.log(`[${role}] ${spawnErr.message}`);
+            continue;
+          }
           const errMsg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
           console.error(
             `[${role}] Failed to spawn process for task ${trigger.taskId?.slice(0, 8) || "unknown"}: ${errMsg}`,

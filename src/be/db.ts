@@ -3213,7 +3213,7 @@ export function cancelTask(id: string, reason?: string): AgentTask | null {
  */
 export function supersedeTask(
   id: string,
-  args: { reason: string; resumeTaskId: string | null },
+  args: { reason: string; resumeTaskId: string | null; preserveDependents?: boolean },
 ): AgentTask | null {
   const oldTask = getTaskById(id);
   if (!oldTask) return null;
@@ -3279,10 +3279,12 @@ export function supersedeTask(
         ),
       );
 
-    try {
-      cascadeFailDependents(id, "superseded");
-    } catch (err) {
-      console.error("[supersedeTask] cascade-fail dependents error:", err);
+    if (!args.preserveDependents) {
+      try {
+        cascadeFailDependents(id, "superseded");
+      } catch (err) {
+        console.error("[supersedeTask] cascade-fail dependents error:", err);
+      }
     }
   }
 
@@ -5496,6 +5498,31 @@ export function getDependentTasks(
   const tasks = rows.map(rowToAgentTask);
   if (opts?.includeTerminal) return tasks;
   return tasks.filter((t) => !isTerminalTaskStatus(t.status));
+}
+
+/** Repoint queued work to an atomic managed successor, retaining every other dependency. */
+export function rebindManagedTaskDependents(parentId: string, resumeId: string): void {
+  for (const dependent of getDependentTasks(parentId)) {
+    const dependencies = [
+      ...new Set(dependent.dependsOn.map((id) => (id === parentId ? resumeId : id))),
+    ];
+    const isReview = dependent.tags.includes(`review-of:${parentId}`);
+    const tags = dependent.tags.map((tag) =>
+      tag === `review-of:${parentId}` ? `review-of:${resumeId}` : tag,
+    );
+    getDb()
+      .query(`UPDATE agent_tasks SET dependsOn = ?, tags = ?, task = ?,
+      parentTaskId = CASE WHEN parentTaskId = ? THEN ? ELSE parentTaskId END,
+      lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`)
+      .run(
+        JSON.stringify(dependencies),
+        JSON.stringify(tags),
+        isReview ? dependent.task.replaceAll(parentId, resumeId) : dependent.task,
+        parentId,
+        resumeId,
+        dependent.id,
+      );
+  }
 }
 
 export interface CascadeFailResult {

@@ -39,6 +39,10 @@ Tier mappings can be overridden in the claiming worker's resolved environment:
 
 Direct `MODEL_TIER_<TIER>` variables win over `MODEL_TIER_MAP`; both win over the built-in defaults.
 
+## Managed account policy
+
+Workers with `SWARM_ACCOUNT_MANAGED=true` use the host controller's explicit per-provider `{default,smol,regular,smart,ultra}` mapping. Migrate the effective existing environment/JSON tier overrides into that policy before enabling managed admission. The binding stores the selected concrete model and echoes the task's tier; the runner checks both the tier and any explicit task model against that snapshot. Missing mappings defer work, and managed sessions never independently fall back to a stale worker tier map. Unmanaged workers keep the resolution below. See [managed account admission](./harness-providers.md#managed-account-capacity-admission).
+
 ## Legacy aliases
 
 Existing `haiku`, `sonnet`, `opus`, and `fable` inputs are normalized at creation/update boundaries:

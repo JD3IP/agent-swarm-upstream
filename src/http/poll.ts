@@ -7,6 +7,7 @@ import {
   emitBudgetRefusalSideEffects,
 } from "../be/budget-refusal-notify";
 import {
+  checkDependencies,
   claimMentions,
   claimOfferedTask,
   claimTask,
@@ -156,6 +157,13 @@ const pollTriggers = route({
   summary: "Poll for triggers (tasks, mentions)",
   tags: ["Poll"],
   auth: { apiKey: true, agentId: true },
+  query: z.object({
+    taskId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Restrict claims to this assigned/offered task; suppress unrelated triggers."),
+  }),
   responses: {
     200: { description: "Trigger data or null", schema: pollResponseSchema },
     400: { description: "Missing X-Agent-ID" },
@@ -241,6 +249,9 @@ export async function handlePoll(
   }
 
   if (pollTriggers.match(req.method, pathSegments)) {
+    const parsedPoll = await pollTriggers.parse(req, res, pathSegments, queryParams);
+    if (!parsedPoll) return true;
+    const requestedTaskId = parsedPoll.query.taskId;
     if (!myAgentId) {
       jsonError(res, "Missing X-Agent-ID header", 400);
       return true;
@@ -270,7 +281,9 @@ export async function handlePoll(
         // Check for offered tasks first (highest priority for both workers and leads)
         // Atomically claim the task for review to prevent duplicate processing
         const offeredTasks = getOfferedTasksForAgent(myAgentId);
-        const firstOfferedTask = offeredTasks[0];
+        const firstOfferedTask = requestedTaskId
+          ? offeredTasks.find((task) => task.id === requestedTaskId)
+          : offeredTasks[0];
         if (firstOfferedTask) {
           const claimedTask = claimOfferedTask(firstOfferedTask.id, myAgentId);
           if (claimedTask) {
@@ -287,7 +300,14 @@ export async function handlePoll(
         // Check for pending tasks (assigned directly to this agent)
         // Only return a task if agent has capacity (server-side enforcement)
         if (hasCapacity(myAgentId)) {
-          const pendingTask = getPendingTaskForAgent(myAgentId);
+          const requestedTask = requestedTaskId ? getTaskById(requestedTaskId) : null;
+          const pendingTask = requestedTaskId
+            ? requestedTask?.agentId === myAgentId &&
+              requestedTask.status === "pending" &&
+              checkDependencies(requestedTask.id).ready
+              ? requestedTask
+              : null
+            : getPendingTaskForAgent(myAgentId);
           if (pendingTask) {
             // Budget admission gate (Phase 3). Runs in the same transaction as
             // the capacity check so capacity AND budget gates share atomicity.
@@ -400,6 +420,9 @@ export async function handlePoll(
             };
           }
         }
+
+        // A managed reservation must never consume mentions or unrelated pool work.
+        if (requestedTaskId) return { trigger: null };
 
         // Check for unread mentions (internal chat) - all agents can be woken by @mentions
         // Uses atomic claiming via processing_since to prevent duplicate processing.
@@ -555,6 +578,7 @@ export async function handlePoll(
     // Throttled to avoid Slack API rate limits (~50 calls/min).
     if (
       result.trigger === null &&
+      !requestedTaskId &&
       process.env.LEAD_MONITOR_CHANNELS === "true" &&
       Date.now() - lastChannelActivityCheckAt >= CHANNEL_ACTIVITY_INTERVAL_MS
     ) {

@@ -69,6 +69,7 @@ import {
   type WebSearchItem,
 } from "@openai/codex-sdk";
 import { buildRatingsFromLlm, fetchRetrievalsForTask, postRatings } from "../be/memory/raters/llm";
+import { codexAccountIdentity } from "../utils/account-identity";
 import { getApiKey } from "../utils/api-key";
 import {
   CONTEXT_FORMULA,
@@ -77,10 +78,16 @@ import {
 } from "../utils/context-window";
 import { SessionErrorTracker } from "../utils/error-tracker";
 import { summarizeSession as runSummarize } from "../utils/internal-ai";
+import {
+  abortProviderProcess,
+  managedProviderCommand,
+  verifiedProviderExit,
+} from "../utils/managed-provider-process";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { type CodexAgentsMdHandle, writeCodexAgentsMd } from "./codex-agents-md";
 import { computeCodexCostUsd, getCodexContextWindow, resolveCodexModel } from "./codex-models";
 import { credentialsToAuthJson } from "./codex-oauth/auth-json.js";
+import { resolveCodexAuthDirectory } from "./codex-oauth/auth-json-fs";
 import { CodexOAuthRefreshError, getValidCodexOAuth } from "./codex-oauth/storage.js";
 import { resolveCodexPrompt } from "./codex-skill-resolver";
 import { createCodexSwarmEventHandler } from "./codex-swarm-events";
@@ -203,14 +210,14 @@ export async function resolveCodexAuthMode(
   } = {},
 ): Promise<string | null> {
   const fsModule = await import("node:fs/promises");
-  const homedir = deps.homedir ?? os.homedir.bind(os);
   const fs = deps.fs ?? {
     readFile: (path: string, encoding: "utf-8") => fsModule.readFile(path, encoding),
     mkdir: (path: string, opts: { recursive: boolean; mode: number }) => fsModule.mkdir(path, opts),
     writeFile: (path: string, data: string, opts: { mode: number }) =>
       fsModule.writeFile(path, data, opts),
   };
-  const authJsonPath = join(homedir(), ".codex", "auth.json");
+  const authDirectory = resolveCodexAuthDirectory(deps.homedir?.());
+  const authJsonPath = join(authDirectory, "auth.json");
 
   const readAuthMode = async (): Promise<string | null> => {
     try {
@@ -266,6 +273,19 @@ export async function resolveCodexAuthMode(
         content: `[codex] OAuth revalidation failed (non-fatal, non-pool auth): ${message}\n`,
       });
     }
+    if (config.expectedAccountIdentity && oauthCreds) {
+      try {
+        if (
+          codexAccountIdentity(oauthCreds.access, oauthCreds.accountId) !==
+          config.expectedAccountIdentity
+        )
+          throw new Error("mismatch");
+      } catch {
+        throw new Error(
+          "[auth-error] Managed Codex credential identity changed during broker refresh",
+        );
+      }
+    }
     if (!oauthCreds && isPoolSlot) {
       // The runner's pool-slot resolution (`resolveCodexOAuthCredentialInfo`)
       // only ever hands out a slot backed by a config-store entry — reaching
@@ -287,7 +307,7 @@ export async function resolveCodexAuthMode(
         const authJson = credentialsToAuthJson(oauthCreds, {
           includeRefreshToken: !isPoolSlot,
         });
-        await fs.mkdir(join(homedir(), ".codex"), { recursive: true, mode: 0o700 });
+        await fs.mkdir(authDirectory, { recursive: true, mode: 0o700 });
         await fs.writeFile(authJsonPath, JSON.stringify(authJson, null, 2), { mode: 0o600 });
         const verb =
           currentMode === null
@@ -301,6 +321,9 @@ export async function resolveCodexAuthMode(
         });
         currentMode = "chatgpt";
       } catch (err) {
+        if (config.expectedAccountIdentity) {
+          throw new Error("[auth-error] Could not materialize the reserved Codex account");
+        }
         const message = err instanceof Error ? err.message : String(err);
         emit({
           type: "raw_stderr",
@@ -1605,13 +1628,16 @@ class CodexSubprocessSession implements ProviderSession {
   // Mirrors CodexSession: steering is delivered by the codex-hook, not here.
   readonly steeringDeliveredExternally = true;
   private readonly proc: ReturnType<typeof Bun.spawn>;
+  private readonly providerExit: Promise<number>;
+  private readonly managed: boolean;
   private readonly listeners: Array<(event: ProviderEvent) => void> = [];
   private readonly eventQueue: ProviderEvent[] = [];
   private readonly completionPromise: Promise<ProviderResult>;
   private _sessionId: string | undefined;
 
   constructor(config: ProviderSessionConfig, skillsDir: string | undefined) {
-    const argv = resolveCodexRunnerArgv();
+    this.managed = config.env?.SWARM_ACCOUNT_MANAGED === "true";
+    const argv = managedProviderCommand(resolveCodexRunnerArgv(), this.managed);
     const payload: CodexSubprocessInput = {
       config,
       skillsDir,
@@ -1637,11 +1663,13 @@ class CodexSubprocessSession implements ProviderSession {
         ...(process.env.MCP_BASE_URL ? { MCP_BASE_URL: process.env.MCP_BASE_URL } : {}),
         ...(apiKey ? { AGENT_SWARM_API_KEY: apiKey, API_KEY: apiKey } : {}),
         // Embedding / summarization paths read these:
-        ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
-        ...(process.env.OPENROUTER_API_KEY
+        ...(config.env?.SWARM_ACCOUNT_MANAGED !== "true" && process.env.OPENAI_API_KEY
+          ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY }
+          : {}),
+        ...(config.env?.SWARM_ACCOUNT_MANAGED !== "true" && process.env.OPENROUTER_API_KEY
           ? { OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY }
           : {}),
-        ...(process.env.ANTHROPIC_API_KEY
+        ...(config.env?.SWARM_ACCOUNT_MANAGED !== "true" && process.env.ANTHROPIC_API_KEY
           ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
           : {}),
         ...(process.env.CODEX_PATH_OVERRIDE
@@ -1658,6 +1686,7 @@ class CodexSubprocessSession implements ProviderSession {
       stdout: "pipe",
       stderr: "pipe",
     });
+    this.providerExit = this.managed ? verifiedProviderExit(this.proc, true) : this.proc.exited;
 
     // `Bun.spawn`'s `stdin` is typed as `number | FileSink`; with `stdin:
     // "pipe"` it is always a FileSink. Narrow via assertion.
@@ -1685,7 +1714,11 @@ class CodexSubprocessSession implements ProviderSession {
   }
 
   async abort(): Promise<void> {
-    this.proc.kill("SIGTERM");
+    if (!this.managed) {
+      this.proc.kill("SIGTERM");
+      return;
+    }
+    await abortProviderProcess(this.proc, true, this.providerExit);
   }
 
   private emit(event: ProviderEvent): void {
@@ -1747,7 +1780,7 @@ class CodexSubprocessSession implements ProviderSession {
     })();
 
     await Promise.all([stdoutPromise, stderrPromise]);
-    const exitCode = await this.proc.exited;
+    const exitCode = await this.providerExit;
 
     if (result) {
       return result;

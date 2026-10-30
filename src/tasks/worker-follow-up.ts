@@ -3,11 +3,14 @@ import {
   createTaskExtended,
   getActiveTaskCount,
   getAgentById,
+  getDb,
   getDependentTasks,
   getLeadAgent,
   getTaskAttachments,
   getTaskById,
   hasNonTerminalRerouteDecisionChild,
+  rebindManagedTaskDependents,
+  supersedeTask,
 } from "../be/db";
 import { repointTrackerSyncBySwarmId } from "../be/db-queries/tracker";
 import { resolveTemplate } from "../prompts/resolver";
@@ -255,6 +258,7 @@ export type CreateResumeFollowUpResult =
 export function createResumeFollowUp(args: {
   parentId: string;
   reason: ResumeReason;
+  pinToOriginalAgent?: boolean;
 }): CreateResumeFollowUpResult {
   const parent = getTaskById(args.parentId);
   if (!parent) return { kind: "skipped", reason: "parent_not_found" };
@@ -318,6 +322,12 @@ export function createResumeFollowUp(args: {
     }
   }
 
+  // The managed account controller owns this stable worker's future admission.
+  // Offline/API capacity snapshots must not send its recovery into an unowned pool.
+  if (args.pinToOriginalAgent && parent.agentId && getAgentById(parent.agentId)) {
+    preferredAgentId = parent.agentId;
+  }
+
   const parentDesc = parent.task.slice(0, 200);
   const followUpDescription = [
     "Resume interrupted task.",
@@ -333,6 +343,9 @@ export function createResumeFollowUp(args: {
 
   const priority = Math.min(100, (parent.priority ?? 50) + 10);
   const tags = [
+    ...(args.pinToOriginalAgent
+      ? parent.tags.filter((tag) => !tag.startsWith(RESUME_GENERATION_TAG_PREFIX))
+      : []),
     "auto-resume",
     `reason:${args.reason}`,
     `${RESUME_GENERATION_TAG_PREFIX}${getNextResumeGeneration(parent)}`,
@@ -376,6 +389,9 @@ export function createResumeFollowUp(args: {
     priority,
     parentTaskId: parent.id,
     routingAffinity,
+    ...(args.pinToOriginalAgent
+      ? { modelTier: parent.modelTier, dependsOn: parent.dependsOn }
+      : {}),
   });
 
   // Repoint Linear / Jira `tracker_sync` rows from the (now terminal) parent
@@ -393,6 +409,30 @@ export function createResumeFollowUp(args: {
   }
 
   return { kind: "created", task: created };
+}
+
+/** Same-owner capacity handoff is one DB transaction, so dependent reviews never fail or run early. */
+export function createManagedCapacityResume(
+  parentId: string,
+  reason: ResumeReason,
+): {
+  task: AgentTask;
+  resume: AgentTask;
+} | null {
+  return getDb().transaction(() => {
+    const parent = getTaskById(parentId);
+    if (!parent || parent.status !== "in_progress" || parent.workflowRunStepId) return null;
+    const followUp = createResumeFollowUp({ parentId, reason, pinToOriginalAgent: true });
+    if (followUp.kind !== "created") throw new Error("Managed resume could not be created");
+    const task = supersedeTask(parentId, {
+      reason,
+      resumeTaskId: followUp.task.id,
+      preserveDependents: true,
+    });
+    if (!task) throw new Error("Managed parent could not be superseded");
+    rebindManagedTaskDependents(parentId, followUp.task.id);
+    return { task, resume: getTaskById(followUp.task.id)! };
+  })();
 }
 
 /** Result of `createRerouteDecisionTask`. */

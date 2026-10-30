@@ -18,6 +18,11 @@ import {
   SessionErrorTracker,
   trackErrorFromJson,
 } from "../utils/error-tracker";
+import {
+  abortProviderProcess,
+  managedProviderCommand,
+  verifiedProviderExit,
+} from "../utils/managed-provider-process";
 import { fetchInstalledMcpServers } from "../utils/mcp-server-fetcher";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { CTX_MODE_NUDGE_EVERY } from "./ctx-mode-env";
@@ -552,6 +557,7 @@ export function getSystemPromptFilePath(taskId: string): string {
 
 class ClaudeSession implements ProviderSession {
   private proc: ReturnType<typeof Bun.spawn>;
+  private readonly providerExit: Promise<number>;
   private stdinWriter:
     | {
         write(value: string): unknown;
@@ -617,7 +623,7 @@ class ClaudeSession implements ProviderSession {
     const reasoningEnv = reasoningApplication.kind === "claude-env" ? reasoningApplication.env : {};
     this.appliedReasoningEffort =
       reasoningApplication.kind === "claude-env" ? (config.reasoningEffort ?? null) : null;
-    this.proc = Bun.spawn(cmd, {
+    this.proc = Bun.spawn(managedProviderCommand(cmd, sourceEnv.SWARM_ACCOUNT_MANAGED === "true"), {
       cwd: this.config.cwd,
       env: {
         ENABLE_PROMPT_CACHING_1H: "1",
@@ -649,6 +655,11 @@ class ClaudeSession implements ProviderSession {
       stdout: "pipe",
       stderr: "pipe",
     });
+
+    this.providerExit =
+      sourceEnv.SWARM_ACCOUNT_MANAGED === "true"
+        ? verifiedProviderExit(this.proc, true)
+        : this.proc.exited;
 
     if (this.queueSteeringSupported) {
       const stdin = this.proc.stdin;
@@ -859,7 +870,7 @@ class ClaudeSession implements ProviderSession {
       this.closeStdin();
     }
     await logFileHandle.end();
-    const exitCode = await this.proc.exited;
+    const exitCode = await this.providerExit;
 
     const transcript = this.transcript.join("\n");
     if (transcript.length <= 100) {
@@ -1195,11 +1206,11 @@ class ClaudeSession implements ProviderSession {
 
   async abort(): Promise<void> {
     this.closeStdin();
-    try {
-      this.proc.kill("SIGTERM");
-    } catch {
-      // The subprocess may already have exited.
-    }
+    await abortProviderProcess(
+      this.proc,
+      this.config.env?.SWARM_ACCOUNT_MANAGED === "true",
+      this.providerExit,
+    );
   }
 }
 

@@ -10138,7 +10138,10 @@ export interface paths {
         /** Poll for triggers (tasks, mentions) */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description Restrict claims to this assigned/offered task; suppress unrelated triggers. */
+                    taskId?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -15784,6 +15787,8 @@ export interface paths {
                     "application/json": {
                         /** @enum {string} */
                         reason: "graceful_shutdown" | "context_limits" | "manual_supersede" | "crash_recovery";
+                        /** @description Keep the resume pending on the same worker during verified managed capacity recovery, even while its process is offline. */
+                        pinToOriginalAgent?: boolean;
                     };
                 };
             };
@@ -15798,7 +15803,7 @@ export interface paths {
                             /** @enum {boolean} */
                             success: true;
                             /** @enum {string} */
-                            kind: "alreadyFinished" | "workflow-failed" | "resumed";
+                            kind: "alreadyFinished" | "workflow-failed" | "resumed" | "capacity-paused";
                             task: components["schemas"]["AgentTask"] | null;
                             resumeTaskId: string | null;
                             /** @enum {string} */

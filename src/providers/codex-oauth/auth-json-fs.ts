@@ -9,6 +9,12 @@ import { join } from "node:path";
 import { credentialsToAuthJson } from "./auth-json.js";
 import type { CodexOAuthCredentials } from "./types.js";
 
+/** Explicit test/worker home wins; otherwise follow the Codex CLI's CODEX_HOME. */
+export function resolveCodexAuthDirectory(explicitHome?: string): string {
+  if (explicitHome !== undefined) return join(explicitHome, ".codex");
+  return process.env.CODEX_HOME || join(process.env.HOME ?? os.homedir(), ".codex");
+}
+
 /**
  * Atomically write `~/.codex/auth.json` from `creds` for the given slot.
  *
@@ -39,7 +45,6 @@ export async function materializeCodexAuthJson(
   } = {},
 ): Promise<void> {
   const fsModule = await import("node:fs/promises");
-  const homedir = deps.homedir ?? os.homedir.bind(os);
   const fs = deps.fs ?? {
     mkdir: (path: string, opts: { recursive: boolean; mode: number }) => fsModule.mkdir(path, opts),
     writeFile: (path: string, data: string, opts: { mode: number }) =>
@@ -47,7 +52,7 @@ export async function materializeCodexAuthJson(
     rename: (from: string, to: string) => fsModule.rename(from, to),
   };
 
-  const codexDir = join(homedir(), ".codex");
+  const codexDir = resolveCodexAuthDirectory(deps.homedir?.());
   const authJsonPath = join(codexDir, "auth.json");
   const tmpPath = join(codexDir, "auth.json.tmp");
 

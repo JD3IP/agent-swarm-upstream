@@ -99,6 +99,8 @@ export type ProviderEvent =
 
 /** Configuration passed to a provider adapter to create a session. */
 export interface ProviderSessionConfig {
+  /** Managed sessions verify broker refreshes remain on the enrolled account. */
+  expectedAccountIdentity?: string;
   prompt: string;
   systemPrompt: string;
   model: string;

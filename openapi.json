@@ -22487,6 +22487,19 @@
             "bearerAuth": []
           }
         ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Restrict claims to this assigned/offered task; suppress unrelated triggers."
+            },
+            "required": false,
+            "description": "Restrict claims to this assigned/offered task; suppress unrelated triggers.",
+            "name": "taskId",
+            "in": "query"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Trigger data or null",
@@ -38969,6 +38982,10 @@
                       "manual_supersede",
                       "crash_recovery"
                     ]
+                  },
+                  "pinToOriginalAgent": {
+                    "type": "boolean",
+                    "description": "Keep the resume pending on the same worker during verified managed capacity recovery, even while its process is offline."
                   }
                 },
                 "required": [
@@ -38997,7 +39014,8 @@
                       "enum": [
                         "alreadyFinished",
                         "workflow-failed",
-                        "resumed"
+                        "resumed",
+                        "capacity-paused"
                       ]
                     },
                     "task": {
