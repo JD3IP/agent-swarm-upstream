@@ -17,6 +17,7 @@ type Window = {
   resetsAt: string | null;
   models: string[] | null;
   blocked?: boolean;
+  active?: boolean;
 };
 type Account = {
   id: string;
@@ -90,29 +91,129 @@ export function codexWindows(body: unknown): Window[] {
   return out;
 }
 
-export function claudeWindows(headers: Headers, models: string[]): Window[] {
-  const out: Window[] = [];
-  const prefix = "anthropic-ratelimit-unified-";
-  for (const [name, value] of headers.entries()) {
-    if (!name.startsWith(prefix) || !name.endsWith("-utilization")) continue;
-    const bucket = name.slice(prefix.length, -"-utilization".length);
-    const match = /^(\d+)(h|d)(?:-(opus|sonnet|haiku))?$/.exec(bucket);
-    if (!match) continue;
-    const family = match[3];
-    const relevantModels = family ? models.filter((m) => m.toLowerCase().includes(family)) : null;
-    // No known mapping for a family means it cannot affect these configured models.
-    if (relevantModels && relevantModels.length === 0) continue;
-    const raw = Number(value);
-    out.push({
-      id: bucket,
-      durationSeconds: Number(match[1]) * (match[2] === "h" ? 3600 : 86400),
-      usedPercent: value.trim() !== "" && Number.isFinite(raw) ? percent(raw * 100) : null,
-      resetsAt: epoch(Number(headers.get(`${prefix}${bucket}-reset`))),
-      models: relevantModels,
-      blocked: headers.get(`${prefix}${bucket}-status`) === "rejected",
+export function claudeWindows(
+  body: unknown,
+  models: string[],
+): { windows: Window[]; complete: boolean } {
+  const windows: Window[] = [];
+  let complete = true;
+  const object = (v: unknown): Record<string, unknown> | null =>
+    v !== null && typeof v === "object" && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : null;
+  const value = object(body);
+  if (!value) return { windows, complete: false };
+  const family = (v: string) =>
+    /(?:^|[\s/_-])(opus|sonnet|haiku|fable)(?=$|[\s/_-])/i.exec(v)?.[1]?.toLowerCase();
+  function scoped(model: unknown): string[] | undefined {
+    const scope = object(model);
+    if (
+      !scope ||
+      (scope.id != null && typeof scope.id !== "string") ||
+      (scope.display_name != null && typeof scope.display_name !== "string")
+    )
+      return undefined;
+    const id = typeof scope.id === "string" ? scope.id : "";
+    const category =
+      family(id) ?? family(typeof scope.display_name === "string" ? scope.display_name : "");
+    if (!category) return models.length === 1 && models[0] === id ? [id] : undefined;
+    if (models.some((m) => m !== id && !family(m))) return undefined;
+    return models.filter((m) => m === id || family(m) === category);
+  }
+  function append(
+    raw: unknown,
+    id: string,
+    durationSeconds: number,
+    applicable: string[] | null,
+    canonical: boolean,
+  ): void {
+    const limit = object(raw) ?? {};
+    const usedPercent = percent(canonical ? limit.percent : limit.utilization);
+    const active = typeof limit.is_active === "boolean" ? limit.is_active : undefined;
+    const blocked =
+      usedPercent === 100 ||
+      (typeof limit.locked_reason === "string" && !!limit.locked_reason.trim());
+    if (limit.is_active !== undefined && active === undefined) {
+      complete = false;
+      return;
+    }
+    if (active === false && (usedPercent !== 0 || blocked)) {
+      complete = false;
+      return;
+    }
+    const reset = limit.resets_at;
+    const resetsAt =
+      typeof reset === "string" &&
+      /^\d{4}-\d\d-\d\dT.*(?:Z|[+-]\d\d:\d\d)$/.test(reset) &&
+      Number.isFinite(Date.parse(reset))
+        ? new Date(reset).toISOString()
+        : null;
+    if (usedPercent === null || (active !== false && !resetsAt)) complete = false;
+    windows.push({
+      id,
+      durationSeconds,
+      usedPercent,
+      resetsAt,
+      models: applicable,
+      blocked,
+      ...(active === undefined ? {} : { active }),
     });
   }
-  return out;
+  const shared = new Set<string>();
+  if (Object.hasOwn(value, "limits")) {
+    if (!Array.isArray(value.limits)) return { windows, complete: false };
+    for (const [index, raw] of value.limits.entries()) {
+      const limit = object(raw);
+      if (!limit) {
+        complete = false;
+        continue;
+      }
+      const inactive =
+        limit.is_active === false && percent(limit.percent) === 0 && !limit.locked_reason;
+      if (limit.kind === "session" || limit.kind === "weekly_all") {
+        const expectedGroup = limit.kind === "session" ? "session" : "weekly";
+        if (limit.group !== expectedGroup || limit.scope != null || shared.has(limit.kind)) {
+          complete = false;
+          continue;
+        }
+        shared.add(limit.kind);
+        append(limit, limit.kind, limit.kind === "session" ? 18000 : 604800, null, true);
+      } else if (limit.kind === "weekly_scoped" && limit.group === "weekly") {
+        const scope = object(limit.scope);
+        const applicable =
+          scope &&
+          scope.surface == null &&
+          Object.keys(scope).every((k) => ["model", "surface"].includes(k))
+            ? scoped(scope.model)
+            : undefined;
+        if (applicable === undefined) {
+          if (!inactive) complete = false;
+          continue;
+        }
+        if (applicable.length) append(limit, `weekly_scoped.${index}`, 604800, applicable, true);
+      } else if (!inactive) complete = false;
+    }
+    if (!shared.has("session") || !shared.has("weekly_all")) complete = false;
+  } else {
+    if (!Object.hasOwn(value, "five_hour") && !Object.hasOwn(value, "seven_day"))
+      return { windows, complete: false };
+    for (const name of ["five_hour", "seven_day"]) {
+      if (!Object.hasOwn(value, name)) complete = false;
+      append(value[name], name, name === "five_hour" ? 18000 : 604800, null, false);
+    }
+    for (const [name, raw] of Object.entries(value)) {
+      if (["five_hour", "seven_day", "extra_usage"].includes(name) || raw == null) continue;
+      if (name.startsWith("seven_day_")) {
+        const applicable = scoped({ display_name: name.slice("seven_day_".length) });
+        if (applicable === undefined) {
+          complete = false;
+          continue;
+        }
+        if (applicable.length) append(raw, name, 604800, applicable, false);
+      } else if (object(raw) && Object.hasOwn(raw as object, "utilization")) complete = false;
+    }
+  }
+  return { windows, complete };
 }
 
 export async function probeAccount(account: Account, deps: Dependencies): Promise<Observation> {
@@ -173,28 +274,22 @@ export async function probeAccount(account: Account, deps: Dependencies): Promis
         };
       if (claudeAccountIdentity(await identityResponse.json()) !== account.identityKey)
         return { ...observation, authState: "invalid" };
+      observation.authState = "healthy";
       response = await deps.fetch(deps.claudeUrl, {
-        method: "POST",
+        method: "GET",
         headers: {
           Authorization: `Bearer ${credential}`,
           "anthropic-beta": "oauth-2025-04-20",
           "anthropic-version": "2023-06-01",
           "content-type": "application/json",
         },
-        body: JSON.stringify({
-          model: account.allowedModels[0],
-          max_tokens: 1,
-          messages: [{ role: "user", content: "usage probe" }],
-        }),
         signal: AbortSignal.timeout(20000),
       });
-      observation.windows = claudeWindows(response.headers, account.allowedModels);
       if (response.ok) {
-        const body = (await response.json()) as { type?: unknown };
-        if ((body as { type?: unknown })?.type !== "message")
-          return { ...observation, windows: [], state: "unavailable" };
+        const parsed = claudeWindows(await response.json(), account.allowedModels);
+        observation.windows = parsed.windows;
         observation.authState = "healthy";
-        observation.state = observation.windows.length ? "healthy" : "unknown";
+        observation.state = parsed.complete && observation.windows.length ? "healthy" : "unknown";
         if (observation.windows.some((w) => w.models === null && w.blocked))
           observation.state = "exhausted";
       }
@@ -248,7 +343,7 @@ export async function collectAccounts(options: {
       fetch: fetchImpl,
       now: options.now ?? Date.now,
       codexUrl: "https://chatgpt.com/backend-api/wham/usage",
-      claudeUrl: "https://api.anthropic.com/v1/messages",
+      claudeUrl: "https://api.anthropic.com/api/oauth/usage",
       codexCredential:
         options.codexCredential ??
         ((slot) =>

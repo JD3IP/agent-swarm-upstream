@@ -35,7 +35,7 @@ const deps = (fetchImpl: typeof fetch) => ({
     slot === 4 ? { access, accountId: "test-workspace" } : null,
   claudeCredential: async () => "fake-claude",
   codexUrl: "https://codex.invalid/usage",
-  claudeUrl: "https://claude.invalid/messages",
+  claudeUrl: "https://claude.invalid/usage",
 });
 
 describe("account-scoped quota collector", () => {
@@ -105,24 +105,22 @@ describe("account-scoped quota collector", () => {
         allowedModels: ["claude-haiku-test", "claude-sonnet-test"],
         credentialRef: { ...account.credentialRef, keyType: "claude_oauth" },
       },
-      deps((async (url) =>
+      deps((async (url, init) =>
         String(url).endsWith("/profile")
           ? Response.json(profile)
-          : Response.json(
-              { type: "message" },
-              {
-                headers: {
-                  "anthropic-ratelimit-unified-5h-utilization": "0.1",
-                  "anthropic-ratelimit-unified-5h-reset": String(now / 1000 + 1000),
-                  "anthropic-ratelimit-unified-7d-sonnet-utilization": "1",
-                  "anthropic-ratelimit-unified-7d-sonnet-status": "rejected",
-                  "anthropic-ratelimit-unified-7d-sonnet-reset": String(now / 1000 + 1000),
-                },
-              },
-            )) as typeof fetch),
+          : (() => {
+              expect(init?.method).toBe("GET");
+              expect(init?.body).toBeUndefined();
+              const resets_at = new Date(now + 1000_000).toISOString();
+              return Response.json({
+                five_hour: { utilization: 10, resets_at },
+                seven_day: { utilization: 20, resets_at },
+                seven_day_sonnet: { utilization: 100, resets_at },
+              });
+            })()) as typeof fetch),
     );
     expect(result).toMatchObject({ authState: "healthy", state: "healthy" });
-    expect(result.windows.find((w) => w.id === "7d-sonnet")).toMatchObject({
+    expect(result.windows.find((w) => w.id === "seven_day_sonnet")).toMatchObject({
       blocked: true,
       models: ["claude-sonnet-test"],
     });
@@ -211,18 +209,176 @@ describe("account-scoped quota collector", () => {
       cooldownUntil: new Date(now + 60000).toISOString(),
     });
   });
-  test("Claude percent conversion and family mapping", () => {
-    const headers = new Headers({
-      "anthropic-ratelimit-unified-5h-utilization": "0.4",
-      "anthropic-ratelimit-unified-5h-reset": String(now / 1000 + 100),
-      "anthropic-ratelimit-unified-7d-opus-utilization": "0.9",
-      "anthropic-ratelimit-unified-7d-opus-reset": String(now / 1000 + 200),
-      "anthropic-ratelimit-unified-7d-sonnet-utilization": "0.2",
+  test("legacy Claude percentages are already percent and retain known family applicability", () => {
+    const resets_at = new Date(now + 1000_000).toISOString();
+    const result = claudeWindows(
+      {
+        five_hour: { utilization: 40, resets_at },
+        seven_day: { utilization: 20, resets_at },
+        seven_day_opus: { utilization: 90, resets_at },
+        seven_day_sonnet: { utilization: 20, resets_at },
+        seven_day_cowork: null,
+      },
+      ["claude-opus-test"],
+    );
+    expect(result.complete).toBe(true);
+    expect(result.windows).toHaveLength(3);
+    expect(result.windows[0]).toMatchObject({
+      usedPercent: 40,
+      durationSeconds: 18000,
+      models: null,
     });
-    const result = claudeWindows(headers, ["claude-opus-test"]);
-    expect(result).toHaveLength(2);
-    expect(result[0]).toMatchObject({ usedPercent: 40, durationSeconds: 18000, models: null });
-    expect(result[1]).toMatchObject({ usedPercent: 90, models: ["claude-opus-test"] });
+    expect(result.windows[2]).toMatchObject({ usedPercent: 90, models: ["claude-opus-test"] });
+  });
+  test("verified canonical limits take precedence over opaque legacy/marketing fields, preserving inactive zero/null reset", () => {
+    const resets_at = "2026-10-30T14:00:00.390747+00:00";
+    const result = claudeWindows(
+      {
+        five_hour: { utilization: 0, resets_at: null },
+        seven_day: { utilization: 100, resets_at },
+        seven_day_omelette: { opaque: true },
+        marketing: { utilization: 999 },
+        limits: [
+          {
+            kind: "session",
+            group: "session",
+            percent: 0,
+            resets_at: null,
+            scope: null,
+            is_active: false,
+          },
+          {
+            kind: "weekly_all",
+            group: "weekly",
+            percent: 100,
+            resets_at,
+            scope: null,
+            is_active: true,
+          },
+          {
+            kind: "weekly_scoped",
+            group: "weekly",
+            percent: 0,
+            resets_at,
+            scope: { model: { id: null, display_name: "Fable" }, surface: null },
+            is_active: false,
+          },
+        ],
+      },
+      ["haiku", "sonnet", "opus", "fable"],
+    );
+    expect(result.complete).toBe(true);
+    expect(result.windows[0]).toMatchObject({ usedPercent: 0, resetsAt: null, active: false });
+    expect(result.windows[1]).toMatchObject({
+      usedPercent: 100,
+      active: true,
+      blocked: true,
+      models: null,
+    });
+    expect(result.windows[2]).toMatchObject({ models: ["fable"], usedPercent: 0, active: false });
+  });
+  test("unknown active kind, surface, model mapping and contradictory inactivity fail closed", () => {
+    const resets_at = new Date(now + 1000_000).toISOString();
+    const primary = [
+      {
+        kind: "session",
+        group: "session",
+        percent: 0,
+        resets_at: null,
+        scope: null,
+        is_active: false,
+      },
+      { kind: "weekly_all", group: "weekly", percent: 20, resets_at, scope: null, is_active: true },
+    ];
+    for (const extra of [
+      { kind: "future_kind", group: "weekly", percent: 0, resets_at, scope: null, is_active: true },
+      {
+        kind: "weekly_scoped",
+        group: "weekly",
+        percent: 20,
+        resets_at,
+        scope: { model: { display_name: "Unknown model" }, surface: null },
+        is_active: true,
+      },
+      {
+        kind: "weekly_scoped",
+        group: "weekly",
+        percent: 20,
+        resets_at,
+        scope: { model: { display_name: "Sonnet" }, surface: "unknown-surface" },
+        is_active: true,
+      },
+      {
+        kind: "weekly_scoped",
+        group: "weekly",
+        percent: 5,
+        resets_at: null,
+        scope: { model: { display_name: "Sonnet" }, surface: null },
+        is_active: false,
+      },
+    ])
+      expect(claudeWindows({ limits: [...primary, extra] }, ["sonnet"]).complete).toBe(false);
+    expect(claudeWindows({ limits: primary }, ["unknown-configured-model"]).complete).toBe(true);
+    expect(
+      claudeWindows(
+        {
+          limits: [
+            ...primary,
+            {
+              kind: "weekly_scoped",
+              group: "weekly",
+              percent: 10,
+              resets_at,
+              scope: { model: { display_name: "Sonnet" }, surface: null },
+              is_active: true,
+            },
+          ],
+        },
+        ["unknown-configured-model"],
+      ).complete,
+    ).toBe(false);
+    expect(
+      claudeWindows(
+        {
+          five_hour: { utilization: 0, resets_at: null },
+          seven_day: { utilization: 20, resets_at },
+        },
+        ["sonnet"],
+      ).complete,
+    ).toBe(false);
+    expect(
+      claudeWindows(
+        {
+          five_hour: { utilization: 20, resets_at },
+          seven_day: { utilization: 20, resets_at },
+          seven_day_omelette: { utilization: 0, resets_at },
+        },
+        ["sonnet"],
+      ).complete,
+    ).toBe(false);
+  });
+  test("Claude usage429 never becomes invalid authentication or a model request", async () => {
+    const profile = { account: { uuid: "claude-fixture" } };
+    const result = await probeAccount(
+      {
+        ...account,
+        provider: "claude",
+        identityKey: claudeAccountIdentity(profile),
+        credentialRef: { ...account.credentialRef, keyType: "claude_oauth" },
+      },
+      deps((async (url, init) => {
+        if (String(url).endsWith("/profile")) return Response.json(profile);
+        expect(init?.method).toBe("GET");
+        expect(init?.body).toBeUndefined();
+        return new Response(null, { status: 429, headers: { "retry-after": "60" } });
+      }) as typeof fetch),
+    );
+    expect(result).toMatchObject({
+      authState: "healthy",
+      state: "throttled",
+      authAction: null,
+      windows: [],
+    });
   });
   test("Claude successful gateway/error body is not healthy", async () => {
     const result = await probeAccount(
