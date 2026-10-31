@@ -277,6 +277,61 @@ describe("account-scoped quota collector", () => {
     });
     expect(result.windows[2]).toMatchObject({ models: ["fable"], usedPercent: 0, active: false });
   });
+  test("canonical unused active session has no reset until usage starts", async () => {
+    const profile = { account: { uuid: "claude-reset-fixture" } };
+    const limits = [
+      {
+        kind: "session",
+        group: "session",
+        percent: 0,
+        resets_at: null,
+        scope: null,
+        is_active: true,
+      },
+      {
+        kind: "weekly_all",
+        group: "weekly",
+        percent: 0,
+        resets_at: "2026-11-06T14:00:00Z",
+        scope: null,
+        is_active: false,
+      },
+    ];
+    const result = await probeAccount(
+      {
+        ...account,
+        provider: "claude",
+        identityKey: claudeAccountIdentity(profile),
+        allowedModels: ["sonnet"],
+        credentialRef: { ...account.credentialRef, keyType: "claude_oauth" },
+      },
+      deps((async (url) =>
+        Response.json(String(url).endsWith("/profile") ? profile : { limits })) as typeof fetch),
+    );
+    expect(result).toMatchObject({ authState: "healthy", state: "healthy", authAction: null });
+    expect(result.windows[0]).toEqual({
+      id: "session",
+      durationSeconds: 18000,
+      usedPercent: 0,
+      resetsAt: null,
+      models: null,
+      blocked: false,
+      active: true,
+    });
+    for (const change of [
+      { percent: 1 },
+      { percent: null },
+      { locked_reason: "quota" },
+      { resets_at: "invalid" },
+      { resets_at: undefined },
+      { is_active: undefined },
+      { kind: "weekly_all", group: "weekly" },
+    ]) {
+      expect(
+        claudeWindows({ limits: [{ ...limits[0], ...change }, limits[1]] }, ["sonnet"]).complete,
+      ).toBe(false);
+    }
+  });
   test("unknown active kind, surface, model mapping and contradictory inactivity fail closed", () => {
     const resets_at = new Date(now + 1000_000).toISOString();
     const primary = [

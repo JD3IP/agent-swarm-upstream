@@ -148,7 +148,16 @@ export function claudeWindows(
       Number.isFinite(Date.parse(reset))
         ? new Date(reset).toISOString()
         : null;
-    if (usedPercent === null || (active !== false && !resetsAt)) complete = false;
+    // Claude reports a fresh session as active with no reset until its first use.
+    // Preserve that null; only this explicit canonical zero-usage shape is known.
+    const unusedSession =
+      canonical &&
+      id === "session" &&
+      active === true &&
+      usedPercent === 0 &&
+      !blocked &&
+      reset === null;
+    if (usedPercent === null || (active !== false && !resetsAt && !unusedSession)) complete = false;
     windows.push({
       id,
       durationSeconds,
