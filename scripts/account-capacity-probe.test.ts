@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { CodexOAuthRefreshError } from "../src/providers/codex-oauth/storage.ts";
 import { claudeAccountIdentity, codexAccountIdentity } from "../src/utils/account-identity.ts";
 import {
   claudeWindows,
@@ -39,6 +40,220 @@ const deps = (fetchImpl: typeof fetch) => ({
 });
 
 describe("account-scoped quota collector", () => {
+  test("Codex usage401 revalidates the original slot once before its JWT expiry", async () => {
+    const refreshed = `fake.${Buffer.from(JSON.stringify({ sub: "user-b", exp: now / 1000 + 864000 })).toString("base64url")}.new`;
+    const credentials: [number, boolean | undefined][] = [];
+    const sent: string[] = [];
+    const result = await probeAccount(account, {
+      ...deps((async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        sent.push(new Headers(init?.headers).get("Authorization")!);
+        expect(new Headers(init?.headers).get("ChatGPT-Account-Id")).toBe("test-workspace");
+        return sent.length === 1
+          ? new Response(null, { status: 401 })
+          : Response.json({ rate_limit: { allowed: true, primary_window: window(18000) } });
+      }) as unknown as typeof fetch),
+      codexCredential: async (slot, revalidate) => {
+        credentials.push([slot, revalidate]);
+        return { access: revalidate ? refreshed : access, accountId: "test-workspace" };
+      },
+    });
+    expect(credentials).toEqual([
+      [4, undefined],
+      [4, true],
+    ]);
+    expect(sent).toEqual([`Bearer ${access}`, `Bearer ${refreshed}`]);
+    expect(result).toMatchObject({ authState: "healthy", state: "healthy", authAction: null });
+  });
+  test("a second Codex401 requires reauthentication and fences the same enrollment generation", async () => {
+    let credentialCalls = 0,
+      requests = 0;
+    const dependencies = {
+      ...deps((async () => {
+        requests++;
+        return new Response(null, { status: 401 });
+      }) as unknown as typeof fetch),
+      codexCredential: async () => {
+        credentialCalls++;
+        return { access, accountId: "test-workspace" };
+      },
+    };
+    const observation = await probeAccount(account, dependencies);
+    expect(observation).toMatchObject({
+      authState: "invalid",
+      state: "unavailable",
+      authAction: "reauthenticate",
+      windows: [],
+    });
+    expect([credentialCalls, requests]).toEqual([2, 2]);
+    const fenced = await probeAccount({ ...account, observation }, dependencies);
+    expect(fenced).toMatchObject({ authState: "invalid", authAction: "reauthenticate" });
+    expect([credentialCalls, requests]).toEqual([2, 2]);
+    await probeAccount({ ...account, credentialGeneration: 3, observation }, dependencies);
+    expect([credentialCalls, requests]).toEqual([4, 4]);
+  });
+  test("revalidated Codex identity must still match before another usage request", async () => {
+    let requests = 0;
+    const result = await probeAccount(account, {
+      ...deps((async () => {
+        requests++;
+        return new Response(null, { status: 401 });
+      }) as unknown as typeof fetch),
+      codexCredential: async (_slot, revalidate) => ({
+        access,
+        accountId: revalidate ? "other-workspace" : "test-workspace",
+      }),
+    });
+    expect(requests).toBe(1);
+    expect(result.authState).toBe("invalid");
+    expect(result.windows).toEqual([]);
+  });
+  test("confirmed Codex refresh rejection is fenced, while broker outages stay unknown", async () => {
+    for (const error of [
+      new CodexOAuthRefreshError(4, "refresh_rejected", "fixture", 400, "sensitive upstream body"),
+      new CodexOAuthRefreshError(4, "refresh_rejected", "fixture", 401),
+      new CodexOAuthRefreshError(4, "refresh_rejected", "fixture", 503),
+      new CodexOAuthRefreshError(4, "lock_timeout", "fixture"),
+      new Error("sensitive upstream outage"),
+    ]) {
+      let forced = 0;
+      const dependencies = {
+        ...deps((async () => new Response(null, { status: 401 })) as unknown as typeof fetch),
+        codexCredential: async (_slot: number, revalidate?: boolean) => {
+          if (revalidate) {
+            forced++;
+            throw error;
+          }
+          return { access, accountId: "test-workspace" };
+        },
+      };
+      const observation = await probeAccount(account, dependencies);
+      const rejected =
+        error instanceof CodexOAuthRefreshError && [400, 401].includes(error.status ?? 0);
+      expect(observation).toMatchObject({
+        authState: rejected ? "invalid" : "unknown",
+        authAction: rejected ? "reauthenticate" : null,
+        state: "unavailable",
+        windows: [],
+      });
+      expect(JSON.stringify(observation)).not.toContain("sensitive");
+      await probeAccount({ ...account, observation }, dependencies);
+      expect(forced).toBe(rejected ? 1 : 2);
+    }
+  });
+  test("Codex quota and service errors never request credential revalidation", async () => {
+    for (const status of [429, 503]) {
+      const calls: (boolean | undefined)[] = [];
+      const result = await probeAccount(account, {
+        ...deps((async () => new Response(null, { status })) as unknown as typeof fetch),
+        codexCredential: async (_slot, revalidate) => {
+          calls.push(revalidate);
+          return { access, accountId: "test-workspace" };
+        },
+      });
+      expect(calls).toEqual([undefined]);
+      expect(result.authAction).toBeNull();
+      expect(result.state).toBe(status === 429 ? "throttled" : "unavailable");
+    }
+  });
+  test("published Codex refresh rejection prevents refresh replay on the next collection", async () => {
+    let observation: Record<string, unknown> | undefined;
+    let forced = 0;
+    const options = {
+      apiUrl: "http://swarm.invalid",
+      apiKey: "fake",
+      sidecarUrl: "http://sidecar.invalid",
+      sidecarToken: "fake",
+      codexCredential: async (_slot: number, revalidate?: boolean) => {
+        if (revalidate) {
+          forced++;
+          throw new CodexOAuthRefreshError(4, "refresh_rejected", "fixture", 400);
+        }
+        return { access, accountId: "test-workspace" };
+      },
+      fetchImpl: (async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        if (String(url).endsWith("/accounts"))
+          return Response.json({ accounts: [{ ...account, observation }] });
+        if (String(url).endsWith("/observation")) {
+          observation = JSON.parse(String(init?.body));
+          return Response.json({});
+        }
+        if (String(url).endsWith("/reconcile")) return Response.json({});
+        return new Response(null, { status: 401 });
+      }) as unknown as typeof fetch,
+    };
+    await collectAccounts(options);
+    expect(observation).toMatchObject({
+      credentialGeneration: 2,
+      authState: "invalid",
+      authAction: "reauthenticate",
+    });
+    await collectAccounts(options);
+    expect(forced).toBe(1);
+  });
+  test("prior Codex outage or quota evidence cannot fence credential recovery", async () => {
+    for (const prior of [
+      { authState: "unknown", authAction: "reauthenticate" },
+      { authState: "invalid", authAction: null },
+      { authState: "healthy", authAction: null },
+    ] as const) {
+      let calls = 0;
+      const result = await probeAccount(
+        { ...account, observation: { ...prior, credentialGeneration: 2 } },
+        {
+          ...deps((async () =>
+            Response.json({
+              rate_limit: { allowed: true, primary_window: window(18000) },
+            })) as unknown as typeof fetch),
+          codexCredential: async () => {
+            calls++;
+            return { access, accountId: "test-workspace" };
+          },
+        },
+      );
+      expect(calls).toBe(1);
+      expect(result.authState).toBe("healthy");
+    }
+  });
+  test("dry-run Codex401 performs only reads and never revalidates a credential", async () => {
+    const savedFetch = globalThis.fetch;
+    const requests: { method: string; url: string }[] = [];
+    const fakeFetch = (async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const path = String(url);
+      requests.push({ method: init?.method ?? "GET", url: path });
+      if (path.endsWith("/accounts")) return Response.json({ accounts: [account] });
+      if (path.includes("/api/config/resolved"))
+        return Response.json({
+          configs: [
+            {
+              key: "codex_oauth_4",
+              value: JSON.stringify({
+                access,
+                refresh: "fake-refresh",
+                accountId: "test-workspace",
+                expires: now - 1,
+              }),
+            },
+          ],
+        });
+      if (path.endsWith("/wham/usage")) return new Response(null, { status: 401 });
+      throw new Error(`Unexpected request: ${path}`);
+    }) as unknown as typeof fetch;
+    globalThis.fetch = fakeFetch;
+    try {
+      await collectAccounts({
+        apiUrl: "http://swarm.invalid",
+        apiKey: "fake",
+        sidecarUrl: "http://sidecar.invalid",
+        sidecarToken: "fake",
+        dryRun: true,
+        fetchImpl: fakeFetch,
+      });
+      expect(requests.map((r) => r.method)).toEqual(["GET", "GET", "GET"]);
+      expect(requests.filter((r) => r.url.endsWith("/wham/usage"))).toHaveLength(1);
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
   test("only durable unconfirmed renewal asks for owner action while unknown stays unknown", async () => {
     for (const error of [
       new ClaudeReauthenticationRequiredError("fixture"),

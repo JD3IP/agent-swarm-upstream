@@ -1,7 +1,11 @@
 /** Account-scoped probes. Run on the host with Bun or bundle into the sweep image.
  * Secrets stay in the existing config broker; Codex refresh uses its existing lock.
  */
-import { getValidCodexOAuth, loadCodexOAuth } from "../src/providers/codex-oauth/storage.ts";
+import {
+  CodexOAuthRefreshError,
+  getValidCodexOAuth,
+  loadCodexOAuth,
+} from "../src/providers/codex-oauth/storage.ts";
 import { claudeAccountIdentity, codexAccountIdentity } from "../src/utils/account-identity.ts";
 import { getApiKey } from "../src/utils/api-key.ts";
 import {
@@ -27,6 +31,7 @@ type Account = {
   identityKey: string;
   allowedModels: string[];
   credentialRef: { keyType: string; index: number; scope: string; scopeId: string | null };
+  observation?: Pick<Observation, "credentialGeneration" | "authState" | "authAction"> | null;
 };
 type Observation = {
   credentialGeneration: number;
@@ -41,10 +46,14 @@ type Observation = {
 type Dependencies = {
   fetch: typeof fetch;
   now: () => number;
-  codexCredential: (slot: number) => Promise<{ access: string; accountId: string } | null>;
+  codexCredential: (
+    slot: number,
+    revalidate?: boolean,
+  ) => Promise<{ access: string; accountId: string } | null>;
   claudeCredential: (account: Account) => Promise<string | null>;
   codexUrl: string;
   claudeUrl: string;
+  dryRun?: boolean;
 };
 
 function percent(value: unknown): number | null {
@@ -249,17 +258,39 @@ export async function probeAccount(account: Account, deps: Dependencies): Promis
         account.credentialRef.keyType !== "codex_oauth"
       )
         return observation;
-      const credential = await deps.codexCredential(account.credentialRef.index);
-      if (!credential) return observation;
-      if (codexAccountIdentity(credential.access, credential.accountId) !== account.identityKey)
-        return { ...observation, authState: "invalid" };
-      response = await deps.fetch(deps.codexUrl, {
-        headers: {
-          Authorization: `Bearer ${credential.access}`,
-          "ChatGPT-Account-Id": credential.accountId,
-        },
-        signal: AbortSignal.timeout(20000),
-      });
+      const previous = account.observation;
+      if (
+        previous?.credentialGeneration === account.credentialGeneration &&
+        previous.authState === "invalid" &&
+        previous.authAction === "reauthenticate"
+      )
+        return {
+          ...observation,
+          authState: "invalid",
+          authAction: "reauthenticate",
+          state: "unavailable",
+        };
+      // A server rejection can precede JWT expiry. Revalidate this exact slot
+      // through the locked broker once; a second rejection needs a new login.
+      for (let attempt = 0; ; attempt++) {
+        const credential = await deps.codexCredential(
+          account.credentialRef.index,
+          attempt ? true : undefined,
+        );
+        if (!credential) return observation;
+        if (codexAccountIdentity(credential.access, credential.accountId) !== account.identityKey)
+          return { ...observation, authState: "invalid" };
+        response = await deps.fetch(deps.codexUrl, {
+          headers: {
+            Authorization: `Bearer ${credential.access}`,
+            "ChatGPT-Account-Id": credential.accountId,
+          },
+          signal: AbortSignal.timeout(20000),
+        });
+        if (response.status !== 401 || attempt || deps.dryRun) break;
+        await response.body?.cancel();
+      }
+      if (response.status === 401 && !deps.dryRun) observation.authAction = "reauthenticate";
       if (response.ok) {
         const body = (await response.json()) as {
           rate_limit?: { allowed?: boolean; limit_reached?: boolean };
@@ -318,9 +349,16 @@ export async function probeAccount(account: Account, deps: Dependencies): Promis
       observation.state = "exhausted";
   } catch (error) {
     // Never emit upstream exception bodies: they may include a bearer or OAuth payload.
-    observation.authState = error instanceof ClaudeAccountAuthError ? "invalid" : "unknown";
+    const codexRejected =
+      error instanceof CodexOAuthRefreshError &&
+      error.reason === "refresh_rejected" &&
+      [400, 401].includes(error.status ?? 0);
+    observation.authState =
+      error instanceof ClaudeAccountAuthError || codexRejected ? "invalid" : "unknown";
     observation.authAction =
-      error instanceof ClaudeReauthenticationRequiredError ? "reauthenticate" : null;
+      error instanceof ClaudeReauthenticationRequiredError || codexRejected
+        ? "reauthenticate"
+        : null;
     observation.state = "unavailable";
     observation.windows = [];
   }
@@ -357,12 +395,18 @@ export async function collectAccounts(options: {
       now: options.now ?? Date.now,
       codexUrl: "https://chatgpt.com/backend-api/wham/usage",
       claudeUrl: "https://api.anthropic.com/api/oauth/usage",
+      dryRun: options.dryRun,
       codexCredential:
         options.codexCredential ??
-        ((slot) =>
+        ((slot, revalidate) =>
           options.dryRun
             ? loadCodexOAuth(options.apiUrl, options.apiKey, slot)
-            : getValidCodexOAuth(options.apiUrl, options.apiKey, slot)),
+            : getValidCodexOAuth(
+                options.apiUrl,
+                options.apiKey,
+                slot,
+                revalidate ? { maxAgeMs: 60_000 } : undefined,
+              )),
       claudeCredential: async (a) => {
         return getClaudeAccountCredential({
           apiUrl: options.apiUrl,
