@@ -277,6 +277,67 @@ describe("account-scoped quota collector", () => {
     });
     expect(result.windows[2]).toMatchObject({ models: ["fable"], usedPercent: 0, active: false });
   });
+  test("inactive canonical weekly usage is retained and charged as a normal quota window", async () => {
+    const profile = { account: { uuid: "claude-inactive-weekly-fixture" } };
+    const limits = [
+      {
+        kind: "session",
+        group: "session",
+        percent: 4,
+        resets_at: "2026-11-01T22:20:00.295093+00:00",
+        scope: null,
+        is_active: true,
+      },
+      {
+        kind: "weekly_all",
+        group: "weekly",
+        percent: 1,
+        resets_at: "2026-11-06T14:00:00.295113+00:00",
+        scope: null,
+        is_active: false,
+      },
+    ];
+    const result = await probeAccount(
+      {
+        ...account,
+        provider: "claude",
+        identityKey: claudeAccountIdentity(profile),
+        allowedModels: ["sonnet"],
+        credentialRef: { ...account.credentialRef, keyType: "claude_oauth" },
+      },
+      deps((async (url) =>
+        Response.json(String(url).endsWith("/profile") ? profile : { limits })) as typeof fetch),
+    );
+    expect(result).toMatchObject({ authState: "healthy", state: "healthy" });
+    expect(result.windows[1]).toEqual({
+      id: "weekly_all",
+      durationSeconds: 604800,
+      usedPercent: 1,
+      resetsAt: "2026-11-06T14:00:00.295Z",
+      models: null,
+      blocked: false,
+    });
+    // Nonzero usage must retain normal reserve/pacing accounting, never inactive-zero semantics.
+    for (const percent of [20, 80]) {
+      const parsed = claudeWindows({ limits: [limits[0], { ...limits[1], percent }] }, ["sonnet"]);
+      expect(parsed.complete).toBe(true);
+      expect(parsed.windows[1].usedPercent).toBe(percent);
+      expect(parsed.windows[1].active).toBeUndefined();
+    }
+    for (const change of [
+      { resets_at: null },
+      { resets_at: "invalid" },
+      { percent: null },
+      { percent: "1" },
+      { percent: 101 },
+      { percent: 100 },
+      { locked_reason: "quota" },
+    ]) {
+      expect(
+        claudeWindows({ limits: [limits[0], { ...limits[1], ...change }] }, ["sonnet"]).complete,
+      ).toBe(false);
+    }
+  });
   test("canonical unused active session has no reset until usage starts", async () => {
     const profile = { account: { uuid: "claude-reset-fixture" } };
     const limits = [

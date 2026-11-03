@@ -129,7 +129,7 @@ export function claudeWindows(
   ): void {
     const limit = object(raw) ?? {};
     const usedPercent = percent(canonical ? limit.percent : limit.utilization);
-    const active = typeof limit.is_active === "boolean" ? limit.is_active : undefined;
+    let active = typeof limit.is_active === "boolean" ? limit.is_active : undefined;
     const blocked =
       usedPercent === 100 ||
       (typeof limit.locked_reason === "string" && !!limit.locked_reason.trim());
@@ -137,6 +137,10 @@ export function claudeWindows(
       complete = false;
       return;
     }
+    // Claude can mark a window inactive while retaining measured usage.
+    // Keep that usage subject to normal reserve/pacing checks; active:false
+    // is reserved for known zero-usage windows in the sidecar contract.
+    if (active === false && usedPercent !== null && usedPercent > 0 && !blocked) active = undefined;
     if (active === false && (usedPercent !== 0 || blocked)) {
       complete = false;
       return;
